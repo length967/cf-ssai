@@ -1,0 +1,37 @@
+{
+  "name": "cf-ssai",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev:manifest": "wrangler dev --local --port 8787",
+    "dev:decision": "wrangler dev --local --port 8788 --config wrangler.decision.toml",
+    "dev:beacon": "wrangler dev --local --port 8789 --config wrangler.beacon.toml",
+    "dev:vast": "wrangler dev --local --port 8790 --config wrangler.vast.toml",
+    "dev:admin-api": "wrangler dev --local --port 8791 --config wrangler.admin.toml",
+    "dev:guard": "wrangler dev --local src/segment-guard.ts",
+    "deploy:manifest": "wrangler deploy",
+    "deploy:decision": "wrangler deploy --config wrangler.decision.toml",
+    "deploy:beacon": "wrangler deploy --config wrangler.beacon.toml",
+    "deploy:vast": "wrangler deploy --config wrangler.vast.toml",
+    "deploy:admin-api": "wrangler deploy --config wrangler.admin.toml",
+    "deploy:all": "npm run deploy:manifest && npm run deploy:decision && npm run deploy:beacon && npm run deploy:vast && npm run deploy:admin-api",
+    "db:create": "wrangler d1 create ssai-admin",
+    "db:init": "wrangler d1 execute ssai-admin --file=./schema.sql --config wrangler.admin.toml --remote",
+    "db:init:local": "wrangler d1 execute ssai-admin --file=./schema.sql --config wrangler.admin.toml",
+    "db:query": "wrangler d1 execute ssai-admin --command --config wrangler.admin.toml",
+    "check": "echo \"(optional) add eslint/tsc here\"",
+    "test": "tsx --test tests/*.test.ts",
+    "test:unit": "tsx --test tests/golden.test.ts tests/workers.test.ts tests/hls-advanced.test.ts tests/security.test.ts tests/scte35.test.ts tests/scte35-advanced.test.ts tests/vast.test.ts",
+    "test:integration": "tsx --test tests/integration.test.ts tests/e2e-comprehensive.test.ts",
+    "test:performance": "tsx --test tests/performance.test.ts",
+    "test:chaos": "tsx --test tests/chaos.test.ts",
+    "test:quick": "tsx --test tests/golden.test.ts tests/scte35.test.ts tests/vast.test.ts",
+    "test:all": "./run-tests.sh"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20241022.0",
+    "tsx": "^4.7.0",
+    "wrangler": "^4.45.3"
+  }
+}

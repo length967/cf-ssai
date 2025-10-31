@@ -1,0 +1,45 @@
+name = "cf-ssai-decision"
+main = "src/decision-worker.ts"
+compatibility_date = "2025-10-01"
+workers_dev = true
+
+# R2 bucket for ad pods
+[[r2_buckets]]
+binding = "ADS_BUCKET"
+bucket_name = "ads-bucket"
+
+# KV for decision caching
+[[kv_namespaces]]
+binding = "DECISION_CACHE"
+id = "4beba810f4d141e7be9e3298c7b07944"
+
+# Service binding to VAST parser worker
+[[services]]
+binding = "VAST_PARSER"
+service = "cf-ssai-vast-parser"
+
+# Configuration
+[vars]
+AD_POD_BASE = "https://ads.example.com/pods"
+DECISION_TIMEOUT_MS = "2000"
+CACHE_DECISION_TTL = "60"
+SLATE_POD_ID = "slate"
+# VAST_URL = "https://example.com/vast.xml"  # Optional: Static VAST URL for testing
+
+# Secrets (optional - for external ad API)
+# AD_DECISION_API_URL - set via: wrangler secret put AD_DECISION_API_URL
+# AD_DECISION_API_KEY - set via: wrangler secret put AD_DECISION_API_KEY
+
+# Observability
+[observability]
+enabled = true
+
+# Sampling rates for decision worker (service-to-service calls)
+[observability.logs]
+enabled = true
+head_sampling_rate = 0.05  # 5% of decisions - balance cost with debugging needs
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.15  # 15% of decisions - traces help identify slow ad fetches
+

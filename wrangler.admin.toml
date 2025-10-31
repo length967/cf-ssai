@@ -1,0 +1,31 @@
+name = "cf-ssai-admin-api"
+main = "src/admin-api-worker.ts"
+compatibility_date = "2025-10-01"
+workers_dev = true
+
+# D1 Database binding
+[[d1_databases]]
+binding = "DB"
+database_name = "ssai-admin"
+database_id = "0302f8ab-e592-4fa6-8bbf-7371759da6ed"  # Replace after creating: wrangler d1 create ssai-admin
+
+# Configuration
+[vars]
+ADMIN_CORS_ORIGIN = "https://ssai-admin.pages.dev"  # Production domain (matches all deployments)
+
+# Secrets (set via: wrangler secret put JWT_SECRET)
+# JWT_SECRET - Secret key for JWT tokens
+
+# Observability
+[observability]
+enabled = true
+
+# Sampling rates for admin API (lower traffic, more important to log)
+[observability.logs]
+enabled = true
+head_sampling_rate = 0.20  # 20% of requests - capture more admin actions
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.20  # 20% of requests - good coverage for admin operations
+

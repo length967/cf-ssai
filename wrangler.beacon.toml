@@ -1,0 +1,37 @@
+name = "cf-ssai-beacon-consumer"
+main = "src/beacon-consumer-worker.ts"
+compatibility_date = "2025-10-01"
+workers_dev = true
+
+# Queue consumer configuration
+[[queues.consumers]]
+queue = "beacon-queue"
+max_batch_size = 100
+max_batch_timeout = 5
+max_retries = 3
+dead_letter_queue = "beacon-dlq"
+retry_delay = 30  # Wait 30 seconds before retrying failed messages
+
+# Optional: KV for beacon deduplication
+[[kv_namespaces]]
+binding = "BEACON_KV"
+id = "f2771891b6f848f5a3380f9e4d948e33"
+
+# Configuration
+[vars]
+BEACON_RETRY_ATTEMPTS = "2"
+BEACON_TIMEOUT_MS = "5000"
+
+# Observability
+[observability]
+enabled = true
+
+# Sampling rates for beacon consumer (queue-based, moderate traffic)
+[observability.logs]
+enabled = true
+head_sampling_rate = 0.05  # 5% of batches - balance between visibility and cost
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.10  # 10% of batches - good for monitoring queue performance
+

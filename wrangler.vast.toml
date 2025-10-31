@@ -1,0 +1,34 @@
+name = "cf-ssai-vast-parser"
+main = "src/vast-parser-worker.ts"
+compatibility_date = "2025-10-01"
+workers_dev = true
+
+# KV for VAST parsing cache
+[[kv_namespaces]]
+binding = "VAST_CACHE"
+id = "30ef6cf22c354288a74b6d8ba001b5b0"
+
+# R2 bucket for ads (shared with other workers)
+[[r2_buckets]]
+binding = "ADS_BUCKET"
+bucket_name = "ads-bucket"
+
+# Configuration
+[vars]
+AD_POD_BASE = "https://ads.example.com/pods"
+VAST_TIMEOUT_MS = "2000"
+VAST_MAX_WRAPPER_DEPTH = "5"
+
+# Observability
+[observability]
+enabled = true
+
+# Sampling rates for VAST parser (service-to-service calls, lower traffic)
+[observability.logs]
+enabled = true
+head_sampling_rate = 0.10  # 10% of VAST parses - important to catch XML parsing issues
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.15  # 15% of VAST parses - helps identify slow external VAST fetches
+

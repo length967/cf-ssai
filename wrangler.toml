@@ -1,0 +1,64 @@
+name = "cf-ssai"
+main = "src/manifest-worker.ts"
+compatibility_date = "2025-10-01"
+workers_dev = true
+
+# ---- Environment bindings (adjust names/ids) ----
+# Durable Object to coordinate each channel's live state
+[[durable_objects.bindings]]
+name = "CHANNEL_DO"
+class_name = "ChannelDO"
+
+# Migrations for the DO
+[[migrations]]
+tag = "v1"
+new_classes = ["ChannelDO"]
+
+# R2 bucket for ads (pre-normalized ABR pods)
+[[r2_buckets]]
+binding = "ADS_BUCKET"
+bucket_name = "ads-bucket"
+
+# D1 Database for per-channel multi-tenant configuration
+[[d1_databases]]
+binding = "DB"
+database_name = "ssai-admin"
+database_id = "0302f8ab-e592-4fa6-8bbf-7371759da6ed"
+
+# KV for caching channel configuration (reduces D1 queries, 5-minute TTL)
+[[kv_namespaces]]
+binding = "CHANNEL_CONFIG_CACHE"
+id = "f03509ea56964ca3ad062b116a683dc4"
+
+# Queues for server-side beacons
+# Producer only - consumer is in separate beacon-consumer-worker
+[[queues.producers]]
+binding = "BEACON_QUEUE"
+queue = "beacon-queue"
+
+# Service bindings for worker-to-worker communication
+[[services]]
+binding = "DECISION"
+service = "cf-ssai-decision"
+
+# Configuration
+[vars]
+ORIGIN_VARIANT_BASE = "https://origin.example.com/hls"   # your packager/Bunny Stream variant base
+AD_POD_BASE = "https://ads.example.com/pods"             # public (or guarded) R2 base
+WINDOW_BUCKET_SECS = "2"
+DECISION_TIMEOUT_MS = "150"
+SIGN_HOST = "media.example.com"                          # host used when signing URLs
+# tokens & keys set as secrets: JWT_PUBLIC_KEY, SEGMENT_SECRET
+
+# Observability
+[observability]
+enabled = true
+
+# Sampling rates for high-traffic manifest worker
+[observability.logs]
+enabled = true
+head_sampling_rate = 0.01  # 1% of requests - adjust based on traffic volume
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 0.10  # 10% of requests - traces are more valuable for debugging
