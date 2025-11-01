@@ -632,27 +632,51 @@ export class ChannelDO {
                 }
                 
                 const playlistContent = await playlistResponse.text()
-                const adSegments: string[] = []
+                const adSegments: Array<{url: string, duration: number}> = []
                 
-                // Parse playlist to extract segment filenames
+                // Parse playlist to extract segment filenames AND durations
                 const lines = playlistContent.split('\n')
+                let currentDuration = 6.0 // Default fallback
+                
                 for (const line of lines) {
                   const trimmed = line.trim()
-                  // Skip comments and empty lines
+                  
+                  // Extract duration from #EXTINF
+                  if (trimmed.startsWith('#EXTINF:')) {
+                    const match = trimmed.match(/#EXTINF:([\d.]+)/)
+                    if (match) {
+                      currentDuration = parseFloat(match[1])
+                    }
+                    continue
+                  }
+                  
+                  // Skip other comments and empty lines
                   if (!trimmed || trimmed.startsWith('#')) continue
-                  // This is a segment URL
-                  adSegments.push(`${baseUrl}/${trimmed}`)
+                  
+                  // This is a segment URL - add with its duration
+                  adSegments.push({
+                    url: `${baseUrl}/${trimmed}`,
+                    duration: currentDuration
+                  })
                 }
                 
-                console.log(`Extracted ${adSegments.length} ad segments from playlist: ${adItem.playlistUrl}`)
+                const totalDuration = adSegments.reduce((sum, seg) => sum + seg.duration, 0)
+                console.log(`Extracted ${adSegments.length} ad segments (total: ${totalDuration.toFixed(1)}s) from playlist: ${adItem.playlistUrl}`)
+                
+                // Warn if SCTE-35 duration doesn't match actual ad duration
+                if (Math.abs(totalDuration - breakDurationSec) > 1.0) {
+                  console.warn(`SCTE-35 duration mismatch: SCTE-35=${breakDurationSec}s, Actual ad=${totalDuration.toFixed(1)}s`)
+                }
                 
                 if (adSegments.length > 0) {
                   const cleanOrigin = stripOriginSCTE35Markers(origin)
+                  // CRITICAL: Use actual ad duration, not SCTE-35 duration
+                  // This ensures we skip the correct number of content segments
                   const ssai = replaceSegmentsWithAds(
                     cleanOrigin,
                     scte35StartPDT,
                     adSegments,
-                    breakDurationSec
+                    totalDuration  // ← Use actual ad duration, not breakDurationSec
                   )
                   await this.env.BEACON_QUEUE.send(beaconMsg)
                   return new Response(ssai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })

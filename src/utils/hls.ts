@@ -96,21 +96,63 @@ export function addDaterangeInterstitial(
 }
 
 /**
+ * Add seconds to an ISO 8601 timestamp
+ */
+function addSecondsToTimestamp(isoTimestamp: string, seconds: number): string {
+  const date = new Date(isoTimestamp)
+  date.setMilliseconds(date.getMilliseconds() + seconds * 1000)
+  return date.toISOString()
+}
+
+/**
+ * Parse average segment duration from manifest
+ */
+function getAverageSegmentDuration(lines: string[]): number {
+  const durations: number[] = []
+  
+  for (const line of lines) {
+    if (line.startsWith("#EXTINF:")) {
+      const match = line.match(/#EXTINF:([\d.]+)/)
+      if (match) {
+        durations.push(parseFloat(match[1]))
+      }
+    }
+    // Stop after collecting 10 samples for efficiency
+    if (durations.length >= 10) break
+  }
+  
+  if (durations.length === 0) {
+    console.warn("No segment durations found in manifest, assuming 2 seconds")
+    return 2.0  // Fallback default
+  }
+  
+  // Return average
+  const avg = durations.reduce((sum, d) => sum + d, 0) / durations.length
+  console.log(`Detected average content segment duration: ${avg.toFixed(3)}s (from ${durations.length} samples)`)
+  return avg
+}
+
+/**
  * Replace content segments with ad segments for true SSAI
  * Inserts DISCONTINUITY tags before and after ad pod
  */
 export function replaceSegmentsWithAds(
   variantText: string,
   scte35StartPDT: string,
-  adSegments: string[],
+  adSegments: Array<{url: string, duration: number}> | string[],
   adDuration: number
 ): string {
   const lines = variantText.split("\n")
   const output: string[] = []
   
+  // Detect actual segment duration from content manifest
+  const contentSegmentDuration = getAverageSegmentDuration(lines)
+  const segmentsToReplace = Math.ceil(adDuration / contentSegmentDuration)
+  
+  console.log(`Ad duration: ${adDuration}s, Content segment duration: ${contentSegmentDuration}s, Segments to skip: ${segmentsToReplace}`)
+  
   let foundMarker = false
   let segmentsReplaced = 0
-  const segmentsToReplace = Math.ceil(adDuration / 4)  // Assuming 4-second segments
   
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
@@ -120,13 +162,38 @@ export function replaceSegmentsWithAds(
       foundMarker = true
       output.push(line)  // Keep the PDT
       
+      // Parse the starting PDT timestamp for ad timeline continuity
+      const startPDT = line.replace("#EXT-X-PROGRAM-DATE-TIME:", "").trim()
+      
       // Add DISCONTINUITY before ad
       output.push("#EXT-X-DISCONTINUITY")
       
-      // Insert ad segments
+      // Insert ad segments with actual durations AND PDT tags for timeline continuity
+      let currentPDT = startPDT
+      
       for (let j = 0; j < adSegments.length; j++) {
-        output.push(`#EXTINF:${(adDuration / adSegments.length).toFixed(3)},`)
-        output.push(adSegments[j])
+        const segment = adSegments[j]
+        
+        // Add PDT tag for this ad segment (maintains live stream timeline)
+        output.push(`#EXT-X-PROGRAM-DATE-TIME:${currentPDT}`)
+        
+        // Support both object format {url, duration} and legacy string format
+        let segmentDuration: number
+        
+        if (typeof segment === 'string') {
+          // Legacy: calculate duration (fallback)
+          segmentDuration = adDuration / adSegments.length
+          output.push(`#EXTINF:${segmentDuration.toFixed(3)},`)
+          output.push(segment)
+        } else {
+          // New: use actual duration from ad playlist
+          segmentDuration = segment.duration
+          output.push(`#EXTINF:${segment.duration.toFixed(3)},`)
+          output.push(segment.url)
+        }
+        
+        // Advance PDT for next segment
+        currentPDT = addSecondsToTimestamp(currentPDT, segmentDuration)
       }
       
       // Add DISCONTINUITY after ad

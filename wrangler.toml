@@ -61,7 +61,7 @@ DECISION_TIMEOUT_MS = "2000"  # Increased to 2 seconds for database queries
 SIGN_HOST = "pub-24423d0273094578a7f498bd462c2e20.r2.dev"
 # Cache settings for HLS delivery (Safari compatibility)
 SEGMENT_CACHE_MAX_AGE = "60"                             # Segments are immutable, cache longer
-MANIFEST_CACHE_MAX_AGE = "4"                             # Manifests update frequently
+MANIFEST_CACHE_MAX_AGE = "2"                             # Reduced from 4s: better ad timing (industry standard)
 # Dev/testing mode - allows access without JWT authentication (set to "0" for production)
 DEV_ALLOW_NO_AUTH = "1"
 # tokens & keys set as secrets: JWT_PUBLIC_KEY, SEGMENT_SECRET
