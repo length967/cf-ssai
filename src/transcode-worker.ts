@@ -12,6 +12,7 @@ export interface Env {
   R2_ACCESS_KEY_ID: string;
   R2_SECRET_ACCESS_KEY: string;
   R2_ACCOUNT_ID: string;
+  CONTAINER_URL?: string; // Optional: FFmpeg container URL (default: http://localhost:8080)
 }
 
 export interface TranscodeJob {
@@ -78,7 +79,8 @@ export default {
         
         // Call container to transcode
         console.log(`[TranscodeWorker] Calling FFmpeg container for ad ${job.adId}`);
-        const response = await containerInstance.fetch('http://localhost:8080/transcode', {
+        const containerUrl = env.CONTAINER_URL || 'http://localhost:8080';
+        const response = await containerInstance.fetch(`${containerUrl}/transcode`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

@@ -442,8 +442,9 @@ async function runAdWaterfall(
               durationSec: Math.min(totalDuration, durationSec),
               items: allItems
             },
+            // Tracking handled by beacon system - no hardcoded URLs
             tracking: {
-              impressions: [`https://tracking.example.com/imp?pod=${selectedPod.id}`]
+              impressions: []
             }
           }
         }

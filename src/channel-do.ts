@@ -168,24 +168,12 @@ async function fetchOriginVariant(originUrl: string, channel: string, variant: s
     console.log(`Origin fetch error: ${err}`)
   }
   
-  // DEV FALLBACK: simple 3-segment live-like variant (only for playlists)
-  const base = new Date(Date.now() - 8_000)
-  const pdt = (d: Date) => d.toISOString()
-  const seg = (i: number) =>
-    `#EXT-X-PROGRAM-DATE-TIME:${pdt(new Date(base.getTime() + i * 4000))}\n#EXTINF:4.000,\nseg_${1000 + i}.m4s`
-  const fallback = [
-    "#EXTM3U",
-    "#EXT-X-VERSION:7",
-    "#EXT-X-TARGETDURATION:4",
-    "#EXT-X-MEDIA-SEQUENCE:1000",
-    seg(0),
-    seg(1),
-    seg(2),
-    ""
-  ].join("\n")
-  
-  return new Response(fallback, {
-    headers: { "Content-Type": "application/vnd.apple.mpegurl" }
+  // Origin fetch failed - return proper error instead of fake segments
+  console.error(`Origin unavailable for: ${u}`)
+  return new Response("Origin unavailable", { 
+    status: 502,
+    statusText: "Bad Gateway",
+    headers: { "Content-Type": "text/plain" }
   })
 }
 
@@ -245,6 +233,98 @@ function selectAdVariant(viewerBitrate: number | null): string {
 }
 
 // -----------------------------------------------------------------------------
+// Helper: fetch slate pod from database
+// -----------------------------------------------------------------------------
+async function getSlatePodFromDB(env: Env, slatePodId: string, adPodBase: string, durationSec: number): Promise<DecisionResponse> {
+  try {
+    // Fetch slate pod from database
+    const pod = await env.DB.prepare(`
+      SELECT id, name, ads FROM ad_pods 
+      WHERE id = ? AND status = 'active'
+    `).bind(slatePodId).first<any>()
+    
+    if (!pod || !pod.ads) {
+      console.error(`Slate pod not found or has no ads: ${slatePodId}`)
+      // Return empty response as last resort
+      return {
+        pod: {
+          podId: slatePodId,
+          durationSec,
+          items: []
+        }
+      }
+    }
+    
+    // Parse ad IDs and fetch ad details
+    const adIds = JSON.parse(pod.ads)
+    if (adIds.length === 0) {
+      console.error(`Slate pod ${slatePodId} has no ads configured`)
+      return {
+        pod: {
+          podId: pod.id,
+          durationSec,
+          items: []
+        }
+      }
+    }
+    
+    // Fetch ad details
+    const placeholders = adIds.map(() => '?').join(',')
+    const adsResult = await env.DB.prepare(`
+      SELECT id, name, variants, duration 
+      FROM ads 
+      WHERE id IN (${placeholders}) AND transcode_status = 'ready'
+    `).bind(...adIds).all()
+    
+    const ads = adsResult.results || []
+    if (ads.length === 0) {
+      console.error(`No ready ads found for slate pod ${slatePodId}`)
+      return {
+        pod: {
+          podId: pod.id,
+          durationSec,
+          items: []
+        }
+      }
+    }
+    
+    // Build pod items from ad variants
+    const items: any[] = []
+    for (const ad of ads) {
+      const variants = ad.variants ? JSON.parse(ad.variants as string) : []
+      for (const variant of variants) {
+        items.push({
+          adId: ad.id,
+          bitrate: variant.bitrate,
+          playlistUrl: variant.url,
+          duration: ad.duration || durationSec
+        })
+      }
+    }
+    
+    console.log(`Loaded slate pod from DB: ${pod.id} with ${items.length} variants`)
+    
+    return {
+      pod: {
+        podId: pod.id,
+        durationSec: items[0]?.duration || durationSec,
+        items
+      }
+    }
+  } catch (error) {
+    console.error(`Failed to fetch slate pod from DB:`, error)
+    // Return empty response
+    return {
+      pod: {
+        podId: slatePodId,
+        durationSec,
+        items: []
+      }
+    }
+  }
+}
+
+// -----------------------------------------------------------------------------
 // Helper: make ad decision via decision service worker
 // -----------------------------------------------------------------------------
 async function decision(env: Env, adPodBase: string, channel: string, durationSec: number, viewerInfo?: any): Promise<DecisionResponse> {
@@ -272,20 +352,10 @@ async function decision(env: Env, adPodBase: string, channel: string, durationSe
     }
   }
   
-  // Fallback: static slate pod (if service unavailable or in dev mode)
+  // Fallback: fetch slate pod from database instead of hardcoded values
   console.warn("Using fallback slate pod - decision service unavailable")
-  // Use per-channel ad pod base URL
-  return {
-    pod: {
-      podId: "slate",
-      durationSec,
-      items: [
-        { adId: "slate", bitrate: 800000, playlistUrl: `${adPodBase}/slate/v_800k/playlist.m3u8` },
-        { adId: "slate", bitrate: 1600000, playlistUrl: `${adPodBase}/slate/v_1600k/playlist.m3u8` },
-        { adId: "slate", bitrate: 2500000, playlistUrl: `${adPodBase}/slate/v_2500k/playlist.m3u8` }
-      ]
-    }
-  }
+  const slatePodId = env.SLATE_POD_ID || "pod_demo_slate"
+  return await getSlatePodFromDB(env, slatePodId, adPodBase, durationSec)
 }
 
 // -----------------------------------------------------------------------------
@@ -338,15 +408,21 @@ export class ChannelDO {
           }
 
           const podId: string | undefined = body?.pod_id
-          // Use per-channel ad pod base URL
-          const podUrl: string =
-            body?.pod_url || `${adPodBase}/${podId ?? "example-pod"}/v_1600k/playlist.m3u8`
+          const podUrl: string | undefined = body?.pod_url
+          
+          // If no pod_url provided, we need either pod_id or return error
+          if (!podUrl && !podId) {
+            return new Response("Missing pod_url or pod_id in request body", { status: 400 })
+          }
+          
+          // If pod_url not provided but pod_id is, construct URL (requires valid pod_id)
+          const finalPodUrl = podUrl || `${adPodBase}/${podId}/1000k/playlist.m3u8`
 
           const now = Date.now()
           const s: AdState = {
             active: true,
             podId,
-            podUrl,
+            podUrl: finalPodUrl,
             startedAt: now,
             endsAt: now + durationSec * 1000,
             durationSec,
@@ -539,28 +615,52 @@ export class ChannelDO {
           
           if (scte35StartPDT) {
             // True SSAI: Replace segments at SCTE-35 marker position
-            // In production, we'd fetch the actual ad segments here
-            // For now, use placeholder segment URLs from the ad pod
+            // Fetch the actual ad playlist and extract real segment URLs
             
-            const adSegments = pod.items
-              .filter(item => item.bitrate === viewerBitrate)
-              .map(item => {
-                // Generate segment URLs from playlist URL
-                // In production, parse the playlist and extract segment URLs
-                const baseUrl = item.playlistUrl.replace("/playlist.m3u8", "")
-                return `${baseUrl}/seg_00001.m4s`  // Simplified for demo
-              })
+            const matchingItems = pod.items.filter(item => item.bitrate === viewerBitrate)
             
-            if (adSegments.length > 0) {
-              const cleanOrigin = stripOriginSCTE35Markers(origin)
-              const ssai = replaceSegmentsWithAds(
-                cleanOrigin,
-                scte35StartPDT,
-                adSegments,
-                breakDurationSec
-              )
-              await this.env.BEACON_QUEUE.send(beaconMsg)
-              return new Response(ssai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
+            if (matchingItems.length > 0) {
+              const adItem = matchingItems[0]
+              const baseUrl = adItem.playlistUrl.replace("/playlist.m3u8", "")
+              
+              // Fetch the actual ad playlist to get real segment URLs
+              try {
+                const playlistResponse = await fetch(adItem.playlistUrl)
+                if (!playlistResponse.ok) {
+                  console.error(`Failed to fetch ad playlist: ${adItem.playlistUrl} - ${playlistResponse.status}`)
+                  throw new Error(`Ad playlist fetch failed: ${playlistResponse.status}`)
+                }
+                
+                const playlistContent = await playlistResponse.text()
+                const adSegments: string[] = []
+                
+                // Parse playlist to extract segment filenames
+                const lines = playlistContent.split('\n')
+                for (const line of lines) {
+                  const trimmed = line.trim()
+                  // Skip comments and empty lines
+                  if (!trimmed || trimmed.startsWith('#')) continue
+                  // This is a segment URL
+                  adSegments.push(`${baseUrl}/${trimmed}`)
+                }
+                
+                console.log(`Extracted ${adSegments.length} ad segments from playlist: ${adItem.playlistUrl}`)
+                
+                if (adSegments.length > 0) {
+                  const cleanOrigin = stripOriginSCTE35Markers(origin)
+                  const ssai = replaceSegmentsWithAds(
+                    cleanOrigin,
+                    scte35StartPDT,
+                    adSegments,
+                    breakDurationSec
+                  )
+                  await this.env.BEACON_QUEUE.send(beaconMsg)
+                  return new Response(ssai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
+                }
+              } catch (err) {
+                console.error(`Error fetching/parsing ad playlist:`, err)
+                // Fall through to no-ad-insertion
+              }
             }
           }
           

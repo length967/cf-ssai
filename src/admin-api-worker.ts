@@ -7,6 +7,7 @@ export interface Env {
   DB: D1Database
   JWT_SECRET: string
   ADMIN_CORS_ORIGIN?: string
+  ALLOWED_ORIGINS?: string // Optional: Comma-separated list of additional allowed origins
   
   // R2 for ad storage
   R2: R2Bucket
@@ -153,18 +154,26 @@ async function authenticate(request: Request, env: Env, requestOrigin?: string |
 }
 
 function corsHeaders(env: Env, requestOrigin?: string | null): Record<string, string> {
-  // Allow localhost origins in development, production domain in production
+  // Allow configured origins (production + development)
   let origin = '*'
   
   // Check if request has an origin header
   if (requestOrigin) {
+    // Build allowed origins list from environment variables
     const allowedOrigins = [
       env.ADMIN_CORS_ORIGIN || 'https://ssai-admin.pages.dev',
+      // Development localhost origins (always allowed for convenience)
       'http://localhost:3000',
       'http://localhost:3001',
       'http://127.0.0.1:3000',
       'http://127.0.0.1:3001'
     ]
+    
+    // Add any additional origins from ALLOWED_ORIGINS environment variable
+    if (env.ALLOWED_ORIGINS) {
+      const additionalOrigins = env.ALLOWED_ORIGINS.split(',').map(o => o.trim())
+      allowedOrigins.push(...additionalOrigins)
+    }
     
     // If origin is in allowed list, use it (required for credentials)
     if (allowedOrigins.includes(requestOrigin)) {
