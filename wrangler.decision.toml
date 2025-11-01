@@ -3,10 +3,21 @@ main = "src/decision-worker.ts"
 compatibility_date = "2025-10-01"
 workers_dev = true
 
+# D1 Database for ad pods and channel configuration
+[[d1_databases]]
+binding = "DB"
+database_name = "ssai-admin"
+database_id = "0302f8ab-e592-4fa6-8bbf-7371759da6ed"
+
 # R2 bucket for ad pods
 [[r2_buckets]]
 binding = "ADS_BUCKET"
 bucket_name = "ads-bucket"
+
+# R2 bucket for transcoded HLS ads
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "ssai-ads"
 
 # KV for decision caching
 [[kv_namespaces]]
@@ -20,7 +31,7 @@ service = "cf-ssai-vast-parser"
 
 # Configuration
 [vars]
-AD_POD_BASE = "https://ads.example.com/pods"
+AD_POD_BASE = "https://pub-24423d0273094578a7f498bd462c2e20.r2.dev/transcoded-ads"
 DECISION_TIMEOUT_MS = "2000"
 CACHE_DECISION_TTL = "60"
 SLATE_POD_ID = "slate"
@@ -37,9 +48,9 @@ enabled = true
 # Sampling rates for decision worker (service-to-service calls)
 [observability.logs]
 enabled = true
-head_sampling_rate = 0.05  # 5% of decisions - balance cost with debugging needs
+head_sampling_rate = 1.0  # 100% for debugging - reduce to 0.05 (5%) in production
 
 [observability.traces]
 enabled = true
-head_sampling_rate = 0.15  # 15% of decisions - traces help identify slow ad fetches
+head_sampling_rate = 1.0  # 100% for debugging - reduce to 0.15 (15%) in production
 

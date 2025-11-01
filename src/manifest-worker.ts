@@ -23,6 +23,10 @@ export interface Env {
   WINDOW_BUCKET_SECS: string
   DECISION_TIMEOUT_MS: string
   SIGN_HOST: string
+  
+  // Cache settings
+  SEGMENT_CACHE_MAX_AGE?: string
+  MANIFEST_CACHE_MAX_AGE?: string
 
   // Secrets
   JWT_PUBLIC_KEY: string
@@ -59,10 +63,37 @@ function entitled(viewer: ViewerJWT | null, env: Env): boolean {
   return !!viewer
 }
 
+/** CORS headers for HLS playback */
+function corsHeaders(): Record<string, string> {
+  return {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, HEAD, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, Range',
+    'Access-Control-Expose-Headers': 'Content-Length, Content-Range',
+    'Access-Control-Max-Age': '86400'
+  }
+}
+
 export default {
   /** HTTP entrypoint: edge micro-cache + DO coalescing + passthrough */
   async fetch(req: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(req.url)
+
+    // CORS preflight
+    if (req.method === 'OPTIONS') {
+      return new Response(null, {
+        status: 204,
+        headers: corsHeaders()
+      })
+    }
+
+    // Health check endpoint
+    if (url.pathname === "/health") {
+      return new Response("OK", { 
+        status: 200,
+        headers: corsHeaders()
+      })
+    }
 
     // --- Simple router: /cue endpoint for live ad triggers ---
     if (url.pathname === "/cue") {
@@ -91,13 +122,13 @@ export default {
       }
     }
 
-    // Parse URL: supports both legacy (?channel=x&variant=y) and new path-based (/:org/:channel/variant.m3u8)
+    // Parse URL: supports both legacy (?channel=x&variant=y) and new path-based (/:org/:channel/file)
     let orgSlug: string | null = null
     let channelSlug: string | null = null
     let variant: string = "v_1600k.m3u8"
     
-    // Try path-based routing first: /:orgSlug/:channelSlug/variant.m3u8
-    const pathMatch = url.pathname.match(/^\/([^/]+)\/([^/]+)\/(.+\.m3u8)$/)
+    // Try path-based routing first: /:orgSlug/:channelSlug/file (matches .m3u8, .ts, .m4s, etc.)
+    const pathMatch = url.pathname.match(/^\/([^/]+)\/([^/]+)\/(.+)$/)
     if (pathMatch) {
       [, orgSlug, channelSlug, variant] = pathMatch
     } else {
@@ -111,10 +142,10 @@ export default {
     if (!channelSlug) {
       return new Response(JSON.stringify({
         error: "Invalid path format",
-        usage: "/:org/:channel/variant.m3u8 or ?channel=x&variant=y"
+        usage: "/:org/:channel/file or ?channel=x&variant=y"
       }), { 
         status: 400,
-        headers: { "Content-Type": "application/json" }
+        headers: { "Content-Type": "application/json", ...corsHeaders() }
       })
     }
 
@@ -141,7 +172,7 @@ export default {
             channel: channelSlug 
           }), { 
             status: 404,
-            headers: { "Content-Type": "application/json" }
+            headers: { "Content-Type": "application/json", ...corsHeaders() }
           })
         }
 
@@ -152,7 +183,7 @@ export default {
             status: channelConfig.status
           }), { 
             status: 503,
-            headers: { "Content-Type": "application/json" }
+            headers: { "Content-Type": "application/json", ...corsHeaders() }
           })
         }
 
@@ -216,14 +247,38 @@ export default {
     doRequest.headers.set('X-Origin-Url', effectiveConfig.originUrl)
     doRequest.headers.set('X-Ad-Pod-Base', effectiveConfig.adPodBaseUrl)
     doRequest.headers.set('X-Sign-Host', effectiveConfig.signHost)
+    doRequest.headers.set('X-Org-Slug', orgSlug || '')
+    doRequest.headers.set('X-Channel-Slug', channelSlug)
     
     const upstream = await stub.fetch(doRequest)
-    const text = await upstream.text()
+    
+    // Determine content type based on file extension
+    let contentType = "application/vnd.apple.mpegurl"
+    if (variant.endsWith('.ts')) {
+      contentType = "video/MP2T"
+    } else if (variant.endsWith('.m4s') || variant.endsWith('.mp4')) {
+      contentType = "video/mp4"
+    } else if (variant.endsWith('.vtt')) {
+      contentType = "text/vtt"
+    }
 
-    const resp = new Response(text, {
+    // For segments (.ts, .m4s), pass through binary data; for manifests, we can read as text
+    const body = contentType.startsWith('video/') ? upstream.body : await upstream.text()
+
+    // Cache control: segments are immutable (longer cache), manifests update frequently (shorter cache)
+    // Use per-channel settings if available, otherwise fall back to global env vars
+    const isSegment = contentType.startsWith('video/')
+    const segmentMaxAge = channelConfig?.segmentCacheMaxAge || parseInt(env.SEGMENT_CACHE_MAX_AGE || "60", 10)
+    const manifestMaxAge = channelConfig?.manifestCacheMaxAge || parseInt(env.MANIFEST_CACHE_MAX_AGE || "4", 10)
+    const cacheControl = isSegment 
+      ? `public, max-age=${segmentMaxAge}, immutable` 
+      : `private, max-age=${manifestMaxAge}`
+
+    const resp = new Response(body, {
       headers: {
-        "Content-Type": "application/vnd.apple.mpegurl",
-        "Cache-Control": "private, max-age=2",
+        "Content-Type": contentType,
+        "Cache-Control": cacheControl,
+        ...corsHeaders()
       },
       status: upstream.status,
       statusText: upstream.statusText,

@@ -27,11 +27,26 @@ type Asset = {
   url: string
 }
 
+type Ad = {
+  id: string
+  name: string
+  description?: string
+  duration: number
+  source_key: string
+  transcode_status: string
+  master_playlist_url?: string
+  variants?: string
+  error_message?: string
+}
+
 export default function AdPodsPage() {
   const router = useRouter()
   const [adPods, setAdPods] = useState<AdPod[]>([])
   const [loading, setLoading] = useState(true)
   const [showModal, setShowModal] = useState(false)
+  const [showAdsLibrary, setShowAdsLibrary] = useState(false)
+  const [ads, setAds] = useState<Ad[]>([])
+  const [loadingAds, setLoadingAds] = useState(false)
   const [editingPod, setEditingPod] = useState<AdPod | null>(null)
   const [saving, setSaving] = useState(false)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
@@ -197,6 +212,52 @@ export default function AdPodsPage() {
     const newAssets = [...formData.assets]
     newAssets[index] = { ...newAssets[index], [field]: value }
     setFormData({ ...formData, assets: newAssets })
+  }
+
+  const loadAdsLibrary = async () => {
+    setLoadingAds(true)
+    try {
+      const data = await api.listAds()
+      // Filter to only show ready ads
+      const readyAds = (data.ads || []).filter((ad: Ad) => ad.transcode_status === 'ready')
+      setAds(readyAds)
+      setShowAdsLibrary(true)
+    } catch (err: any) {
+      showMessage('error', err.message || 'Failed to load ads library')
+    } finally {
+      setLoadingAds(false)
+    }
+  }
+
+  const selectAdFromLibrary = (ad: Ad) => {
+    // Parse variants from transcoded R2 HLS
+    let variants = []
+    if (ad.variants) {
+      try {
+        variants = JSON.parse(ad.variants)
+      } catch (e) {
+        console.warn('Failed to parse ad variants:', e)
+        variants = []
+      }
+    }
+
+    // If no variants, can't use this ad
+    if (variants.length === 0) {
+      showMessage('error', 'This ad has no transcoded variants. Please wait for transcoding to complete.')
+      return
+    }
+
+    setFormData({
+      ...formData,
+      name: formData.name || ad.name,
+      duration_sec: ad.duration || formData.duration_sec,
+      assets: variants.map((v: any) => ({ 
+        bitrate: v.bitrate, 
+        url: v.url || v.playlist_url 
+      }))
+    })
+    setShowAdsLibrary(false)
+    showMessage('success', `Ad "${ad.name}" selected! ${variants.length} bitrate variant(s) auto-populated from R2.`)
   }
 
   return (
@@ -407,13 +468,27 @@ export default function AdPodsPage() {
               <div>
                 <div className="flex justify-between items-center mb-4">
                   <h3 className="text-lg font-semibold">Bitrate Variants</h3>
-                  <button
-                    type="button"
-                    onClick={addAsset}
-                    className="px-3 py-1 text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700"
-                  >
-                    + Add Variant
-                  </button>
+                  <div className="flex gap-2">
+                    <button
+                      type="button"
+                      onClick={loadAdsLibrary}
+                      disabled={loadingAds}
+                      className="px-3 py-1 text-sm bg-green-600 text-white rounded-md hover:bg-green-700 disabled:opacity-50"
+                    >
+                      🎬 Browse Ads Library
+                    </button>
+                    <button
+                      type="button"
+                      onClick={addAsset}
+                      className="px-3 py-1 text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700"
+                    >
+                      + Add Variant
+                    </button>
+                  </div>
+                </div>
+                
+                <div className="mb-4 p-3 bg-blue-50 border border-blue-200 rounded-md text-sm text-blue-800">
+                  💡 <strong>Tip:</strong> Click "Browse Ads Library" to select a video you've already uploaded via the Ads Library. This will auto-populate all bitrate variants!
                 </div>
                 
                 <div className="space-y-4">
@@ -542,6 +617,71 @@ export default function AdPodsPage() {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* Ads Library Modal */}
+      {showAdsLibrary && (
+        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-lg max-w-5xl w-full max-h-[90vh] overflow-y-auto">
+            <div className="p-6 border-b flex justify-between items-center">
+              <div>
+                <h2 className="text-2xl font-bold">Browse Ads Library</h2>
+                <p className="text-sm text-gray-600 mt-1">Select an ad to auto-populate bitrate variants</p>
+              </div>
+              <button
+                onClick={() => setShowAdsLibrary(false)}
+                className="text-2xl text-gray-400 hover:text-gray-600"
+              >
+                &times;
+              </button>
+            </div>
+
+            <div className="p-6">
+              {loadingAds ? (
+                <div className="text-center py-12">
+                  <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto"></div>
+                  <p className="mt-4 text-gray-600">Loading ads...</p>
+                </div>
+              ) : ads.length === 0 ? (
+                <div className="text-center py-12">
+                  <div className="text-6xl mb-4">🎬</div>
+                  <h3 className="text-lg font-semibold text-gray-900 mb-2">No ready ads yet</h3>
+                  <p className="text-gray-600 mb-6">Upload and process ads in the Ads Library first</p>
+                  <a
+                    href="/ads"
+                    className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 inline-block"
+                  >
+                    Go to Ads Library
+                  </a>
+                </div>
+              ) : (
+                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {ads.map((ad) => (
+                    <button
+                      key={ad.id}
+                      onClick={() => selectAdFromLibrary(ad)}
+                      className="bg-white border-2 border-gray-200 hover:border-blue-500 rounded-lg overflow-hidden text-left transition-all"
+                    >
+                      <div className="w-full h-32 bg-gray-200 flex items-center justify-center text-4xl">
+                        🎬
+                      </div>
+                      
+                      <div className="p-3">
+                        <h3 className="font-semibold text-gray-900">{ad.name}</h3>
+                        {ad.description && (
+                          <p className="text-sm text-gray-600 mt-1 line-clamp-2">{ad.description}</p>
+                        )}
+                        <div className="mt-2 text-xs text-gray-500">
+                          ⏱️ Duration: {ad.duration}s
+                        </div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}

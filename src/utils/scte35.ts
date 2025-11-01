@@ -15,11 +15,13 @@ export function parseSCTE35FromManifest(manifestText: string): SCTE35Signal[] {
     if (line.startsWith("#EXT-X-DATERANGE:")) {
       const signal = parseDateRangeSCTE35(line)
       if (signal) {
+        console.log(`SCTE-35 signal detected: ${signal.id}, type: ${signal.type}, duration: ${signal.duration || signal.breakDuration}s`)
         signals.push(signal)
       }
     }
   }
   
+  console.log(`Total SCTE-35 signals found: ${signals.length}`)
   return signals
 }
 
@@ -41,7 +43,8 @@ function parseDateRangeSCTE35(line: string): SCTE35Signal | null {
   }
   
   const id = attrs["ID"] || `scte35-${Date.now()}`
-  const duration = attrs["DURATION"] ? parseFloat(attrs["DURATION"]) : undefined
+  const duration = attrs["DURATION"] ? parseFloat(attrs["DURATION"]) : 
+                   attrs["PLANNED-DURATION"] ? parseFloat(attrs["PLANNED-DURATION"]) : undefined
   const pts = attrs["X-PTS"] ? parseInt(attrs["X-PTS"], 10) : undefined
   
   // Determine signal type

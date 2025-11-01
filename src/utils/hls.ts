@@ -2,6 +2,25 @@
 
 export type VariantInfo = { bandwidth?: number; resolution?: string; uri: string }
 
+/**
+ * Extract bitrates (in kbps) from HLS master manifest
+ * Returns sorted array of bitrates for transcoding ladder matching
+ */
+export function extractBitrates(masterManifest: string): number[] {
+  const lines = masterManifest.split('\n')
+  const variants = parseVariant(lines)
+  
+  // Extract bandwidths and convert from bps to kbps
+  const bitrates = variants
+    .map(v => v.bandwidth)
+    .filter((bw): bw is number => bw !== undefined)
+    .map(bw => Math.round(bw / 1000)) // Convert bps to kbps
+    .sort((a, b) => a - b) // Sort ascending
+  
+  // Remove duplicates
+  return Array.from(new Set(bitrates))
+}
+
 /** Parse #EXT-X-STREAM-INF entries into a simple list */
 export function parseVariant(lines: string[]): VariantInfo[] {
   const out: VariantInfo[] = []

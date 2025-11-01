@@ -1,309 +1,479 @@
-# 🚀 Cloudflare Deployment Guide
+# 🚀 Production Deployment Guide - FFmpeg + R2 SSAI
 
-## Complete deployment of SSAI Admin Platform to Cloudflare
-
----
-
-## 📋 Prerequisites
-
-- Cloudflare account
-- Wrangler CLI installed and authenticated
-- D1 database created and initialized
-- All workers tested locally
+This guide walks you through deploying the production-ready SSAI ad management system using FFmpeg in Cloudflare Containers and R2 for storage.
 
 ---
 
-## 🗄️ Step 1: Deploy Admin API (Cloudflare Workers)
+## 📋 **Prerequisites**
 
-### **1.1 Set Production JWT Secret**
+Before you begin, ensure you have:
+
+- ✅ Cloudflare account with **Workers Paid plan** ($5/month)
+- ✅ Docker installed locally (for building container images)
+- ✅ Wrangler CLI installed (`npm install -g wrangler`)
+- ✅ Node.js 18+ installed
+- ✅ Access to your Cloudflare dashboard
+
+---
+
+## 🗄️ **Step 1: Database Migration**
+
+Apply the new database schema to remove Cloudflare Stream references and add R2 fields:
 
 ```bash
-# Generate a secure random secret
-openssl rand -hex 32
+cd /Users/markjohns/Development/cf-ssai
 
-# Set it as a secret
-wrangler secret put JWT_SECRET --config wrangler.admin.toml
-# Paste the generated secret when prompted
+# Apply migration to local D1
+npx wrangler d1 execute ssai-admin --local --file=./migrations/004_remove_stream_add_r2.sql
+
+# Apply migration to production D1
+npx wrangler d1 execute ssai-admin --remote --file=./migrations/004_remove_stream_add_r2.sql
 ```
 
-### **1.2 Update Production CORS (Optional)**
-
-If you know your production frontend URL:
-
-```toml
-# In wrangler.admin.toml
-[vars]
-ADMIN_CORS_ORIGIN = "https://ssai-admin.pages.dev"  # Your Pages URL
-```
-
-### **1.3 Deploy Admin API**
+**Verify the migration:**
 
 ```bash
-npm run deploy:admin-api
+# Local
+npx wrangler d1 execute ssai-admin --local --command="SELECT * FROM ads LIMIT 1"
+
+# Production
+npx wrangler d1 execute ssai-admin --remote --command="SELECT * FROM ads LIMIT 1"
 ```
 
-✅ **Result**: Admin API deployed to Cloudflare Workers
-- URL will be something like: `https://cf-ssai-admin-api.your-account.workers.dev`
-- Note this URL - you'll need it for the frontend
+**Expected new columns:**
+- `source_key` (TEXT)
+- `transcode_status` (TEXT)
+- `master_playlist_url` (TEXT)
+- `error_message` (TEXT)
+- `transcoded_at` (INTEGER)
+- `channel_id` (TEXT)
+
+**Removed columns:**
+- `stream_id`
+- `stream_status`
+- `stream_thumbnail_url`
 
 ---
 
-## 🎨 Step 2: Deploy Frontend (Cloudflare Pages)
+## 📦 **Step 2: Create R2 Bucket**
 
-### **2.1 Update Frontend Environment**
+Create the R2 bucket for ad storage:
 
-Update the API URL for production:
+```bash
+# Create the R2 bucket
+npx wrangler r2 bucket create ssai-ads
+
+# Enable public access (optional, for direct HLS playback)
+# Recommended: Use a custom domain with public access
+```
+
+**Configure Public Access (Recommended):**
+
+1. Go to Cloudflare Dashboard → R2
+2. Select `ssai-ads` bucket
+3. Settings → Public Access → Enable
+4. Configure custom domain (e.g., `ads.example.com`)
+5. Update `R2_PUBLIC_URL` in your configuration
+
+---
+
+## 🔐 **Step 3: Generate R2 API Credentials**
+
+Create API tokens for R2 access:
+
+1. **Cloudflare Dashboard** → R2 → **Manage R2 API Tokens**
+2. **Create API Token**
+3. **Permissions:**
+   - Object Read & Write
+4. **R2 Bucket:** `ssai-ads`
+5. Click **Create API Token**
+6. **Save these values:**
+   - Access Key ID
+   - Secret Access Key
+   - Account ID
+
+**Update `.dev.vars` for local development:**
+
+```bash
+# Edit .dev.vars
+R2_ACCOUNT_ID=your_account_id_here
+R2_ACCESS_KEY_ID=your_access_key_id_here
+R2_SECRET_ACCESS_KEY=your_secret_access_key_here
+R2_PUBLIC_URL=https://pub-XXXXX.r2.dev  # Or your custom domain
+```
+
+**Set production secrets:**
+
+```bash
+# Set R2 credentials as secrets
+npx wrangler secret put R2_ACCOUNT_ID
+# Paste your account ID and press Enter
+
+npx wrangler secret put R2_ACCESS_KEY_ID
+# Paste your access key ID and press Enter
+
+npx wrangler secret put R2_SECRET_ACCESS_KEY
+# Paste your secret access key and press Enter
+```
+
+---
+
+## 📬 **Step 4: Create Queue**
+
+Create the transcode queue:
+
+```bash
+# Create the transcode queue
+npx wrangler queues create transcode-queue
+
+# Create dead-letter queue for failed jobs
+npx wrangler queues create transcode-dlq
+```
+
+**Verify:**
+
+```bash
+npx wrangler queues list
+```
+
+You should see:
+- `transcode-queue`
+- `transcode-dlq`
+
+---
+
+## 🐳 **Step 5: Build and Deploy FFmpeg Container**
+
+### **5.1: Ensure Docker is Running**
+
+```bash
+# Check Docker is running
+docker info
+
+# If not running, start Docker Desktop
+```
+
+### **5.2: Test Container Locally (Optional)**
+
+```bash
+cd ffmpeg-container
+
+# Build locally
+docker build -t ffmpeg-transcode .
+
+# Test run
+docker run -p 8080:8080 -e PORT=8080 ffmpeg-transcode
+
+# In another terminal, test health endpoint
+curl http://localhost:8080/health
+```
+
+### **5.3: Deploy Transcode Worker with Container**
+
+```bash
+cd /Users/markjohns/Development/cf-ssai
+
+# Deploy the transcode worker (this builds and uploads the container)
+npx wrangler deploy --config wrangler-transcode.toml
+
+# This will:
+# 1. Build the Docker image from ffmpeg-container/Dockerfile
+# 2. Push the image to Cloudflare's Container Registry
+# 3. Deploy the transcode worker
+# 4. Configure the queue consumer
+```
+
+**⚠️ First Deployment Note:**
+
+After the first deployment, **wait 3-5 minutes** for the container image to be provisioned across Cloudflare's network before it can accept requests.
+
+**Check deployment status:**
+
+```bash
+# List containers
+npx wrangler containers list
+
+# List deployed images
+npx wrangler containers images list
+
+# Check transcode worker status
+npx wrangler deployments list --name cf-ssai-transcode
+```
+
+---
+
+## 🌐 **Step 6: Deploy Admin API Worker**
+
+Update and deploy the Admin API Worker:
+
+```bash
+cd /Users/markjohns/Development/cf-ssai
+
+# Deploy Admin API Worker
+# (This should be deployed as a separate worker or service)
+# Adjust the wrangler.toml if needed
+
+npx wrangler deploy --config wrangler-admin-api.toml
+# OR if it's the main worker:
+npx wrangler deploy
+```
+
+**Ensure the Admin API Worker has:**
+- ✅ R2 binding (`R2`)
+- ✅ Queue producer binding (`TRANSCODE_QUEUE`)
+- ✅ D1 binding (`DB`)
+
+---
+
+## 🎨 **Step 7: Deploy Admin Frontend**
+
+Build and deploy the Next.js admin frontend:
 
 ```bash
 cd admin-frontend
 
-# Create production .env file (optional, can set in Pages dashboard)
-echo "NEXT_PUBLIC_API_URL=https://cf-ssai-admin-api.your-account.workers.dev" > .env.production
-```
-
-### **2.2 Build the Frontend**
-
-```bash
-npm run build
-```
-
-### **2.3 Deploy to Cloudflare Pages**
-
-#### **Option A: Using Wrangler (Recommended)**
-
-```bash
-# Deploy the static build
-npx wrangler pages deploy .next --project-name=ssai-admin
-
-# Follow prompts to create the project
-```
-
-#### **Option B: Using Cloudflare Dashboard**
-
-1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com)
-2. Navigate to **Pages**
-3. Click **Create a project**
-4. Choose **Direct Upload**
-5. Upload the `.next` folder
-6. Set environment variable:
-   - Key: `NEXT_PUBLIC_API_URL`
-   - Value: `https://cf-ssai-admin-api.your-account.workers.dev`
-
-#### **Option C: GitHub Integration**
-
-1. Push your code to GitHub
-2. Connect repository in Cloudflare Pages
-3. Build settings:
-   - **Framework preset**: Next.js (Static HTML Export)
-   - **Build command**: `npm run build`
-   - **Build output directory**: `.next`
-4. Add environment variable:
-   - `NEXT_PUBLIC_API_URL`: Your API URL
-
-✅ **Result**: Frontend deployed to Cloudflare Pages
-- URL will be: `https://ssai-admin.pages.dev` (or custom domain)
-
----
-
-## 🔄 Step 3: Update CORS After Deployment
-
-Once you have your Pages URL, update the API's CORS:
-
-```bash
-# Edit wrangler.admin.toml
-[vars]
-ADMIN_CORS_ORIGIN = "https://ssai-admin.pages.dev"
-
-# Redeploy
-npm run deploy:admin-api
-```
-
----
-
-## 🚀 Step 4: Deploy All SSAI Workers
-
-Deploy the complete SSAI system:
-
-```bash
-# From project root
-npm run deploy:all
-```
-
-This deploys:
-- ✅ Manifest Worker
-- ✅ Decision Service
-- ✅ Beacon Consumer
-- ✅ VAST Parser
-- ✅ Admin API
-
----
-
-## ✅ Step 5: Verify Deployment
-
-### **Admin API Health Check**
-
-```bash
-curl https://cf-ssai-admin-api.your-account.workers.dev/health
-```
-
-Expected: `OK`
-
-### **Frontend Access**
-
-Visit: `https://ssai-admin.pages.dev`
-
-Login with:
-- Email: `admin@demo.com`
-- Password: `demo123`
-
-### **Test Full Flow**
-
-1. Login to admin platform
-2. Create a test channel
-3. View analytics (if any beacon data exists)
-
----
-
-## 🔐 Security Checklist
-
-- [ ] JWT_SECRET is set to a secure random value
-- [ ] CORS is configured for your production domain only
-- [ ] D1 database is in production (not local)
-- [ ] Password for demo account changed or disabled
-- [ ] All secrets are set (not in code)
-
----
-
-## 📊 Production URLs Summary
-
-After deployment, you'll have:
-
-```
-Frontend:  https://ssai-admin.pages.dev
-API:       https://cf-ssai-admin-api.your-account.workers.dev
-Manifest:  https://cf-ssai.your-account.workers.dev
-Decision:  https://cf-ssai-decision.your-account.workers.dev
-Beacon:    https://cf-ssai-beacon-consumer.your-account.workers.dev
-VAST:      https://cf-ssai-vast-parser.your-account.workers.dev
-```
-
----
-
-## 🔧 Troubleshooting
-
-### **Issue: CORS Error in Browser**
-
-**Solution**: Update `ADMIN_CORS_ORIGIN` in `wrangler.admin.toml` to match your Pages URL, then redeploy.
-
-### **Issue: Login Returns 401**
-
-**Possible causes**:
-1. JWT_SECRET not set → Run `wrangler secret put JWT_SECRET --config wrangler.admin.toml`
-2. Database not initialized → Run `npm run db:init`
-3. Wrong API URL → Check `NEXT_PUBLIC_API_URL` in Pages environment variables
-
-### **Issue: Build Fails**
-
-**Solution**: Ensure all dependencies are installed:
-```bash
-cd admin-frontend
-rm -rf node_modules
+# Install dependencies
 npm install
+
+# Build for production
 npm run build
+
+# Deploy to Cloudflare Pages
+npx wrangler pages deploy .next --project-name=cf-ssai-admin
+
+# Or use the Cloudflare Dashboard to connect your Git repository
+```
+
+**Environment Variables for Pages:**
+
+Set these in Cloudflare Dashboard → Pages → Settings → Environment Variables:
+
+```
+NEXT_PUBLIC_API_URL=https://your-admin-api.workers.dev
 ```
 
 ---
 
-## 🔄 Update Process
+## ✅ **Step 8: Verify Deployment**
 
-### **Update Admin API**
+### **8.1: Check All Services**
 
 ```bash
-# Make changes to src/admin-api-worker.ts
-npm run deploy:admin-api
+# Check transcode worker
+npx wrangler tail cf-ssai-transcode
+
+# Check admin API
+npx wrangler tail cf-ssai-admin
+
+# Check containers
+npx wrangler containers list
 ```
 
-### **Update Frontend**
+### **8.2: Test End-to-End Workflow**
+
+1. **Login to Admin GUI**
+   - Navigate to your Pages deployment URL
+   - Login with your credentials
+
+2. **Upload a Test Video**
+   - Go to "Ads Library"
+   - Click "Upload Ad"
+   - Select a short test video (30 seconds recommended)
+   - Upload and watch status
+
+3. **Monitor Transcode Progress**
+   - Status should change: `queued` → `processing` → `ready`
+   - Check logs: `npx wrangler tail cf-ssai-transcode`
+   - Should take 30-60 seconds for a 30-second video
+
+4. **Create an Ad Pod**
+   - Go to "Ad Pods"
+   - Click "Create Ad Pod"
+   - Click "Browse Ads Library"
+   - Select your transcoded ad
+   - Bitrate variants should auto-populate
+   - Save the Ad Pod
+
+5. **Verify R2 Files**
 
 ```bash
-cd admin-frontend
-# Make changes
-npm run build
-npx wrangler pages deploy .next --project-name=ssai-admin
+# List files in R2
+npx wrangler r2 object list ssai-ads --prefix="source-videos/"
+npx wrangler r2 object list ssai-ads --prefix="transcoded-ads/"
 ```
 
-### **Update Database Schema**
+### **8.3: Test HLS Playback**
 
 ```bash
-# Edit schema.sql
-wrangler d1 execute ssai-admin --file=./schema.sql --config wrangler.admin.toml --remote
+# Get the master playlist URL from the ad
+# Test with VLC or curl
+
+curl -I "https://pub-XXXXX.r2.dev/transcoded-ads/ad_XXX/master.m3u8"
 ```
 
-⚠️ **Warning**: This will reset the database. For production, use migrations.
+Should return `200 OK` with content type `application/x-mpegURL`.
 
 ---
 
-## 💰 Cost Estimate
+## 🔍 **Troubleshooting**
 
-### **Free Tier Limits**
+### **Container Not Starting**
 
-- **Workers**: 100,000 requests/day
-- **Pages**: Unlimited requests
-- **D1**: 5GB storage, 5M reads/day, 100K writes/day
+```bash
+# Check container status
+npx wrangler containers list
 
-### **Estimated Monthly Cost**
+# Check if image was deployed
+npx wrangler containers images list
 
-For small to medium deployments:
-- Workers: **$0** (within free tier)
-- Pages: **$0** (always free)
-- D1: **$0** (within free tier)
+# View transcode worker logs
+npx wrangler tail cf-ssai-transcode --format=pretty
+```
 
-**Total: $0/month** for most use cases! 🎉
+**Common issues:**
+- ❌ **Docker not running**: Start Docker Desktop
+- ❌ **Image build failed**: Check `ffmpeg-container/Dockerfile` syntax
+- ❌ **Container not provisioned**: Wait 3-5 minutes after first deployment
 
-For large deployments, costs scale affordably:
-- Workers: $0.50 per million requests
-- D1: $0.75 per million reads
+### **Transcode Jobs Failing**
+
+```bash
+# Check queue status
+npx wrangler queues consumer list transcode-queue
+
+# View dead-letter queue
+npx wrangler queues consumer list transcode-dlq
+
+# Check R2 permissions
+npx wrangler r2 object list ssai-ads
+```
+
+**Common issues:**
+- ❌ **R2 permissions**: Verify API token has read/write access
+- ❌ **FFmpeg error**: Check container logs for FFmpeg errors
+- ❌ **Out of memory**: Upgrade instance type to `standard-3` or `standard-4`
+
+### **Upload Fails**
+
+```bash
+# Check Admin API logs
+npx wrangler tail cf-ssai-admin --format=pretty
+
+# Check R2 bucket exists
+npx wrangler r2 bucket list
+```
+
+**Common issues:**
+- ❌ **R2 bucket not created**: Run `npx wrangler r2 bucket create ssai-ads`
+- ❌ **Queue not created**: Run `npx wrangler queues create transcode-queue`
+- ❌ **Missing secrets**: Run `npx wrangler secret put R2_ACCESS_KEY_ID` etc.
+
+### **Frontend Not Connecting to API**
+
+- ✅ Check `NEXT_PUBLIC_API_URL` environment variable in Pages settings
+- ✅ Check CORS settings in Admin API Worker
+- ✅ Check JWT_SECRET is set in both API and frontend
 
 ---
 
-## 🎯 Custom Domain (Optional)
+## 💰 **Cost Estimate**
 
-### **Add Custom Domain to Pages**
+### **Monthly Costs (100 Ads)**
 
-1. Go to Pages project settings
-2. Click **Custom domains**
-3. Add your domain (e.g., `admin.yourdomain.com`)
-4. Update DNS records as instructed
-5. Update CORS in `wrangler.admin.toml`
+| Service | Usage | Cost |
+|---------|-------|------|
+| Workers Paid Plan | Base | $5.00 |
+| Container Compute | ~10 minutes | ~$0.01 |
+| R2 Storage | ~1 GB | ~$0.02 |
+| R2 Operations | ~10,000 | ~$0.05 |
+| Queue Messages | ~200 | ~$0.00 |
+| **Total** | | **~$5.08/month** |
 
-### **Add Custom Domain to Workers**
+### **Per-Ad Cost**
 
-1. Go to Workers project settings
-2. Add custom domain (e.g., `api.yourdomain.com`)
-3. Update `NEXT_PUBLIC_API_URL` in Pages environment variables
+- Transcode (30s video): ~$0.001
+- Storage (10 MB): ~$0.0002/month
+- **Total per ad**: ~$0.0012
 
----
-
-## 📚 Next Steps
-
-1. ✅ Deploy admin platform
-2. ✅ Test with production data
-3. ✅ Change default passwords
-4. ✅ Configure custom domains
-5. ✅ Set up monitoring/alerts
-6. ✅ Create additional admin users
+**Comparison to Cloudflare Stream:**
+- Stream: $1/1000 min delivered + $5/1000 min stored
+- FFmpeg + R2: ~$5/month flat (for 100 ads)
+- **Savings**: ~$100-500/month (depending on volume)
 
 ---
 
-## 🆘 Support
+## 📊 **Monitoring**
 
-- [Cloudflare Workers Docs](https://developers.cloudflare.com/workers/)
-- [Cloudflare Pages Docs](https://developers.cloudflare.com/pages/)
-- [Cloudflare D1 Docs](https://developers.cloudflare.com/d1/)
+### **Cloudflare Dashboard**
+
+- **Workers → Analytics**: View request volume, errors
+- **R2 → Metrics**: View storage usage, bandwidth
+- **Queues → Dashboard**: View queue depth, processing rate
+
+### **Logs**
+
+```bash
+# Real-time logs
+npx wrangler tail cf-ssai-transcode --format=pretty
+npx wrangler tail cf-ssai-admin --format=pretty
+
+# Filter for errors
+npx wrangler tail cf-ssai-transcode --format=pretty | grep ERROR
+```
+
+### **Alerts (Optional)**
+
+Set up alerts in Cloudflare Dashboard for:
+- ⚠️ Queue depth > 10
+- ⚠️ Worker error rate > 5%
+- ⚠️ R2 storage > 90% of quota
 
 ---
 
-**Ready to deploy!** 🚀
+## 🔄 **Updates and Rollbacks**
 
-Run: `npm run deploy:admin-api && cd admin-frontend && npm run build && npx wrangler pages deploy .next --project-name=ssai-admin`
+### **Deploy New Code**
 
+```bash
+# Deploy transcode worker
+npx wrangler deploy --config wrangler-transcode.toml
+
+# Deploy admin API
+npx wrangler deploy --config wrangler-admin-api.toml
+```
+
+### **Rollback**
+
+```bash
+# List recent deployments
+npx wrangler deployments list --name cf-ssai-transcode
+
+# Rollback to specific version
+npx wrangler rollback --name cf-ssai-transcode --version-id=XXXXXXXX
+```
+
+---
+
+## 🎉 **You're Live!**
+
+Your production FFmpeg + R2 SSAI system is now deployed!
+
+**Next Steps:**
+1. Upload your first commercial
+2. Create ad pods with bitrate matching
+3. Test SSAI insertion
+4. Monitor logs and metrics
+5. Scale as needed
+
+**Need Help?**
+- Check logs: `npx wrangler tail <worker-name>`
+- Review architecture: `/Users/markjohns/Development/cf-ssai/PRODUCTION_ARCHITECTURE.md`
+- Bitrate matching guide: `/Users/markjohns/Development/cf-ssai/BITRATE_MATCHING_GUIDE.md`
+
+---
+
+**Production System Status:** ✅ Fully Deployed  
+**Cloudflare Stream:** ❌ Removed  
+**FFmpeg + R2:** ✅ Active  
+**Exact Bitrate Control:** ✅ Enabled  
+**Cost-Effective:** ✅ $5-10/month

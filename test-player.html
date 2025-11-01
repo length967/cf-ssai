@@ -1,0 +1,206 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>SSAI Test Player</title>
+  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <style>
+    body {
+      font-family: system-ui, -apple-system, sans-serif;
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 20px;
+      background: #f5f5f5;
+    }
+    h1 {
+      color: #333;
+    }
+    .container {
+      background: white;
+      padding: 20px;
+      border-radius: 8px;
+      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    video {
+      width: 100%;
+      max-width: 1000px;
+      background: black;
+      border-radius: 4px;
+    }
+    .controls {
+      margin: 20px 0;
+    }
+    select, button {
+      padding: 10px 15px;
+      margin: 5px;
+      font-size: 14px;
+      border: 1px solid #ddd;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button {
+      background: #0066cc;
+      color: white;
+      border: none;
+    }
+    button:hover {
+      background: #0052a3;
+    }
+    .stats {
+      margin-top: 20px;
+      padding: 15px;
+      background: #f9f9f9;
+      border-radius: 4px;
+      font-family: monospace;
+      font-size: 12px;
+    }
+    .stats div {
+      margin: 5px 0;
+    }
+    .error {
+      color: #d32f2f;
+      padding: 10px;
+      background: #ffebee;
+      border-radius: 4px;
+      margin: 10px 0;
+    }
+    .success {
+      color: #388e3c;
+      padding: 10px;
+      background: #e8f5e9;
+      border-radius: 4px;
+      margin: 10px 0;
+    }
+  </style>
+</head>
+<body>
+  <h1>🎬 SSAI Test Player</h1>
+  
+  <div class="container">
+    <div class="controls">
+      <label for="streamUrl">Stream URL:</label><br>
+      <select id="streamUrl" style="width: 100%; max-width: 600px; margin-top: 10px;">
+        <option value="http://localhost:8787/demo/sports/v_1600k.m3u8">Master Playlist</option>
+        <option value="http://localhost:8787/demo/sports/scte35-audio_eng=128000-video=1000000.m3u8" selected>Media Playlist (1Mbps)</option>
+        <option value="http://localhost:8787/demo/sports/scte35-audio_eng=128000.m3u8">Audio Only</option>
+      </select>
+      <br>
+      <button onclick="loadStream()">Load Stream</button>
+      <button onclick="player.play()">Play</button>
+      <button onclick="player.pause()">Pause</button>
+    </div>
+
+    <video id="video" controls autoplay muted></video>
+
+    <div id="status"></div>
+
+    <div class="stats" id="stats">
+      <div><strong>HLS.js Status</strong></div>
+      <div id="hlsStatus">Not loaded</div>
+    </div>
+  </div>
+
+  <script>
+    const video = document.getElementById('video');
+    const statusDiv = document.getElementById('status');
+    const statsDiv = document.getElementById('hlsStatus');
+    let hls = null;
+
+    function showStatus(message, type = 'info') {
+      statusDiv.innerHTML = `<div class="${type}">${message}</div>`;
+      setTimeout(() => { statusDiv.innerHTML = ''; }, 5000);
+    }
+
+    function updateStats(message) {
+      const time = new Date().toLocaleTimeString();
+      statsDiv.innerHTML = `[${time}] ${message}`;
+    }
+
+    function loadStream() {
+      const url = document.getElementById('streamUrl').value;
+      
+      if (Hls.isSupported()) {
+        if (hls) {
+          hls.destroy();
+        }
+
+        hls = new Hls({
+          debug: true,
+          enableWorker: true,
+          lowLatencyMode: true
+        });
+
+        hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {
+          updateStats(`Manifest loaded: ${data.levels.length} quality levels`);
+          showStatus('✅ Stream loaded successfully!', 'success');
+          video.play();
+        });
+
+        hls.on(Hls.Events.LEVEL_LOADED, function(event, data) {
+          updateStats(`Level loaded: ${data.details.totalduration}s duration, ${data.details.fragments.length} fragments`);
+        });
+
+        hls.on(Hls.Events.FRAG_LOADED, function(event, data) {
+          updateStats(`Fragment loaded: ${data.frag.sn} (${data.frag.duration.toFixed(2)}s)`);
+        });
+
+        hls.on(Hls.Events.ERROR, function(event, data) {
+          if (data.fatal) {
+            updateStats(`❌ FATAL ERROR: ${data.type} - ${data.details}`);
+            showStatus(`Fatal error: ${data.details}`, 'error');
+            
+            switch(data.type) {
+              case Hls.ErrorTypes.NETWORK_ERROR:
+                showStatus('Network error - retrying...', 'error');
+                hls.startLoad();
+                break;
+              case Hls.ErrorTypes.MEDIA_ERROR:
+                showStatus('Media error - recovering...', 'error');
+                hls.recoverMediaError();
+                break;
+              default:
+                showStatus('Unrecoverable error', 'error');
+                hls.destroy();
+                break;
+            }
+          } else {
+            updateStats(`⚠️ ${data.type}: ${data.details}`);
+          }
+        });
+
+        // Look for SCTE-35 markers
+        hls.on(Hls.Events.LEVEL_UPDATED, function(event, data) {
+          const dateRanges = data.details.dateRanges;
+          if (dateRanges && Object.keys(dateRanges).length > 0) {
+            const scte35Count = Object.values(dateRanges).filter(dr => 
+              dr.attr && (dr.attr['SCTE35-OUT'] || dr.attr['SCTE35-IN'])
+            ).length;
+            
+            if (scte35Count > 0) {
+              showStatus(`🎯 Found ${scte35Count} SCTE-35 ad marker(s)!`, 'success');
+            }
+          }
+        });
+
+        updateStats('Loading stream...');
+        hls.loadSource(url);
+        hls.attachMedia(video);
+        
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        // Native HLS support (Safari)
+        video.src = url;
+        updateStats('Using native HLS support');
+        showStatus('✅ Using native HLS playback', 'success');
+      } else {
+        showStatus('❌ HLS is not supported in this browser', 'error');
+      }
+    }
+
+    // Load automatically on page load
+    window.addEventListener('load', function() {
+      loadStream();
+    });
+  </script>
+</body>
+</html>
+

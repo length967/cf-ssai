@@ -188,6 +188,25 @@ async function processBeacon(
 
 export default {
   /**
+   * HTTP handler for health checks
+   */
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const url = new URL(req.url)
+    
+    if (url.pathname === "/health") {
+      return new Response("OK", { status: 200 })
+    }
+    
+    return new Response(JSON.stringify({ 
+      service: "beacon-consumer",
+      message: "This worker processes queue messages. No HTTP endpoints available."
+    }), { 
+      status: 200,
+      headers: { "Content-Type": "application/json" }
+    })
+  },
+
+  /**
    * Queue consumer: Process beacon messages in batches
    */
   async queue(

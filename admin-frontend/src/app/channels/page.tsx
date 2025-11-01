@@ -12,6 +12,7 @@ type Channel = {
   status: string
   mode: string
   scte35_enabled: number
+  scte35_auto_insert?: number
   vast_enabled: number
   vast_url?: string
   vast_timeout_ms?: number
@@ -19,14 +20,25 @@ type Channel = {
   ad_pod_base_url?: string
   sign_host?: string
   slate_pod_id?: string
+  time_based_auto_insert?: number
+  segment_cache_max_age?: number
+  manifest_cache_max_age?: number
   settings?: string
   created_at: number
   updated_at: number
 }
 
+type Organization = {
+  id: string
+  name: string
+  slug: string
+  status: string
+}
+
 export default function ChannelsPage() {
   const router = useRouter()
   const [channels, setChannels] = useState<Channel[]>([])
+  const [organization, setOrganization] = useState<Organization | null>(null)
   const [loading, setLoading] = useState(true)
   const [showModal, setShowModal] = useState(false)
   const [editingChannel, setEditingChannel] = useState<Channel | null>(null)
@@ -41,6 +53,7 @@ export default function ChannelsPage() {
     status: 'active',
     mode: 'auto',
     scte35_enabled: true,
+    scte35_auto_insert: false,
     vast_enabled: true,
     vast_url: '',
     vast_timeout_ms: 2000,
@@ -48,6 +61,9 @@ export default function ChannelsPage() {
     ad_pod_base_url: '',
     sign_host: '',
     slate_pod_id: 'slate',
+    time_based_auto_insert: false,
+    segment_cache_max_age: 60,
+    manifest_cache_max_age: 4,
     settings: {
       max_bitrate: null,
       min_bitrate: null,
@@ -56,18 +72,31 @@ export default function ChannelsPage() {
   })
 
   useEffect(() => {
-    loadChannels()
+    loadData()
   }, [])
 
-  const loadChannels = async () => {
+  const loadData = async () => {
     setLoading(true)
+    try {
+      const [channelsData, orgData] = await Promise.all([
+        api.getChannels(),
+        api.getOrganization()
+      ])
+      setChannels(channelsData.channels)
+      setOrganization(orgData.organization)
+    } catch (err: any) {
+      showMessage('error', err.message || 'Failed to load data')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const loadChannels = async () => {
     try {
       const { channels: channelList } = await api.getChannels()
       setChannels(channelList)
     } catch (err: any) {
       showMessage('error', err.message || 'Failed to load channels')
-    } finally {
-      setLoading(false)
     }
   }
 
@@ -85,6 +114,7 @@ export default function ChannelsPage() {
       status: 'active',
       mode: 'auto',
       scte35_enabled: true,
+      scte35_auto_insert: false,
       vast_enabled: true,
       vast_url: '',
       vast_timeout_ms: 2000,
@@ -92,6 +122,9 @@ export default function ChannelsPage() {
       ad_pod_base_url: '',
       sign_host: '',
       slate_pod_id: 'slate',
+      time_based_auto_insert: false,
+      segment_cache_max_age: 60,
+      manifest_cache_max_age: 4,
       settings: {
         max_bitrate: null,
         min_bitrate: null,
@@ -111,6 +144,7 @@ export default function ChannelsPage() {
       status: channel.status,
       mode: channel.mode,
       scte35_enabled: Boolean(channel.scte35_enabled),
+      scte35_auto_insert: Boolean(channel.scte35_auto_insert),
       vast_enabled: Boolean(channel.vast_enabled),
       vast_url: channel.vast_url || '',
       vast_timeout_ms: channel.vast_timeout_ms || 2000,
@@ -118,6 +152,9 @@ export default function ChannelsPage() {
       ad_pod_base_url: channel.ad_pod_base_url || '',
       sign_host: channel.sign_host || '',
       slate_pod_id: channel.slate_pod_id || 'slate',
+      time_based_auto_insert: Boolean(channel.time_based_auto_insert),
+      segment_cache_max_age: channel.segment_cache_max_age || 60,
+      manifest_cache_max_age: channel.manifest_cache_max_age || 4,
       settings: {
         max_bitrate: settings.max_bitrate || null,
         min_bitrate: settings.min_bitrate || null,
@@ -140,7 +177,9 @@ export default function ChannelsPage() {
       const payload = {
         ...formData,
         scte35_enabled: formData.scte35_enabled ? 1 : 0,
+        scte35_auto_insert: formData.scte35_auto_insert ? 1 : 0,
         vast_enabled: formData.vast_enabled ? 1 : 0,
+        time_based_auto_insert: formData.time_based_auto_insert ? 1 : 0,
         settings: formData.settings,
       }
 
@@ -338,6 +377,45 @@ export default function ChannelsPage() {
             </div>
 
             <form onSubmit={handleSubmit} className="p-6 space-y-6">
+              {/* Playback URL - Only shown when editing */}
+              {editingChannel && organization && (
+                <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                  <h3 className="text-lg font-semibold mb-2 text-blue-900">🎥 Stream Playback URL</h3>
+                  <p className="text-sm text-blue-700 mb-3">
+                    Use this URL to watch your live stream with server-side ad insertion:
+                  </p>
+                  <div className="bg-white border border-blue-300 rounded-md p-3 font-mono text-sm break-all">
+                    https://cf-ssai.mediamasters.workers.dev/{organization.slug}/{editingChannel.slug}/master.m3u8
+                  </div>
+                  <div className="mt-3 flex gap-2">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const url = `https://cf-ssai.mediamasters.workers.dev/${organization.slug}/${editingChannel.slug}/master.m3u8`
+                        navigator.clipboard.writeText(url)
+                        showMessage('success', 'URL copied to clipboard!')
+                      }}
+                      className="px-3 py-1 text-xs bg-blue-600 text-white rounded hover:bg-blue-700"
+                    >
+                      📋 Copy URL
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const url = `https://cf-ssai.mediamasters.workers.dev/${organization.slug}/${editingChannel.slug}/master.m3u8`
+                        window.open(url, '_blank')
+                      }}
+                      className="px-3 py-1 text-xs bg-green-600 text-white rounded hover:bg-green-700"
+                    >
+                      ▶️ Open in Browser
+                    </button>
+                  </div>
+                  <p className="mt-3 text-xs text-blue-600">
+                    💡 Tip: Test this URL in VLC, Safari, or any HLS-compatible player
+                  </p>
+                </div>
+              )}
+
               {/* Basic Information */}
               <div>
                 <h3 className="text-lg font-semibold mb-4">Basic Information</h3>
@@ -432,7 +510,72 @@ export default function ChannelsPage() {
                     />
                     <span className="ml-2 text-sm text-gray-700">Enable SCTE-35 Detection</span>
                   </label>
-                  <p className="text-sm text-gray-500">Automatically detect ad breaks from SCTE-35 markers in the stream</p>
+                  <p className="text-sm text-gray-500">Detect ad breaks from SCTE-35 markers in the stream</p>
+                  
+                  <label className="flex items-center">
+                    <input
+                      type="checkbox"
+                      checked={formData.scte35_auto_insert}
+                      onChange={(e) => setFormData({ ...formData, scte35_auto_insert: e.target.checked })}
+                      className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
+                      disabled={!formData.scte35_enabled}
+                    />
+                    <span className="ml-2 text-sm text-gray-700">Auto-Insert Ads on SCTE-35 Signals</span>
+                  </label>
+                  <p className="text-sm text-gray-500">Automatically trigger ad insertion when SCTE-35 markers are detected (disable to only trigger manually via API)</p>
+                </div>
+              </div>
+
+              {/* Auto-Insertion Configuration */}
+              <div>
+                <h3 className="text-lg font-semibold mb-4">Auto-Insertion</h3>
+                <div className="space-y-4">
+                  <label className="flex items-center">
+                    <input
+                      type="checkbox"
+                      checked={formData.time_based_auto_insert}
+                      onChange={(e) => setFormData({ ...formData, time_based_auto_insert: e.target.checked })}
+                      className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
+                    />
+                    <span className="ml-2 text-sm text-gray-700">Time-Based Auto-Insert</span>
+                  </label>
+                  <p className="text-sm text-gray-500">Insert ads at scheduled intervals (e.g., every 5 minutes) for testing</p>
+                </div>
+              </div>
+
+              {/* Cache Configuration */}
+              <div>
+                <h3 className="text-lg font-semibold mb-4">Cache Configuration</h3>
+                <div className="grid grid-cols-2 gap-6">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Segment Cache Max-Age (seconds)
+                    </label>
+                    <input
+                      type="number"
+                      value={formData.segment_cache_max_age}
+                      onChange={(e) => setFormData({ ...formData, segment_cache_max_age: parseInt(e.target.value) || 60 })}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      min="1"
+                      max="300"
+                    />
+                    <p className="mt-1 text-sm text-gray-500">How long browsers cache video segments (60-120 recommended for Safari)</p>
+                  </div>
+
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Manifest Cache Max-Age (seconds)
+                    </label>
+                    <input
+                      type="number"
+                      value={formData.manifest_cache_max_age}
+                      onChange={(e) => setFormData({ ...formData, manifest_cache_max_age: parseInt(e.target.value) || 4 })}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      min="1"
+                      max="30"
+                    />
+                    <p className="mt-1 text-sm text-gray-500">How long browsers cache the manifest (3-6 recommended for live streams)</p>
+                  </div>
                 </div>
               </div>
 

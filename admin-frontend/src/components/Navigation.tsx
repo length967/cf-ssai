@@ -44,6 +44,16 @@ export default function Navigation() {
                 Channels
               </a>
               <a
+                href="/ads"
+                className={`px-3 py-2 ${
+                  isActive('/ads')
+                    ? 'text-blue-600 font-medium'
+                    : 'text-gray-600 hover:text-gray-900'
+                }`}
+              >
+                Ads Library
+              </a>
+              <a
                 href="/ad-pods"
                 className={`px-3 py-2 ${
                   isActive('/ad-pods')

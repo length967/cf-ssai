@@ -65,6 +65,7 @@ CREATE TABLE channels (
     -- SCTE-35 Configuration
     scte35_enabled INTEGER NOT NULL DEFAULT 1, -- boolean (1 = true, 0 = false)
     scte35_fallback_schedule TEXT, -- JSON: {"interval_minutes": 5, "duration_sec": 30}
+    scte35_auto_insert INTEGER NOT NULL DEFAULT 0, -- Auto-insert ads on SCTE-35 signals (0 = disabled, 1 = enabled)
     
     -- VAST Configuration
     vast_enabled INTEGER NOT NULL DEFAULT 1,
@@ -75,9 +76,14 @@ CREATE TABLE channels (
     default_ad_duration INTEGER DEFAULT 30,
     ad_pod_base_url TEXT, -- Base URL for ad assets
     slate_pod_id TEXT DEFAULT 'slate',
+    time_based_auto_insert INTEGER NOT NULL DEFAULT 0, -- Auto-insert ads on time schedule (0 = disabled, 1 = enabled)
     
     -- URL Signing Configuration
     sign_host TEXT, -- Host used for URL signing (e.g., "media.example.com")
+    
+    -- Cache Configuration
+    segment_cache_max_age INTEGER DEFAULT 60, -- Segment cache TTL in seconds
+    manifest_cache_max_age INTEGER DEFAULT 4, -- Manifest cache TTL in seconds
     
     -- Settings
     settings JSON, -- Additional channel-specific settings

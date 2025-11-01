@@ -33,5 +33,8 @@
     "@cloudflare/workers-types": "^4.20241022.0",
     "tsx": "^4.7.0",
     "wrangler": "^4.45.3"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "^0.0.30"
   }
 }

@@ -19,6 +19,11 @@ new_classes = ["ChannelDO"]
 binding = "ADS_BUCKET"
 bucket_name = "ads-bucket"
 
+# R2 bucket for ad source files and transcoded HLS
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "ssai-ads"
+
 # D1 Database for per-channel multi-tenant configuration
 [[d1_databases]]
 binding = "DB"
@@ -36,6 +41,11 @@ id = "f03509ea56964ca3ad062b116a683dc4"
 binding = "BEACON_QUEUE"
 queue = "beacon-queue"
 
+# Queue for transcode jobs
+[[queues.producers]]
+binding = "TRANSCODE_QUEUE"
+queue = "transcode-queue"
+
 # Service bindings for worker-to-worker communication
 [[services]]
 binding = "DECISION"
@@ -43,22 +53,33 @@ service = "cf-ssai-decision"
 
 # Configuration
 [vars]
-ORIGIN_VARIANT_BASE = "https://origin.example.com/hls"   # your packager/Bunny Stream variant base
-AD_POD_BASE = "https://ads.example.com/pods"             # public (or guarded) R2 base
+# Global fallback defaults - these are overridden by per-channel configuration in the database
+ORIGIN_VARIANT_BASE = "https://pub-24423d0273094578a7f498bd462c2e20.r2.dev/origin"
+AD_POD_BASE = "https://pub-24423d0273094578a7f498bd462c2e20.r2.dev/transcoded-ads"
 WINDOW_BUCKET_SECS = "2"
-DECISION_TIMEOUT_MS = "150"
-SIGN_HOST = "media.example.com"                          # host used when signing URLs
+DECISION_TIMEOUT_MS = "2000"  # Increased to 2 seconds for database queries
+SIGN_HOST = "pub-24423d0273094578a7f498bd462c2e20.r2.dev"
+# Cache settings for HLS delivery (Safari compatibility)
+SEGMENT_CACHE_MAX_AGE = "60"                             # Segments are immutable, cache longer
+MANIFEST_CACHE_MAX_AGE = "4"                             # Manifests update frequently
+# Dev/testing mode - allows access without JWT authentication (set to "0" for production)
+DEV_ALLOW_NO_AUTH = "1"
 # tokens & keys set as secrets: JWT_PUBLIC_KEY, SEGMENT_SECRET
+# R2 configuration (set in .dev.vars for local, secrets for production)
+R2_PUBLIC_URL = "https://pub-24423d0273094578a7f498bd462c2e20.r2.dev"
+R2_ACCOUNT_ID = ""                                       # Set as secret
+R2_ACCESS_KEY_ID = ""                                    # Set as secret
+R2_SECRET_ACCESS_KEY = ""                                # Set as secret
 
 # Observability
 [observability]
 enabled = true
 
-# Sampling rates for high-traffic manifest worker
+# Sampling rates - set to 100% for debugging
 [observability.logs]
 enabled = true
-head_sampling_rate = 0.01  # 1% of requests - adjust based on traffic volume
+head_sampling_rate = 1.0  # 100% of requests - full logging for debugging
 
 [observability.traces]
 enabled = true
-head_sampling_rate = 0.10  # 10% of requests - traces are more valuable for debugging
+head_sampling_rate = 1.0  # 100% of requests - full tracing for debugging

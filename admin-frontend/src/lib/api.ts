@@ -191,6 +191,65 @@ class APIClient {
       method: 'DELETE'
     })
   }
+  
+  // Ads Library
+  async listAds() {
+    return this.request('/api/ads')
+  }
+  
+  async getAd(id: string) {
+    return this.request(`/api/ads/${id}`)
+  }
+  
+  async uploadAd(file: File, name: string, description?: string, channelId?: string) {
+    const token = this.getToken()
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('name', name)
+    if (description) {
+      formData.append('description', description)
+    }
+    if (channelId) {
+      formData.append('channel_id', channelId)
+    }
+    
+    // Note: Do NOT set Content-Type header manually for FormData
+    // The browser will automatically set it with the correct boundary parameter
+    const response = await fetch(`${API_URL}/api/ads/upload`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`
+        // Content-Type is intentionally omitted - browser sets it automatically
+      },
+      body: formData
+    })
+    
+    if (!response.ok) {
+      const error = await response.json()
+      throw new Error(error.error || 'Upload failed')
+    }
+    
+    return response.json()
+  }
+  
+  async updateAd(id: string, data: any) {
+    return this.request(`/api/ads/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    })
+  }
+  
+  async deleteAd(id: string) {
+    return this.request(`/api/ads/${id}`, {
+      method: 'DELETE'
+    })
+  }
+  
+  async refreshAdStatus(id: string) {
+    return this.request(`/api/ads/${id}/refresh`, {
+      method: 'POST'
+    })
+  }
 }
 
 export const api = new APIClient()

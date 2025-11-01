@@ -1,6 +1,7 @@
-import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, extractPDTs } from "./utils/hls"
+import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, extractPDTs, extractBitrates } from "./utils/hls"
 import { signPath } from "./utils/sign"
 import { parseSCTE35FromManifest, isAdBreakStart, getBreakDuration, findActiveBreak } from "./utils/scte35"
+import { getChannelConfig } from "./utils/channel-config"
 import type { Env } from "./manifest-worker"
 import type { DecisionResponse, BeaconMessage, SCTE35Signal } from "./types"
 
@@ -33,22 +34,146 @@ async function clearAdState(state: DurableObjectState): Promise<void> {
   await state.storage.delete(AD_STATE_KEY)
 }
 
+/**
+ * Detect and store bitrates from master manifest
+ * Updates the database with detected bitrates for GUI display and auto-configuration
+ */
+async function detectAndStoreBitrates(
+  env: Env,
+  channelId: string,
+  manifestContent: string
+): Promise<void> {
+  try {
+    // Check if this is a master manifest (contains #EXT-X-STREAM-INF)
+    if (!manifestContent.includes('#EXT-X-STREAM-INF')) {
+      return // Not a master manifest, skip detection
+    }
+    
+    // Extract bitrates from manifest
+    const detectedBitrates = extractBitrates(manifestContent)
+    
+    if (detectedBitrates.length === 0) {
+      console.warn(`No bitrates detected in manifest for channel ${channelId}`)
+      return
+    }
+    
+    console.log(`Detected bitrates for channel ${channelId}:`, detectedBitrates)
+    
+    // Check if bitrate_ladder is currently auto-detected or not set
+    const channel = await env.DB.prepare(`
+      SELECT bitrate_ladder, bitrate_ladder_source 
+      FROM channels 
+      WHERE id = ?
+    `).bind(channelId).first<any>()
+    
+    if (!channel) return
+    
+    const now = Date.now()
+    const bitratesJSON = JSON.stringify(detectedBitrates)
+    
+    // Update detected bitrates and timestamp
+    // Only auto-update bitrate_ladder if it's not manually configured
+    if (!channel.bitrate_ladder_source || channel.bitrate_ladder_source === 'auto') {
+      // Auto mode: update both detected_bitrates and bitrate_ladder
+      await env.DB.prepare(`
+        UPDATE channels 
+        SET detected_bitrates = ?,
+            bitrate_ladder = ?,
+            bitrate_ladder_source = 'auto',
+            last_bitrate_detection = ?
+        WHERE id = ?
+      `).bind(bitratesJSON, bitratesJSON, now, channelId).run()
+      
+      console.log(`Auto-updated bitrate ladder for channel ${channelId} to:`, detectedBitrates)
+    } else {
+      // Manual mode: only update detected_bitrates for reference
+      await env.DB.prepare(`
+        UPDATE channels 
+        SET detected_bitrates = ?,
+            last_bitrate_detection = ?
+        WHERE id = ?
+      `).bind(bitratesJSON, now, channelId).run()
+      
+      console.log(`Updated detected bitrates for channel ${channelId} (manual ladder preserved)`)
+    }
+  } catch (error) {
+    console.error(`Failed to detect/store bitrates for channel ${channelId}:`, error)
+  }
+}
+
+/**
+ * Strip origin SCTE-35 markers from manifest
+ * Safari can be confused by origin SCTE-35 markers; we only want our own ad markers
+ */
+function stripOriginSCTE35Markers(manifest: string): string {
+  const lines = manifest.split('\n')
+  const filtered: string[] = []
+  let skipNext = false
+  
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    
+    // Skip SCTE-35 related tags from origin
+    if (
+      line.includes('#EXT-X-DATERANGE') ||
+      line.includes('#EXT-X-CUE-OUT') ||
+      line.includes('#EXT-X-CUE-IN') ||
+      line.includes('## splice_insert') ||
+      line.includes('## Auto Return Mode')
+    ) {
+      // Skip this line unless it's OUR interstitial (has CLASS="com.apple.hls.interstitial")
+      if (line.includes('CLASS="com.apple.hls.interstitial"')) {
+        // This is our SGAI interstitial - keep it!
+        filtered.push(line)
+      }
+      // Otherwise skip origin SCTE-35 markers
+      continue
+    }
+    
+    filtered.push(line)
+  }
+  
+  return filtered.join('\n')
+}
+
 // -----------------------------------------------------------------------------
 // Helper: fetch origin or return fallback variant
 // -----------------------------------------------------------------------------
-async function fetchOriginVariant(originUrl: string, channel: string, variant: string): Promise<string> {
-  // Use per-channel origin URL
-  const u = `${originUrl}/${encodeURIComponent(variant)}`
+async function fetchOriginVariant(originUrl: string, channel: string, variant: string): Promise<Response> {
+  // Normalize origin URL: if it ends with .m3u8 or a file extension, strip it to get base path
+  // This handles both formats:
+  // - Base path: https://origin.com/path/to/stream
+  // - Full master manifest: https://origin.com/path/to/stream/.m3u8
+  let baseUrl = originUrl
+  if (baseUrl.endsWith('.m3u8') || baseUrl.endsWith('.isml/.m3u8')) {
+    // Remove the manifest filename to get base path
+    const lastSlash = baseUrl.lastIndexOf('/')
+    if (lastSlash > 0) {
+      baseUrl = baseUrl.substring(0, lastSlash)
+    }
+  }
+  
+  // Construct the full URL for the requested variant
+  const u = `${baseUrl}/${encodeURIComponent(variant)}`
+  console.log(`Fetching origin variant: ${u}`)
+  
   try {
     const r = await fetch(u, { cf: { cacheTtl: 1, cacheEverything: true } })
-    if (r.ok) return await r.text()
-  } catch {}
-  // DEV FALLBACK: simple 3-segment live-like variant
+    if (r.ok) {
+      console.log(`Origin fetch success: ${r.status} ${u}`)
+      return r
+    }
+    console.log(`Origin fetch failed: ${r.status} ${u}`)
+  } catch (err) {
+    console.log(`Origin fetch error: ${err}`)
+  }
+  
+  // DEV FALLBACK: simple 3-segment live-like variant (only for playlists)
   const base = new Date(Date.now() - 8_000)
   const pdt = (d: Date) => d.toISOString()
   const seg = (i: number) =>
     `#EXT-X-PROGRAM-DATE-TIME:${pdt(new Date(base.getTime() + i * 4000))}\n#EXTINF:4.000,\nseg_${1000 + i}.m4s`
-  return [
+  const fallback = [
     "#EXTM3U",
     "#EXT-X-VERSION:7",
     "#EXT-X-TARGETDURATION:4",
@@ -58,6 +183,10 @@ async function fetchOriginVariant(originUrl: string, channel: string, variant: s
     seg(2),
     ""
   ].join("\n")
+  
+  return new Response(fallback, {
+    headers: { "Content-Type": "application/vnd.apple.mpegurl" }
+  })
 }
 
 // -----------------------------------------------------------------------------
@@ -73,11 +202,18 @@ function wantsSGAI(req: Request): boolean {
 // Helper: extract bitrate from variant filename (e.g., "v_1600k.m3u8" → 1600000)
 // -----------------------------------------------------------------------------
 function extractBitrate(variant: string): number | null {
-  // Match patterns like: v_1600k, v_800k, 1600k, etc.
-  const match = variant.match(/(\d+)k/i)
-  if (match) {
-    return parseInt(match[1], 10) * 1000
+  // Match Unified Streaming format: video=1000000
+  const unifiedMatch = variant.match(/video=(\d+)/i)
+  if (unifiedMatch) {
+    return parseInt(unifiedMatch[1], 10)
   }
+  
+  // Match simple format: v_1600k, v_800k, 1600k, etc.
+  const simpleMatch = variant.match(/(\d+)k/i)
+  if (simpleMatch) {
+    return parseInt(simpleMatch[1], 10) * 1000
+  }
+  
   return null
 }
 
@@ -239,8 +375,32 @@ export class ChannelDO {
 
       if (!channel) return new Response("channel required", { status: 400 })
 
+      // Fetch full channel configuration (including auto-insert and cache settings)
+      const orgSlug = req.headers.get('X-Org-Slug') || null
+      const channelSlug = req.headers.get('X-Channel-Slug') || channel
+      const channelConfig = orgSlug ? await getChannelConfig(this.env, orgSlug, channelSlug) : null
+      
+      console.log(`Channel config loaded: orgSlug=${orgSlug}, channelSlug=${channelSlug}, config=`, JSON.stringify(channelConfig))
+
       // Use per-channel origin URL
-      const origin = await fetchOriginVariant(originUrl, channel, variant)
+      const originResponse = await fetchOriginVariant(originUrl, channel, variant)
+      
+      // For non-manifest files (segments), pass through directly without modification
+      if (!variant.endsWith('.m3u8')) {
+        return originResponse
+      }
+      
+      // For manifests, read as text for processing
+      const origin = await originResponse.text()
+
+      // Detect and store bitrates if this is a master manifest
+      // Fire-and-forget to avoid delaying the response
+      const channelIdHeader = req.headers.get('X-Channel-Id')
+      if (channelIdHeader) {
+        detectAndStoreBitrates(this.env, channelIdHeader, origin).catch(err => 
+          console.error('Bitrate detection failed:', err)
+        )
+      }
 
       // Load live ad state (if any) - this takes priority over other signals
       const adState = await loadAdState(this.state)
@@ -249,6 +409,10 @@ export class ChannelDO {
       // Parse SCTE-35 signals from origin manifest
       const scte35Signals = parseSCTE35FromManifest(origin)
       const activeBreak = findActiveBreak(scte35Signals)
+      
+      if (scte35Signals.length > 0) {
+        console.log(`Found ${scte35Signals.length} SCTE-35 signals, activeBreak:`, activeBreak ? `${activeBreak.id} (${activeBreak.duration}s)` : 'none')
+      }
 
       // Determine ad insertion mode: SGAI (server-guided) or SSAI (server-side)
       // - force parameter explicitly sets mode
@@ -274,8 +438,8 @@ export class ChannelDO {
         breakDurationSec = adState!.durationSec
         adSource = "api"
         console.log(`API-triggered ad break: duration=${breakDurationSec}s, podId=${adState!.podId}`)
-      } else if (activeBreak) {
-        // SCTE-35 signal detected - use it
+      } else if (activeBreak && channelConfig?.scte35AutoInsert) {
+        // SCTE-35 signal detected - use it (only if auto-insert enabled)
         shouldInsertAd = true
         breakDurationSec = getBreakDuration(activeBreak)
         adSource = "scte35"
@@ -286,28 +450,35 @@ export class ChannelDO {
           scte35StartPDT = pdts[pdts.length - 1]  // Use most recent PDT near signal
         }
         
-        console.log(`SCTE-35 break detected: duration=${breakDurationSec}s, pdt=${scte35StartPDT}`)
-      } else if (isBreakMinute) {
-        // Fallback to time-based schedule for testing
+        console.log(`SCTE-35 break detected (auto-insert enabled): duration=${breakDurationSec}s, pdt=${scte35StartPDT}`)
+      } else if (isBreakMinute && channelConfig?.timeBasedAutoInsert) {
+        // Fallback to time-based schedule (only if auto-insert enabled)
         shouldInsertAd = true
         adSource = "time"
-        console.log("Time-based ad break (no SCTE-35 signal)")
+        console.log("Time-based ad break (auto-insert enabled)")
       }
 
       // Only inject ads if conditions met
       if (shouldInsertAd) {
+        console.log(`✅ shouldInsertAd=true, adSource=${adSource}, mode=${mode}`)
+        
         const startISO = scte35StartPDT || new Date(Math.floor(now / 1000) * 1000).toISOString()
         
         // Extract viewer bitrate from variant and select matching ad pod
         const viewerBitrate = extractBitrate(variant)
         const adVariant = selectAdVariant(viewerBitrate)
         
+        console.log(`Calling decision service: channelId=${channelId}, duration=${breakDurationSec}s, bitrate=${viewerBitrate}`)
+        
         // Get ad decision from decision service (use per-channel ad pod base)
-        const decisionResponse = await decision(this.env, adPodBase, channel, breakDurationSec, {
+        // Pass channelId (e.g., "ch_demo_sports") not channel slug
+        const decisionResponse = await decision(this.env, adPodBase, channelId, breakDurationSec, {
           variant,
           bitrate: viewerBitrate,
           scte35: activeBreak
         })
+        
+        console.log(`Decision response received: podId=${decisionResponse.pod?.podId}, items=${decisionResponse.pod?.items?.length || 0}`)
         
         const pod = decisionResponse.pod
         const tracking = decisionResponse.tracking || { impressions: [], quartiles: {} }
@@ -351,8 +522,10 @@ export class ChannelDO {
             interstitialURI = await signAdPlaylist(signHost, this.env.SEGMENT_SECRET, adItem.playlistUrl)
           }
           
+          // Strip origin SCTE-35 markers before adding our interstitial
+          const cleanOrigin = stripOriginSCTE35Markers(origin)
           const sgai = addDaterangeInterstitial(
-            origin,
+            cleanOrigin,
             adActive ? (adState!.podId || "ad") : pod.podId,
             startISO,
             breakDurationSec,
@@ -379,8 +552,9 @@ export class ChannelDO {
               })
             
             if (adSegments.length > 0) {
+              const cleanOrigin = stripOriginSCTE35Markers(origin)
               const ssai = replaceSegmentsWithAds(
-                origin,
+                cleanOrigin,
                 scte35StartPDT,
                 adSegments,
                 breakDurationSec
@@ -391,7 +565,8 @@ export class ChannelDO {
           }
           
           // Fallback: Insert DISCONTINUITY only (legacy SSAI)
-          const ssai = insertDiscontinuity(origin)
+          const cleanOrigin = stripOriginSCTE35Markers(origin)
+          const ssai = insertDiscontinuity(cleanOrigin)
           await this.env.BEACON_QUEUE.send(beaconMsg)
           return new Response(ssai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
         }
@@ -402,8 +577,9 @@ export class ChannelDO {
         this.state.storage.delete(AD_STATE_KEY).catch(() => {})
       }
 
-      // No ad break: return origin manifest unchanged
-      return new Response(origin, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
+      // No ad break: return origin manifest, but strip origin SCTE-35 markers for Safari compatibility
+      const cleaned = stripOriginSCTE35Markers(origin)
+      return new Response(cleaned, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
     })
   }
 }

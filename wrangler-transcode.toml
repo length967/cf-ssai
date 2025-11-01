@@ -1,0 +1,57 @@
+name = "cf-ssai-transcode"
+main = "src/transcode-worker.ts"
+compatibility_date = "2025-10-01"
+workers_dev = true
+
+# D1 Database for ad status updates
+[[d1_databases]]
+binding = "DB"
+database_name = "ssai-admin"
+database_id = "0302f8ab-e592-4fa6-8bbf-7371759da6ed"
+
+# R2 bucket for ad storage
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "ssai-ads"
+
+# Queue consumer for transcode jobs
+[[queues.consumers]]
+queue = "transcode-queue"
+max_batch_size = 1
+max_batch_timeout = 10
+max_retries = 3
+dead_letter_queue = "transcode-dlq"
+
+# FFmpeg Container (Durable Object)
+[[durable_objects.bindings]]
+name = "FFMPEG_CONTAINER"
+class_name = "FFmpegContainer"
+
+# Container configuration
+[[containers]]
+class_name = "FFmpegContainer"
+image = "./ffmpeg-container/Dockerfile"
+instance_type = "standard-2"  # 1 vCPU, 6GB RAM, 12GB disk
+max_instances = 10
+
+# Migrations for the Container DO
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["FFmpegContainer"]
+
+# Configuration
+[vars]
+R2_PUBLIC_URL = "https://pub-24423d0273094578a7f498bd462c2e20.r2.dev"
+
+# Secrets (set via wrangler secret put)
+# R2_ACCOUNT_ID
+# R2_ACCESS_KEY_ID
+# R2_SECRET_ACCESS_KEY
+
+# Observability
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+

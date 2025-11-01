@@ -9,23 +9,42 @@ binding = "DB"
 database_name = "ssai-admin"
 database_id = "0302f8ab-e592-4fa6-8bbf-7371759da6ed"  # Replace after creating: wrangler d1 create ssai-admin
 
+# R2 bucket for ad storage
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "ssai-ads"
+
+# Queue for transcode jobs
+[[queues.producers]]
+binding = "TRANSCODE_QUEUE"
+queue = "transcode-queue"
+
+# KV for channel config caching (to invalidate on updates)
+[[kv_namespaces]]
+binding = "CHANNEL_CONFIG_CACHE"
+id = "f03509ea56964ca3ad062b116a683dc4"
+
 # Configuration
 [vars]
-ADMIN_CORS_ORIGIN = "https://ssai-admin.pages.dev"  # Production domain (matches all deployments)
+ADMIN_CORS_ORIGIN = "*"  # Allow all origins for Pages deployments (more secure: use specific domains in production)
+R2_PUBLIC_URL = "https://pub-24423d0273094578a7f498bd462c2e20.r2.dev"
 
 # Secrets (set via: wrangler secret put JWT_SECRET)
 # JWT_SECRET - Secret key for JWT tokens
+# R2_ACCOUNT_ID - Cloudflare account ID for R2
+# R2_ACCESS_KEY_ID - R2 API access key
+# R2_SECRET_ACCESS_KEY - R2 API secret key
 
 # Observability
 [observability]
 enabled = true
 
-# Sampling rates for admin API (lower traffic, more important to log)
+# Sampling rates - set to 100% for debugging
 [observability.logs]
 enabled = true
-head_sampling_rate = 0.20  # 20% of requests - capture more admin actions
+head_sampling_rate = 1.0  # 100% of requests - full logging for debugging
 
 [observability.traces]
 enabled = true
-head_sampling_rate = 0.20  # 20% of requests - good coverage for admin operations
+head_sampling_rate = 1.0  # 100% of requests - full tracing for debugging
 

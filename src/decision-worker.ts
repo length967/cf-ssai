@@ -4,8 +4,14 @@
 import type { DecisionResponse, AdPod, AdItem, VASTParseResponse } from "./types"
 
 export interface Env {
-  // R2 bucket for pre-normalized ad pods
+  // D1 Database for channel config and ad pods
+  DB: D1Database
+  
+  // R2 bucket for pre-normalized ad pods (legacy)
   ADS_BUCKET: R2Bucket
+  
+  // R2 bucket for transcoded HLS ads
+  R2: R2Bucket
   
   // KV for decision caching
   DECISION_CACHE?: KVNamespace
@@ -17,7 +23,7 @@ export interface Env {
   // VAST parser service binding
   VAST_PARSER?: Fetcher
   
-  // Configuration
+  // Configuration (global defaults - overridden by channel config)
   AD_POD_BASE: string
   DECISION_TIMEOUT_MS?: string
   CACHE_DECISION_TTL?: string
@@ -39,6 +45,32 @@ interface DecisionRequest {
     contentId?: string
     contentGenre?: string
   }
+}
+
+interface ChannelConfig {
+  id: string
+  organizationId: string
+  adPodBaseUrl?: string
+  vastUrl?: string
+  vastEnabled: boolean
+  slatePodId?: string
+}
+
+interface DBAdPod {
+  id: string
+  name: string
+  organizationId: string
+  channelId?: string
+  ads: string // JSON array of ad IDs
+}
+
+interface DBAd {
+  id: string
+  name: string
+  transcode_status: string
+  master_playlist_url?: string
+  variants?: string // JSON array of bitrate variants
+  duration?: number
 }
 
 /**
@@ -88,6 +120,95 @@ async function cacheDecision(
 }
 
 /**
+ * Get channel configuration from D1 database
+ */
+async function getChannelConfig(
+  env: Env,
+  channelId: string
+): Promise<ChannelConfig | null> {
+  try {
+    const result = await env.DB.prepare(`
+      SELECT 
+        c.id,
+        c.organization_id as organizationId,
+        c.ad_pod_base_url as adPodBaseUrl,
+        c.vast_url as vastUrl,
+        c.vast_enabled as vastEnabled,
+        c.slate_pod_id as slatePodId
+      FROM channels c
+      WHERE c.id = ? AND c.status = 'active'
+    `).bind(channelId).first<any>()
+    
+    if (!result) return null
+    
+    return {
+      id: result.id,
+      organizationId: result.organizationId,
+      adPodBaseUrl: result.adPodBaseUrl,
+      vastUrl: result.vastUrl,
+      vastEnabled: Boolean(result.vastEnabled),
+      slatePodId: result.slatePodId
+    }
+  } catch (error) {
+    console.error(`Failed to get channel config: ${error}`)
+    return null
+  }
+}
+
+/**
+ * Get ad pods for a channel from D1 database
+ */
+async function getAdPodsForChannel(
+  env: Env,
+  channelId: string,
+  organizationId: string
+): Promise<DBAdPod[]> {
+  try {
+    // Get pods for this channel or organization
+    const results = await env.DB.prepare(`
+      SELECT id, name, organization_id as organizationId, channel_id as channelId, ads
+      FROM ad_pods
+      WHERE (channel_id = ? OR channel_id IS NULL) 
+        AND organization_id = ?
+      ORDER BY created_at DESC
+      LIMIT 10
+    `).bind(channelId, organizationId).all()
+    
+    return results.results as DBAdPod[]
+  } catch (error) {
+    console.error(`Failed to get ad pods: ${error}`)
+    return []
+  }
+}
+
+/**
+ * Get ads by IDs from D1 database
+ */
+async function getAdsById(
+  env: Env,
+  adIds: string[]
+): Promise<DBAd[]> {
+  if (adIds.length === 0) return []
+  
+  try {
+    const placeholders = adIds.map(() => '?').join(',')
+    const query = `
+      SELECT id, name, transcode_status, master_playlist_url, variants, duration
+      FROM ads
+      WHERE id IN (${placeholders}) 
+        AND transcode_status = 'ready'
+      ORDER BY created_at DESC
+    `
+    
+    const results = await env.DB.prepare(query).bind(...adIds).all()
+    return results.results as DBAd[]
+  } catch (error) {
+    console.error(`Failed to get ads: ${error}`)
+    return []
+  }
+}
+
+/**
  * Call external ad decision API
  */
 async function fetchExternalDecision(
@@ -133,7 +254,31 @@ async function fetchExternalDecision(
 }
 
 /**
- * Build ad pod items for different bitrates
+ * Build ad pod items from database ad with transcoded variants
+ */
+function buildAdItemsFromAd(
+  ad: DBAd,
+  trackingUrls?: string[]
+): AdItem[] {
+  if (!ad.variants) return []
+  
+  try {
+    const variants = JSON.parse(ad.variants) as Array<{ bitrate: number; url: string }>
+    
+    return variants.map(variant => ({
+      adId: ad.id,
+      bitrate: variant.bitrate,
+      playlistUrl: variant.url,
+      tracking: trackingUrls ? { impression: trackingUrls } : undefined
+    }))
+  } catch (error) {
+    console.error(`Failed to parse ad variants: ${error}`)
+    return []
+  }
+}
+
+/**
+ * Build ad pod items for different bitrates (legacy/fallback)
  */
 function buildAdItems(
   env: Env,
@@ -224,26 +369,26 @@ async function parseVAST(
 }
 
 /**
- * Simulate VAST waterfall with multiple ad sources
- * In production, this would call multiple ad servers in priority order
+ * Database-driven ad waterfall with VAST, DB pods, and fallback
  */
-async function runVastWaterfall(
+async function runAdWaterfall(
   env: Env,
-  req: DecisionRequest
+  req: DecisionRequest,
+  channelConfig: ChannelConfig | null
 ): Promise<DecisionResponse | null> {
   // Waterfall priority:
-  // 1. VAST-based dynamic ads (programmatic/direct sold)
-  // 2. Pre-transcoded R2 pods (house ads)
-  // 3. Fallback to slate
+  // 1. VAST-based dynamic ads (if enabled for channel)
+  // 2. Database ad pods (uploaded via GUI)
+  // 3. Return null (caller will use slate fallback)
   
-  const channel = req.channel
   const durationSec = req.durationSec
   
-  // Priority 1: Try VAST parser if VAST_URL is configured
-  if (env.VAST_URL && env.VAST_PARSER) {
-    console.log(`Attempting VAST fetch: ${env.VAST_URL}`)
+  // Priority 1: Try VAST if enabled for this channel
+  const vastUrl = channelConfig?.vastUrl || env.VAST_URL
+  if (vastUrl && channelConfig?.vastEnabled && env.VAST_PARSER) {
+    console.log(`Attempting VAST fetch: ${vastUrl}`)
     
-    const vastResult = await parseVAST(env, env.VAST_URL, durationSec)
+    const vastResult = await parseVAST(env, vastUrl, durationSec)
     
     if (vastResult && vastResult.pod && vastResult.pod.items.length > 0) {
       console.log(`VAST parsing successful: pod=${vastResult.pod.podId}`)
@@ -257,49 +402,57 @@ async function runVastWaterfall(
     console.warn("VAST parsing failed or returned no ads")
   }
   
-  // Priority 2: Pre-transcoded R2 pods based on channel type
-  const podMap: Record<string, string> = {
-    "sports": "sports-pod-premium",
-    "news": "news-pod-standard",
-    "entertainment": "entertainment-pod-premium",
-  }
-  
-  const channelType = channel.includes("sport") ? "sports" 
-    : channel.includes("news") ? "news" 
-    : "entertainment"
-  
-  const podId = podMap[channelType] || "example-pod"
-  
-  // Check if pod exists in R2
-  try {
-    const podExists = await env.ADS_BUCKET.head(`${podId}/v_1600k/playlist.m3u8`)
+  // Priority 2: Database ad pods (transcoded ads)
+  if (channelConfig) {
+    const adPods = await getAdPodsForChannel(env, channelConfig.id, channelConfig.organizationId)
     
-    if (podExists) {
-      console.log(`Using R2 pod: ${podId}`)
+    if (adPods.length > 0) {
+      // Pick the first available pod (could be randomized or weighted)
+      const selectedPod = adPods[0]
+      console.log(`Selected ad pod from DB: ${selectedPod.id} (${selectedPod.name})`)
       
-      return {
-        pod: {
-          podId,
-          durationSec,
-          items: buildAdItems(env, podId, `${podId}-ad-1`, [
-            `https://tracking.example.com/imp?pod=${podId}`,
-          ]),
-        },
-        tracking: {
-          impressions: [`https://tracking.example.com/imp?pod=${podId}`],
-          quartiles: {
-            start: [`https://tracking.example.com/start?pod=${podId}`],
-            firstQuartile: [`https://tracking.example.com/q1?pod=${podId}`],
-            midpoint: [`https://tracking.example.com/mid?pod=${podId}`],
-            thirdQuartile: [`https://tracking.example.com/q3?pod=${podId}`],
-            complete: [`https://tracking.example.com/complete?pod=${podId}`]
+      // Parse ad IDs from the pod
+      const adIds = JSON.parse(selectedPod.ads) as string[]
+      
+      // Get the actual ad details
+      const ads = await getAdsById(env, adIds)
+      
+      if (ads.length > 0) {
+        // Build ad items from all ads in the pod
+        const allItems: AdItem[] = []
+        let totalDuration = 0
+        
+        for (const ad of ads) {
+          const items = buildAdItemsFromAd(ad)
+          if (items.length > 0) {
+            allItems.push(...items)
+            totalDuration += ad.duration || 30
+          }
+          
+          // Stop if we've filled the ad break duration
+          if (totalDuration >= durationSec) break
+        }
+        
+        if (allItems.length > 0) {
+          console.log(`Using database pod: ${selectedPod.id} with ${ads.length} ads (${allItems.length} variants)`)
+          
+          return {
+            pod: {
+              podId: selectedPod.id,
+              durationSec: Math.min(totalDuration, durationSec),
+              items: allItems
+            },
+            tracking: {
+              impressions: [`https://tracking.example.com/imp?pod=${selectedPod.id}`]
+            }
           }
         }
       }
+      
+      console.warn(`Pod ${selectedPod.id} has no ready ads`)
+    } else {
+      console.warn(`No ad pods found for channel ${channelConfig.id}`)
     }
-  } catch {
-    // Pod doesn't exist in R2, fall through
-    console.warn(`R2 pod not found: ${podId}`)
   }
   
   return null
@@ -312,6 +465,15 @@ async function makeDecision(
   env: Env,
   req: DecisionRequest
 ): Promise<DecisionResponse> {
+  // Get channel configuration from database
+  const channelConfig = await getChannelConfig(env, req.channel)
+  
+  if (channelConfig) {
+    console.log(`Channel config loaded: ${channelConfig.id} (org: ${channelConfig.organizationId})`)
+  } else {
+    console.warn(`No channel config found for: ${req.channel}`)
+  }
+  
   // Try external API first
   const externalDecision = await fetchExternalDecision(env, req)
   if (externalDecision) {
@@ -319,17 +481,25 @@ async function makeDecision(
     return externalDecision
   }
   
-  // Try VAST waterfall
-  const waterfallDecision = await runVastWaterfall(env, req)
+  // Try ad waterfall (VAST + Database pods)
+  const waterfallDecision = await runAdWaterfall(env, req, channelConfig)
   if (waterfallDecision) {
-    console.log("Decision from VAST waterfall")
+    console.log("Decision from ad waterfall")
     return waterfallDecision
   }
   
   // Fallback to slate
   console.log("Falling back to slate")
+  
+  // Use channel-specific slate pod ID if configured
+  const slatePodId = channelConfig?.slatePodId || env.SLATE_POD_ID || 'slate'
+  
   return {
-    pod: createSlatePod(env, req.durationSec),
+    pod: {
+      podId: slatePodId,
+      durationSec: req.durationSec,
+      items: buildAdItems(env, slatePodId, 'slate-filler')
+    }
   }
 }
 

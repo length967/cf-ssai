@@ -20,6 +20,7 @@ export interface ChannelConfig {
     intervalMinutes: number;
     durationSec: number;
   };
+  scte35AutoInsert: boolean; // Auto-insert ads on SCTE-35 signals
   
   // VAST Configuration
   vastEnabled: boolean;
@@ -29,6 +30,11 @@ export interface ChannelConfig {
   // Ad Configuration
   defaultAdDuration: number;
   slatePodId: string;
+  timeBasedAutoInsert: boolean; // Auto-insert ads on time schedule
+  
+  // Cache Configuration
+  segmentCacheMaxAge: number; // Segment cache TTL in seconds
+  manifestCacheMaxAge: number; // Manifest cache TTL in seconds
   
   // Status
   status: 'active' | 'paused' | 'archived';
@@ -78,11 +84,15 @@ export async function getChannelConfig(
         c.sign_host as signHost,
         c.scte35_enabled as scte35Enabled,
         c.scte35_fallback_schedule as scte35FallbackSchedule,
+        c.scte35_auto_insert as scte35AutoInsert,
         c.vast_enabled as vastEnabled,
         c.vast_url as vastUrl,
         c.vast_timeout_ms as vastTimeoutMs,
         c.default_ad_duration as defaultAdDuration,
         c.slate_pod_id as slatePodId,
+        c.time_based_auto_insert as timeBasedAutoInsert,
+        c.segment_cache_max_age as segmentCacheMaxAge,
+        c.manifest_cache_max_age as manifestCacheMaxAge,
         c.status,
         c.mode
       FROM channels c
@@ -103,10 +113,14 @@ export async function getChannelConfig(
     scte35FallbackSchedule: result.scte35FallbackSchedule 
       ? JSON.parse(result.scte35FallbackSchedule)
       : undefined,
+    scte35AutoInsert: Boolean(result.scte35AutoInsert),
     vastEnabled: Boolean(result.vastEnabled),
     vastTimeoutMs: result.vastTimeoutMs || 2000,
     defaultAdDuration: result.defaultAdDuration || 30,
     slatePodId: result.slatePodId || 'slate',
+    timeBasedAutoInsert: Boolean(result.timeBasedAutoInsert),
+    segmentCacheMaxAge: result.segmentCacheMaxAge || 60,
+    manifestCacheMaxAge: result.manifestCacheMaxAge || 4,
   };
   
   // Cache in KV for next time (if available)
