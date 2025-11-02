@@ -135,21 +135,30 @@ function getAverageSegmentDuration(lines: string[]): number {
 /**
  * Replace content segments with ad segments for true SSAI
  * Inserts DISCONTINUITY tags before and after ad pod
+ * 
+ * @param variantText - Original manifest
+ * @param scte35StartPDT - PDT where ad break starts
+ * @param adSegments - Ad segments with actual durations
+ * @param adDuration - Actual ad duration (sum of ad segment durations)
+ * @param scte35Duration - SCTE-35 break duration (how much content to skip)
  */
 export function replaceSegmentsWithAds(
   variantText: string,
   scte35StartPDT: string,
   adSegments: Array<{url: string, duration: number}> | string[],
-  adDuration: number
+  adDuration: number,
+  scte35Duration?: number  // Optional: SCTE-35 duration if different from ad duration
 ): string {
+  // Use SCTE-35 duration for content skipping, or fall back to ad duration
+  const contentSkipDuration = scte35Duration || adDuration
   const lines = variantText.split("\n")
   const output: string[] = []
   
   // Detect actual segment duration from content manifest
   const contentSegmentDuration = getAverageSegmentDuration(lines)
-  const segmentsToReplace = Math.ceil(adDuration / contentSegmentDuration)
+  const segmentsToReplace = Math.ceil(contentSkipDuration / contentSegmentDuration)
   
-  console.log(`Ad duration: ${adDuration}s, Content segment duration: ${contentSegmentDuration}s, Segments to skip: ${segmentsToReplace}`)
+  console.log(`Ad duration: ${adDuration}s, SCTE-35 duration: ${contentSkipDuration}s, Content segment duration: ${contentSegmentDuration}s, Segments to skip: ${segmentsToReplace}`)
   
   let foundMarker = false
   let segmentsReplaced = 0
@@ -199,14 +208,28 @@ export function replaceSegmentsWithAds(
       // Add DISCONTINUITY after ad
       output.push("#EXT-X-DISCONTINUITY")
       
+      // CRITICAL FIX: Resume PDT must match SCTE-35 duration, not ad duration
+      // If ad is 30s but SCTE-35 says skip 38.4s, resume PDT = start + 38.4s
+      // This maintains correct timeline synchronization
+      const resumePDT = addSecondsToTimestamp(startPDT, contentSkipDuration)
+      console.log(`Inserting resume PDT after ad: ${resumePDT} (SCTE-35 skip: ${contentSkipDuration}s, Ad duration: ${adDuration}s)`)
+      output.push(`#EXT-X-PROGRAM-DATE-TIME:${resumePDT}`)
+      
       // Skip the next N content segments
       let skipped = 0
+      const skipStartIndex = i
       while (i < lines.length && skipped < segmentsToReplace) {
         i++
         if (i < lines.length && !lines[i].startsWith("#") && lines[i].trim().length > 0) {
           skipped++
         }
       }
+      
+      // Decrement i by 1 because the outer for loop will increment it
+      // Without this, we skip twice as many segments as intended
+      i--
+      
+      console.log(`Skipped ${skipped} content segments (target: ${segmentsToReplace}) from index ${skipStartIndex} to ${i}`)
       
       continue
     }

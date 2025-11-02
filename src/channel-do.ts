@@ -154,7 +154,9 @@ async function fetchOriginVariant(originUrl: string, channel: string, variant: s
   }
   
   // Construct the full URL for the requested variant
-  const u = `${baseUrl}/${encodeURIComponent(variant)}`
+  // NOTE: Don't use encodeURIComponent() - the = signs are part of the filename!
+  // Unified Streaming format: scte35-audio_eng=64000-video=500000.m3u8
+  const u = `${baseUrl}/${variant}`
   console.log(`Fetching origin variant: ${u}`)
   
   try {
@@ -168,12 +170,24 @@ async function fetchOriginVariant(originUrl: string, channel: string, variant: s
     console.log(`Origin fetch error: ${err}`)
   }
   
-  // Origin fetch failed - return proper error instead of fake segments
+  // Origin fetch failed - return HLS slate manifest (not plain text!)
   console.error(`Origin unavailable for: ${u}`)
-  return new Response("Origin unavailable", { 
-    status: 502,
-    statusText: "Bad Gateway",
-    headers: { "Content-Type": "text/plain" }
+  
+  // Return a minimal valid HLS manifest with a slate message
+  const slateManifest = `#EXTM3U
+#EXT-X-VERSION:3
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:0
+#EXTINF:10.0,
+#EXT-X-ENDLIST
+`
+  
+  return new Response(slateManifest, { 
+    status: 200,  // Return 200 so HLS.js doesn't error immediately
+    headers: { 
+      "Content-Type": "application/vnd.apple.mpegurl",
+      "Cache-Control": "no-cache"
+    }
   })
 }
 
@@ -686,13 +700,15 @@ export class ChannelDO {
                 
                 if (adSegments.length > 0) {
                   const cleanOrigin = stripOriginSCTE35Markers(origin)
-                  // CRITICAL: Use actual ad duration, not SCTE-35 duration
-                  // This ensures we skip the correct number of content segments
+                  // CRITICAL FIX: Pass both ad duration AND SCTE-35 duration
+                  // - totalDuration: actual ad length (e.g., 30s) - for PDT of ad segments
+                  // - breakDurationSec: SCTE-35 duration (e.g., 38.4s) - for content skipping & resume PDT
                   const ssai = replaceSegmentsWithAds(
                     cleanOrigin,
                     scte35StartPDT,
                     adSegments,
-                    totalDuration  // ← Use actual ad duration, not breakDurationSec
+                    totalDuration,        // Actual ad duration (for ad segment PDTs)
+                    breakDurationSec      // SCTE-35 duration (for content skipping & resume PDT)
                   )
                   await this.env.BEACON_QUEUE.send(beaconMsg)
                   return new Response(ssai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
