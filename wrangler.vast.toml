@@ -8,10 +8,10 @@ workers_dev = true
 binding = "VAST_CACHE"
 id = "30ef6cf22c354288a74b6d8ba001b5b0"
 
-# R2 bucket for ads (shared with other workers)
+# R2 bucket for VAST XML caching (shared with other workers)
 [[r2_buckets]]
 binding = "ADS_BUCKET"
-bucket_name = "ads-bucket"
+bucket_name = "ssai-ads"
 
 # Configuration
 [vars]

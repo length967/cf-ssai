@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Ad Variants Display Component</title>
+  <style>
+    .ad-card {
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      padding: 16px;
+      margin-bottom: 16px;
+      background: white;
+    }
+    
+    .ad-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 12px;
+    }
+    
+    .ad-title {
+      font-size: 18px;
+      font-weight: bold;
+    }
+    
+    .ad-status {
+      padding: 4px 12px;
+      border-radius: 12px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+    
+    .status-ready {
+      background: #d4edda;
+      color: #155724;
+    }
+    
+    .status-processing {
+      background: #fff3cd;
+      color: #856404;
+    }
+    
+    .status-queued {
+      background: #d1ecf1;
+      color: #0c5460;
+    }
+    
+    .status-error {
+      background: #f8d7da;
+      color: #721c24;
+    }
+    
+    .variants-section {
+      margin-top: 16px;
+    }
+    
+    .variants-header {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 8px;
+      font-weight: 500;
+    }
+    
+    .variant-count {
+      background: #007bff;
+      color: white;
+      padding: 2px 8px;
+      border-radius: 12px;
+      font-size: 12px;
+    }
+    
+    .variants-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+    
+    .variant-card {
+      border: 1px solid #e0e0e0;
+      border-radius: 6px;
+      padding: 12px;
+      background: #f8f9fa;
+    }
+    
+    .variant-bitrate {
+      font-size: 16px;
+      font-weight: bold;
+      color: #007bff;
+      margin-bottom: 4px;
+    }
+    
+    .variant-detail {
+      font-size: 12px;
+      color: #666;
+      margin: 2px 0;
+    }
+    
+    .variant-url {
+      font-size: 11px;
+      color: #999;
+      word-break: break-all;
+      margin-top: 8px;
+    }
+    
+    .no-variants {
+      color: #999;
+      font-style: italic;
+      padding: 12px;
+      text-align: center;
+      background: #f8f9fa;
+      border-radius: 4px;
+    }
+    
+    .bitrate-badges {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 8px;
+    }
+    
+    .bitrate-badge {
+      background: #e7f3ff;
+      color: #0066cc;
+      padding: 4px 10px;
+      border-radius: 4px;
+      font-size: 12px;
+      font-weight: 500;
+    }
+  </style>
+</head>
+<body>
+  <div id="ads-container"></div>
+
+  <script>
+    // Example API response format
+    const exampleAd = {
+      id: "ad_1761998592294",
+      name: "Beer Commercial",
+      description: "30 second beer ad",
+      transcode_status: "ready",
+      duration: 30.06,
+      variant_count: 5,
+      variant_bitrates: [800000, 1000000, 1600000, 2000000, 3000000],
+      variants_detailed: [
+        {
+          bitrate: 800000,
+          bitrate_kbps: 800,
+          bitrate_mbps: "0.80",
+          url: "https://pub.r2.dev/transcoded-ads/ad_123/800k/playlist.m3u8",
+          resolution: "640x360"
+        },
+        {
+          bitrate: 1000000,
+          bitrate_kbps: 1000,
+          bitrate_mbps: "1.00",
+          url: "https://pub.r2.dev/transcoded-ads/ad_123/1000k/playlist.m3u8",
+          resolution: "854x480"
+        },
+        {
+          bitrate: 1600000,
+          bitrate_kbps: 1600,
+          bitrate_mbps: "1.60",
+          url: "https://pub.r2.dev/transcoded-ads/ad_123/1600k/playlist.m3u8",
+          resolution: "1280x720"
+        },
+        {
+          bitrate: 2000000,
+          bitrate_kbps: 2000,
+          bitrate_mbps: "2.00",
+          url: "https://pub.r2.dev/transcoded-ads/ad_123/2000k/playlist.m3u8",
+          resolution: "1280x720"
+        },
+        {
+          bitrate: 3000000,
+          bitrate_kbps: 3000,
+          bitrate_mbps: "3.00",
+          url: "https://pub.r2.dev/transcoded-ads/ad_123/3000k/playlist.m3u8",
+          resolution: "1920x1080"
+        }
+      ]
+    };
+
+    function getStatusClass(status) {
+      const statusMap = {
+        'ready': 'status-ready',
+        'processing': 'status-processing',
+        'queued': 'status-queued',
+        'error': 'status-error'
+      };
+      return statusMap[status] || 'status-queued';
+    }
+
+    function renderAdCard(ad) {
+      return `
+        <div class="ad-card">
+          <div class="ad-header">
+            <div class="ad-title">${ad.name}</div>
+            <div class="ad-status ${getStatusClass(ad.transcode_status)}">
+              ${ad.transcode_status.toUpperCase()}
+            </div>
+          </div>
+          
+          ${ad.description ? `<div style="color: #666; margin-bottom: 8px;">${ad.description}</div>` : ''}
+          
+          <div style="color: #999; font-size: 14px;">
+            Duration: ${ad.duration ? ad.duration.toFixed(2) + 's' : 'N/A'}
+          </div>
+          
+          <div class="variants-section">
+            <div class="variants-header">
+              <span>Transcoded Variants</span>
+              <span class="variant-count">${ad.variant_count || 0}</span>
+            </div>
+            
+            ${ad.variant_count > 0 ? `
+              <div class="bitrate-badges">
+                ${ad.variant_bitrates.map(br => `
+                  <div class="bitrate-badge">
+                    ${Math.round(br / 1000)}k
+                  </div>
+                `).join('')}
+              </div>
+              
+              <div class="variants-grid">
+                ${ad.variants_detailed.map(v => `
+                  <div class="variant-card">
+                    <div class="variant-bitrate">${v.bitrate_kbps}k</div>
+                    <div class="variant-detail">📊 ${v.bitrate_mbps} Mbps</div>
+                    <div class="variant-detail">📐 ${v.resolution}</div>
+                    <div class="variant-url" title="${v.url}">
+                      🔗 ${v.url.split('/').pop()}
+                    </div>
+                  </div>
+                `).join('')}
+              </div>
+            ` : `
+              <div class="no-variants">
+                No variants available yet. Transcode in progress...
+              </div>
+            `}
+          </div>
+        </div>
+      `;
+    }
+
+    // Render example ad
+    document.getElementById('ads-container').innerHTML = renderAdCard(exampleAd);
+
+    // Function to fetch and render real ads from API
+    async function fetchAndRenderAds() {
+      try {
+        const response = await fetch('/api/v1/ads', {
+          headers: {
+            'Authorization': 'Bearer YOUR_JWT_TOKEN'
+          }
+        });
+        
+        const data = await response.json();
+        
+        if (data.ads && data.ads.length > 0) {
+          const container = document.getElementById('ads-container');
+          container.innerHTML = data.ads.map(ad => renderAdCard(ad)).join('');
+        }
+      } catch (error) {
+        console.error('Failed to fetch ads:', error);
+      }
+    }
+
+    // Example: Auto-refresh every 5 seconds for transcode progress
+    function startAutoRefresh() {
+      setInterval(() => {
+        const hasProcessingAds = document.querySelector('.status-processing');
+        if (hasProcessingAds) {
+          fetchAndRenderAds();
+        }
+      }, 5000);
+    }
+
+    // Uncomment to enable real API fetching
+    // fetchAndRenderAds();
+    // startAutoRefresh();
+  </script>
+</body>
+</html>

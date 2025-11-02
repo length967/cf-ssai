@@ -14,11 +14,6 @@ class_name = "ChannelDO"
 tag = "v1"
 new_classes = ["ChannelDO"]
 
-# R2 bucket for ads (pre-normalized ABR pods)
-[[r2_buckets]]
-binding = "ADS_BUCKET"
-bucket_name = "ads-bucket"
-
 # R2 bucket for ad source files and transcoded HLS
 [[r2_buckets]]
 binding = "R2"

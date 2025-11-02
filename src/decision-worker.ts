@@ -2,19 +2,21 @@
 // Handles ad pod selection with VAST waterfall, caching, and fallback logic
 
 import type { DecisionResponse, AdPod, AdItem, VASTParseResponse } from "./types"
+import { getVariantsForChannel } from "./on-demand-transcode"
 
 export interface Env {
   // D1 Database for channel config and ad pods
   DB: D1Database
   
-  // R2 bucket for pre-normalized ad pods (legacy)
-  ADS_BUCKET: R2Bucket
-  
   // R2 bucket for transcoded HLS ads
   R2: R2Bucket
   
-  // KV for decision caching
+  // KV for decision caching AND on-demand transcode locks
   DECISION_CACHE?: KVNamespace
+  KV: KVNamespace
+  
+  // Queue for on-demand transcoding
+  TRANSCODE_QUEUE: Queue
   
   // External ad decision API (optional)
   AD_DECISION_API_URL?: string
@@ -54,6 +56,7 @@ interface ChannelConfig {
   vastUrl?: string
   vastEnabled: boolean
   slatePodId?: string
+  bitrateLadder?: string // JSON array of bitrates in kbps
 }
 
 interface DBAdPod {
@@ -134,7 +137,8 @@ async function getChannelConfig(
         c.ad_pod_base_url as adPodBaseUrl,
         c.vast_url as vastUrl,
         c.vast_enabled as vastEnabled,
-        c.slate_pod_id as slatePodId
+        c.slate_pod_id as slatePodId,
+        c.bitrate_ladder as bitrateLadder
       FROM channels c
       WHERE c.id = ? AND c.status = 'active'
     `).bind(channelId).first<any>()
@@ -147,7 +151,8 @@ async function getChannelConfig(
       adPodBaseUrl: result.adPodBaseUrl,
       vastUrl: result.vastUrl,
       vastEnabled: Boolean(result.vastEnabled),
-      slatePodId: result.slatePodId
+      slatePodId: result.slatePodId,
+      bitrateLadder: result.bitrateLadder
     }
   } catch (error) {
     console.error(`Failed to get channel config: ${error}`)
@@ -417,12 +422,42 @@ async function runAdWaterfall(
       // Get the actual ad details
       const ads = await getAdsById(env, adIds)
       
+      // Parse channel bitrate ladder for on-demand transcoding
+      let channelBitrates: number[] = []
+      if (channelConfig.bitrateLadder) {
+        try {
+          channelBitrates = JSON.parse(channelConfig.bitrateLadder)
+        } catch (e) {
+          console.warn('Failed to parse bitrate ladder:', e)
+        }
+      }
+      
       if (ads.length > 0) {
         // Build ad items from all ads in the pod
         const allItems: AdItem[] = []
         let totalDuration = 0
         
         for (const ad of ads) {
+          // Check if ad has all required variants for this channel
+          // If not, trigger on-demand transcode (non-blocking)
+          if (channelBitrates.length > 0) {
+            try {
+              const variantResult = await getVariantsForChannel(
+                env,
+                ad.id,
+                channelConfig.id,
+                channelBitrates,
+                false // Don't wait - use closest available and queue missing
+              )
+              
+              if (variantResult.missingBitrates.length > 0) {
+                console.log(`Ad ${ad.id} missing variants ${variantResult.missingBitrates}, queued=${variantResult.transcodeQueued}`)
+              }
+            } catch (e) {
+              console.warn(`On-demand transcode check failed for ad ${ad.id}:`, e)
+            }
+          }
+          
           const items = buildAdItemsFromAd(ad)
           if (items.length > 0) {
             allItems.push(...items)

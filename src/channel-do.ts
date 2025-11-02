@@ -465,20 +465,23 @@ export class ChannelDO {
 
       if (!channel) return new Response("channel required", { status: 400 })
 
-      // Fetch full channel configuration (including auto-insert and cache settings)
+      // PERFORMANCE FIX: Check if this is a segment request FIRST
+      // Segments should bypass all config/database lookups
+      if (!variant.endsWith('.m3u8')) {
+        // This is a segment (.ts, .m4s, etc.) - pass through immediately
+        const originResponse = await fetchOriginVariant(originUrl, channel, variant)
+        return originResponse
+      }
+      
+      // This is a manifest - fetch channel configuration
       const orgSlug = req.headers.get('X-Org-Slug') || null
       const channelSlug = req.headers.get('X-Channel-Slug') || channel
       const channelConfig = orgSlug ? await getChannelConfig(this.env, orgSlug, channelSlug) : null
       
       console.log(`Channel config loaded: orgSlug=${orgSlug}, channelSlug=${channelSlug}, config=`, JSON.stringify(channelConfig))
 
-      // Use per-channel origin URL
+      // Fetch origin manifest for processing
       const originResponse = await fetchOriginVariant(originUrl, channel, variant)
-      
-      // For non-manifest files (segments), pass through directly without modification
-      if (!variant.endsWith('.m3u8')) {
-        return originResponse
-      }
       
       // For manifests, read as text for processing
       const origin = await originResponse.text()
@@ -493,8 +496,8 @@ export class ChannelDO {
       }
 
       // Load live ad state (if any) - this takes priority over other signals
-      const adState = await loadAdState(this.state)
-      const adActive = !!adState && Date.now() < adState.endsAt
+      let adState = await loadAdState(this.state)
+      let adActive = !!adState && Date.now() < adState.endsAt
 
       // Parse SCTE-35 signals from origin manifest (with enhanced binary parsing)
       const scte35Signals = parseSCTE35FromManifest(origin)
@@ -517,9 +520,18 @@ export class ChannelDO {
       }
 
       // Determine ad insertion mode: SGAI (server-guided) or SSAI (server-side)
-      // - force parameter explicitly sets mode
-      // - otherwise detect client capability (iOS/Safari → SGAI, others → SSAI)
-      const mode = force || (wantsSGAI(req) ? "sgai" : "ssai")
+      // Priority order:
+      // 1. URL force parameter (?force=sgai or ?force=ssai)
+      // 2. Channel config mode setting from database
+      // 3. Auto-detect based on client capability (iOS/Safari → SGAI, others → SSAI)
+      let mode: string
+      if (force) {
+        mode = force
+      } else if (channelConfig?.mode && channelConfig.mode !== 'auto') {
+        mode = channelConfig.mode
+      } else {
+        mode = wantsSGAI(req) ? "sgai" : "ssai"
+      }
 
       // Determine if we should inject ads (priority order):
       // 1. Live ad state from /cue API (highest priority)
@@ -564,6 +576,35 @@ export class ChannelDO {
             scte35StartPDT = pdts[pdts.length - 1]  // Use most recent PDT near signal
           }
           
+          // CRITICAL: Persist SCTE-35 break to storage for stable timing
+          // Only create new ad state if one doesn't exist (don't overwrite existing)
+          if (!adActive) {
+            const startTime = scte35StartPDT ? new Date(scte35StartPDT).getTime() : now
+            // CRITICAL FIX: Round duration to 2 decimal places to avoid floating-point drift
+            // This prevents HLS.js from detecting schedule changes mid-playback
+            const stableDuration = Math.round(breakDurationSec * 100) / 100
+            
+            // CRITICAL: Use stable, time-based ID to prevent HLS.js from canceling interstitials
+            // The ID must remain constant across all manifest requests during the break
+            // activeBreak.id can change or disappear as the live window moves
+            const stableId = `ad_${channelId}_${Math.floor(startTime / 1000)}`
+            
+            const newAdState: AdState = {
+              active: true,
+              podId: stableId,
+              podUrl: '', // Will be filled in after decision service call
+              startedAt: startTime,
+              endsAt: startTime + stableDuration * 1000,
+              durationSec: stableDuration,
+            }
+            await saveAdState(this.state, newAdState)
+            console.log(`Persisted SCTE-35 break to storage: id=${stableId}, start=${new Date(startTime).toISOString()}, duration=${stableDuration}s (rounded from ${breakDurationSec}s)`)
+            
+            // Reload ad state for use in manifest generation below
+            adState = newAdState
+            adActive = true
+          }
+          
           if (channelTier !== 0 && scte35Tier === channelTier) {
             console.log(`SCTE-35 tier match: tier=${channelTier} (0x${channelTier.toString(16).padStart(3, '0')}) - allowing ad`)
           }
@@ -580,17 +621,34 @@ export class ChannelDO {
       if (shouldInsertAd) {
         console.log(`✅ shouldInsertAd=true, adSource=${adSource}, mode=${mode}`)
         
-        const startISO = scte35StartPDT || new Date(Math.floor(now / 1000) * 1000).toISOString()
+        // CRITICAL: Use stable start time AND duration to prevent HLS.js schedule recalculation mid-playback
+        // If ad state exists (from /cue API or previous SCTE-35), reuse its start time and duration
+        // Otherwise, use SCTE-35 PDT or current time (rounded to whole second)
+        let startISO: string
+        let stableDuration: number
+        
+        if (adActive && adState!.startedAt) {
+          // Reuse persisted values for stable interstitial timing
+          startISO = new Date(adState!.startedAt).toISOString()
+          stableDuration = adState!.durationSec
+          console.log(`Using persisted ad state: start=${startISO}, duration=${stableDuration}s`)
+        } else {
+          startISO = scte35StartPDT || new Date(Math.floor(now / 1000) * 1000).toISOString()
+          // Round duration to avoid floating-point precision issues
+          stableDuration = Math.round(breakDurationSec * 100) / 100
+          console.log(`Using calculated values: start=${startISO}, duration=${stableDuration}s (rounded from ${breakDurationSec}s)`)
+        }
         
         // Extract viewer bitrate from variant and select matching ad pod
         const viewerBitrate = extractBitrate(variant)
         const adVariant = selectAdVariant(viewerBitrate)
         
-        console.log(`Calling decision service: channelId=${channelId}, duration=${breakDurationSec}s, bitrate=${viewerBitrate}`)
+        console.log(`Calling decision service: channelId=${channelId}, duration=${stableDuration}s, bitrate=${viewerBitrate}`)
         
         // Get ad decision from decision service (use per-channel ad pod base)
         // Pass channelId (e.g., "ch_demo_sports") not channel slug
-        const decisionResponse = await decision(this.env, adPodBase, channelId, breakDurationSec, {
+        // Use stableDuration to ensure consistent ad selection
+        const decisionResponse = await decision(this.env, adPodBase, channelId, stableDuration, {
           variant,
           bitrate: viewerBitrate,
           scte35: activeBreak
@@ -646,11 +704,12 @@ export class ChannelDO {
           
           // Strip origin SCTE-35 markers before adding our interstitial
           const cleanOrigin = stripOriginSCTE35Markers(origin)
+          // Use stableDuration for consistent interstitial timing
           const sgai = addDaterangeInterstitial(
             cleanOrigin,
             adActive ? (adState!.podId || "ad") : pod.podId,
             startISO,
-            breakDurationSec,
+            stableDuration,
             interstitialURI
           )
           
@@ -663,10 +722,23 @@ export class ChannelDO {
             // True SSAI: Replace segments at SCTE-35 marker position
             // Fetch the actual ad playlist and extract real segment URLs
             
-            const matchingItems = pod.items.filter(item => item.bitrate === viewerBitrate)
+            // Try exact bitrate match first, fall back to closest available
+            let adItem = pod.items.find(item => item.bitrate === viewerBitrate)
             
-            if (matchingItems.length > 0) {
-              const adItem = matchingItems[0]
+            if (!adItem && pod.items.length > 0) {
+              // No exact match - find closest bitrate (prefer lower to avoid buffering)
+              const sorted = [...pod.items].sort((a, b) => {
+                const diffA = Math.abs(a.bitrate - viewerBitrate)
+                const diffB = Math.abs(b.bitrate - viewerBitrate)
+                // If diffs are equal, prefer lower bitrate
+                if (diffA === diffB) return a.bitrate - b.bitrate
+                return diffA - diffB
+              })
+              adItem = sorted[0]
+              console.log(`No exact match for ${viewerBitrate}bps, using closest: ${adItem.bitrate}bps`)
+            }
+            
+            if (adItem) {
               const baseUrl = adItem.playlistUrl.replace("/playlist.m3u8", "")
               
               // Fetch the actual ad playlist to get real segment URLs
@@ -706,25 +778,26 @@ export class ChannelDO {
                   })
                 }
                 
-                const totalDuration = adSegments.reduce((sum, seg) => sum + seg.duration, 0)
-                console.log(`Extracted ${adSegments.length} ad segments (total: ${totalDuration.toFixed(1)}s) from playlist: ${adItem.playlistUrl}`)
+                // Round total duration to avoid floating-point precision issues
+                const totalDuration = Math.round(adSegments.reduce((sum, seg) => sum + seg.duration, 0) * 100) / 100
+                console.log(`Extracted ${adSegments.length} ad segments (total: ${totalDuration.toFixed(2)}s) from playlist: ${adItem.playlistUrl}`)
                 
-                // Warn if SCTE-35 duration doesn't match actual ad duration
-                if (Math.abs(totalDuration - breakDurationSec) > 1.0) {
-                  console.warn(`SCTE-35 duration mismatch: SCTE-35=${breakDurationSec}s, Actual ad=${totalDuration.toFixed(1)}s`)
+                // Warn if stable duration doesn't match actual ad duration
+                if (Math.abs(totalDuration - stableDuration) > 1.0) {
+                  console.warn(`Duration mismatch: Expected=${stableDuration}s, Actual ad=${totalDuration.toFixed(2)}s`)
                 }
                 
                 if (adSegments.length > 0) {
                   const cleanOrigin = stripOriginSCTE35Markers(origin)
-                  // CRITICAL FIX: Pass both ad duration AND SCTE-35 duration
+                  // CRITICAL FIX: Pass both ad duration AND stable duration
                   // - totalDuration: actual ad length (e.g., 30s) - for PDT of ad segments
-                  // - breakDurationSec: SCTE-35 duration (e.g., 38.4s) - for content skipping & resume PDT
+                  // - stableDuration: locked duration (e.g., 30s rounded) - for content skipping & resume PDT
                   const ssai = replaceSegmentsWithAds(
                     cleanOrigin,
                     scte35StartPDT,
                     adSegments,
                     totalDuration,        // Actual ad duration (for ad segment PDTs)
-                    breakDurationSec      // SCTE-35 duration (for content skipping & resume PDT)
+                    stableDuration        // Locked duration (for content skipping & resume PDT)
                   )
                   await this.env.BEACON_QUEUE.send(beaconMsg)
                   return new Response(ssai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })

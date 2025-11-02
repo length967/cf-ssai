@@ -3,6 +3,27 @@
 import { useState, useEffect, useCallback } from 'react'
 import { api } from '@/lib/api'
 import Navigation from '@/components/Navigation'
+import { Button } from '@/components/ui/button'
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'
+import { Badge } from '@/components/ui/badge'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Textarea } from '@/components/ui/textarea'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Progress } from '@/components/ui/progress'
+import { Separator } from '@/components/ui/separator'
+import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs'
+import { Upload, Play, Trash2, RefreshCw, CheckCircle2, AlertCircle, Clock, Loader2 } from 'lucide-react'
+
+type Variant = {
+  bitrate: number
+  bitrate_kbps: number
+  bitrate_mbps: string
+  url: string
+  resolution?: string
+}
 
 type Ad = {
   id: string
@@ -13,6 +34,9 @@ type Ad = {
   transcode_status: 'pending' | 'queued' | 'processing' | 'ready' | 'error'
   master_playlist_url?: string
   variants?: string
+  variant_count?: number
+  variant_bitrates?: number[]
+  variants_detailed?: Variant[]
   error_message?: string
   original_filename: string
   file_size: number
@@ -21,17 +45,37 @@ type Ad = {
   updated_at: number
   transcoded_at?: number
   status: 'active' | 'archived'
+  channel_id?: string
+}
+
+type Channel = {
+  id: string
+  name: string
+  slug: string
+  bitrate_ladder?: string
+  bitrate_ladder_source?: 'auto' | 'manual'
+}
+
+type PlannedVariant = {
+  bitrate: number
+  resolution: string
+  willUpscale: boolean
 }
 
 export default function AdsPage() {
   const [ads, setAds] = useState<Ad[]>([])
+  const [channels, setChannels] = useState<Channel[]>([])
   const [loading, setLoading] = useState(true)
   const [uploading, setUploading] = useState(false)
   const [uploadModalOpen, setUploadModalOpen] = useState(false)
   const [selectedFile, setSelectedFile] = useState<File | null>(null)
   const [uploadName, setUploadName] = useState('')
   const [uploadDescription, setUploadDescription] = useState('')
+  const [selectedChannelId, setSelectedChannelId] = useState<string>('')
+  const [channelBitrates, setChannelBitrates] = useState<number[]>([])
+  const [plannedVariants, setPlannedVariants] = useState<PlannedVariant[]>([])
   const [dragActive, setDragActive] = useState(false)
+  const [uploadProgress, setUploadProgress] = useState(0)
   const [message, setMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null)
 
   const loadAds = useCallback(async () => {
@@ -47,14 +91,57 @@ export default function AdsPage() {
     }
   }, [])
 
+  const loadChannels = useCallback(async () => {
+    try {
+      const data = await api.listChannels()
+      setChannels(data.channels || [])
+    } catch (err) {
+      console.error('Failed to load channels:', err)
+    }
+  }, [])
+
   useEffect(() => {
     loadAds()
+    loadChannels()
     // Auto-refresh every 10 seconds for processing ads
     const interval = setInterval(() => {
       loadAds()
     }, 10000)
     return () => clearInterval(interval)
-  }, [loadAds])
+  }, [loadAds, loadChannels])
+
+  // Load channel bitrates when channel is selected
+  useEffect(() => {
+    if (selectedChannelId) {
+      const channel = channels.find(ch => ch.id === selectedChannelId)
+      if (channel?.bitrate_ladder) {
+        try {
+          const bitrates = JSON.parse(channel.bitrate_ladder)
+          setChannelBitrates(bitrates)
+          
+          // Calculate planned variants (simplified - would need source video analysis)
+          const planned: PlannedVariant[] = bitrates.map((br: number) => ({
+            bitrate: br,
+            resolution: getResolutionForBitrate(br),
+            willUpscale: false // Would need source analysis to determine
+          }))
+          setPlannedVariants(planned)
+        } catch (e) {
+          console.error('Failed to parse bitrate ladder:', e)
+        }
+      }
+    } else {
+      setChannelBitrates([])
+      setPlannedVariants([])
+    }
+  }, [selectedChannelId, channels])
+
+  const getResolutionForBitrate = (bitrateKbps: number): string => {
+    if (bitrateKbps < 600) return '640x360'
+    if (bitrateKbps < 1200) return '854x480'
+    if (bitrateKbps < 2500) return '1280x720'
+    return '1920x1080'
+  }
 
   const handleDrag = (e: React.DragEvent) => {
     e.preventDefault()
@@ -87,26 +174,32 @@ export default function AdsPage() {
   }
 
   const handleUpload = async () => {
-    if (!selectedFile || !uploadName) return
+    if (!selectedFile || !uploadName || !selectedChannelId) return
 
     try {
       setUploading(true)
-      await api.uploadAd(selectedFile, uploadName, uploadDescription)
+      setUploadProgress(10)
+      
+      await api.uploadAd(selectedFile, uploadName, uploadDescription, selectedChannelId)
+      
+      setUploadProgress(100)
       setUploadModalOpen(false)
       setSelectedFile(null)
       setUploadName('')
       setUploadDescription('')
-      setMessage({ type: 'success', text: 'Ad uploaded successfully! Processing will take a few minutes.' })
+      setSelectedChannelId('')
+      setMessage({ type: 'success', text: 'Ad uploaded successfully! Transcoding will take 1-2 minutes.' })
       loadAds()
     } catch (err: any) {
       setMessage({ type: 'error', text: err.message || 'Upload failed' })
     } finally {
       setUploading(false)
+      setUploadProgress(0)
     }
   }
 
   const handleDelete = async (id: string, name: string) => {
-    if (!confirm(`Delete ad "${name}"? This will also delete it from Cloudflare Stream.`)) return
+    if (!confirm(`Delete ad "${name}"?`)) return
 
     try {
       await api.deleteAd(id)
@@ -117,43 +210,31 @@ export default function AdsPage() {
     }
   }
 
-  const handleRefresh = async (id: string) => {
-    try {
-      await api.refreshAdStatus(id)
-      setMessage({ type: 'success', text: 'Status refreshed' })
-      loadAds()
-    } catch (err: any) {
-      setMessage({ type: 'error', text: err.message || 'Refresh failed' })
+  const getStatusIcon = (status: string) => {
+    switch (status) {
+      case 'ready':
+        return <CheckCircle2 className="h-4 w-4" />
+      case 'processing':
+        return <Loader2 className="h-4 w-4 animate-spin" />
+      case 'queued':
+        return <Clock className="h-4 w-4" />
+      case 'error':
+        return <AlertCircle className="h-4 w-4" />
+      default:
+        return <Clock className="h-4 w-4" />
     }
   }
 
-  const getStatusBadge = (status: string) => {
+  const getStatusVariant = (status: string): "default" | "secondary" | "destructive" | "outline" => {
     switch (status) {
       case 'ready':
-        return <span className="px-3 py-1 text-sm font-semibold rounded-full bg-green-500 text-white">✓ READY TO USE</span>
+        return 'default'
       case 'processing':
-        return <span className="px-3 py-1 text-sm font-semibold rounded-full bg-blue-500 text-white animate-pulse">⏳ TRANSCODING...</span>
-      case 'queued':
-        return <span className="px-3 py-1 text-sm font-semibold rounded-full bg-yellow-500 text-white">⏱️ QUEUED</span>
+        return 'secondary'
       case 'error':
-        return <span className="px-3 py-1 text-sm font-semibold rounded-full bg-red-500 text-white">✗ ERROR</span>
+        return 'destructive'
       default:
-        return <span className="px-3 py-1 text-sm font-semibold rounded-full bg-gray-400 text-white">⋯ PENDING</span>
-    }
-  }
-
-  const getStatusMessage = (status: string, errorMessage?: string) => {
-    switch (status) {
-      case 'ready':
-        return '🎉 Video is transcoded and ready! You can now add this to an Ad Pod.'
-      case 'processing':
-        return '⏳ FFmpeg is transcoding your video to HLS. This usually takes 30-60 seconds depending on length. The page auto-refreshes every 10 seconds.'
-      case 'queued':
-        return '⏱️ Your video is queued for transcoding. It will start shortly.'
-      case 'error':
-        return `❌ Transcoding error: ${errorMessage || 'Unknown error'}. Please try uploading again.`
-      default:
-        return '📤 Upload initiated. Waiting for transcode to begin.'
+        return 'outline'
     }
   }
 
@@ -172,279 +253,311 @@ export default function AdsPage() {
   }
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-background">
       <Navigation />
       
-      <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+      <div className="container mx-auto px-4 py-8">
         {/* Header */}
-        <div className="flex justify-between items-center mb-8">
+        <div className="flex items-center justify-between mb-8">
           <div>
-            <h1 className="text-3xl font-bold text-gray-900">Ads Library</h1>
-            <p className="text-gray-600 mt-1">Upload and manage your video commercials</p>
+            <h1 className="text-4xl font-bold tracking-tight">Ad Library</h1>
+            <p className="text-muted-foreground mt-2">
+              Upload and manage your video commercials
+            </p>
           </div>
-          <button
-            onClick={() => setUploadModalOpen(true)}
-            className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
-          >
-            📤 Upload Ad
-          </button>
+          <Button onClick={() => setUploadModalOpen(true)} size="lg">
+            <Upload className="mr-2 h-4 w-4" />
+            Upload Ad
+          </Button>
         </div>
 
         {/* Messages */}
         {message && (
-          <div className={`mb-6 p-4 rounded-md ${message.type === 'success' ? 'bg-green-50 text-green-800' : 'bg-red-50 text-red-800'}`}>
-            <button onClick={() => setMessage(null)} className="float-right text-xl">&times;</button>
-            {message.text}
-          </div>
+          <Alert className="mb-6" variant={message.type === 'error' ? 'destructive' : 'default'}>
+            <AlertDescription>{message.text}</AlertDescription>
+            <Button
+              variant="ghost"
+              size="sm"
+              className="absolute top-2 right-2"
+              onClick={() => setMessage(null)}
+            >
+              ×
+            </Button>
+          </Alert>
         )}
 
         {/* Content */}
         {loading ? (
-          <div className="text-center py-12">
-            <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto"></div>
-            <p className="mt-4 text-gray-600">Loading ads...</p>
+          <div className="flex flex-col items-center justify-center py-12">
+            <Loader2 className="h-8 w-8 animate-spin mb-4" />
+            <p className="text-muted-foreground">Loading ads...</p>
           </div>
         ) : ads.length === 0 ? (
-          <div className="bg-white rounded-lg shadow p-12 text-center">
-            <div className="text-6xl mb-4">🎬</div>
-            <h3 className="text-lg font-semibold text-gray-900 mb-2">No ads yet</h3>
-            <p className="text-gray-600 mb-6">Upload your first video commercial to get started</p>
-            <button
-              onClick={() => setUploadModalOpen(true)}
-              className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
-            >
-              📤 Upload Ad
-            </button>
-          </div>
+          <Card className="text-center py-12">
+            <CardHeader>
+              <div className="text-6xl mb-4">🎬</div>
+              <CardTitle>No ads yet</CardTitle>
+              <CardDescription>
+                Upload your first video commercial to get started
+              </CardDescription>
+            </CardHeader>
+            <CardFooter className="justify-center">
+              <Button onClick={() => setUploadModalOpen(true)} size="lg">
+                <Upload className="mr-2 h-4 w-4" />
+                Upload Ad
+              </Button>
+            </CardFooter>
+          </Card>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
             {ads.map((ad) => (
-              <div key={ad.id} className="bg-white rounded-lg shadow overflow-hidden">
-                <div className="w-full h-48 bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-6xl">
-                  🎬
-                </div>
-                
-                <div className="p-4">
-                  <div className="flex items-start justify-between mb-3">
-                    <h3 className="font-semibold text-gray-900 flex-1">{ad.name}</h3>
+              <Card key={ad.id} className="flex flex-col">
+                <CardHeader>
+                  <div className="flex items-start justify-between mb-2">
+                    <CardTitle className="text-lg">{ad.name}</CardTitle>
+                    <Badge variant={getStatusVariant(ad.transcode_status)} className="ml-2">
+                      <span className="flex items-center gap-1">
+                        {getStatusIcon(ad.transcode_status)}
+                        {ad.transcode_status}
+                      </span>
+                    </Badge>
                   </div>
-                  
-                  {/* Status Badge - More Prominent */}
-                  <div className="mb-3 flex justify-center">
-                    {getStatusBadge(ad.transcode_status)}
-                  </div>
-                  
-                  {/* Status Message */}
-                  <div className={`text-xs p-2 rounded mb-3 ${
-                    ad.transcode_status === 'ready' ? 'bg-green-50 text-green-800' :
-                    ad.transcode_status === 'error' ? 'bg-red-50 text-red-800' :
-                    'bg-blue-50 text-blue-800'
-                  }`}>
-                    {getStatusMessage(ad.transcode_status, ad.error_message)}
-                  </div>
-                  
                   {ad.description && (
-                    <p className="text-sm text-gray-600 mb-3">{ad.description}</p>
+                    <CardDescription>{ad.description}</CardDescription>
                   )}
-                  
-                  <div className="space-y-1 text-sm text-gray-500 mb-4">
-                    <div>⏱️ Duration: {ad.duration > 0 ? formatDuration(ad.duration) : 'Processing...'}</div>
-                    <div>💾 File size: {formatFileSize(ad.file_size)}</div>
-                    <div className="truncate">📄 {ad.original_filename}</div>
-                    {ad.master_playlist_url && (
-                      <div className="pt-2 border-t">
-                        <a 
-                          href={ad.master_playlist_url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-xs text-blue-600 hover:underline truncate"
-                        >
-                          🔗 View HLS URL →
-                        </a>
+                </CardHeader>
+                
+                <CardContent className="flex-1 space-y-3">
+                  <div className="space-y-2 text-sm">
+                    <div className="flex items-center justify-between">
+                      <span className="text-muted-foreground">Duration</span>
+                      <span className="font-medium">
+                        {ad.duration > 0 ? formatDuration(ad.duration) : 'Processing...'}
+                      </span>
+                    </div>
+                    <div className="flex items-center justify-between">
+                      <span className="text-muted-foreground">File size</span>
+                      <span className="font-medium">{formatFileSize(ad.file_size)}</span>
+                    </div>
+                  </div>
+
+                  {/* Transcoded Variants */}
+                  {ad.variant_count && ad.variant_count > 0 && (
+                    <>
+                      <Separator />
+                      <div>
+                        <div className="flex items-center justify-between mb-2">
+                          <span className="text-sm font-medium">Variants</span>
+                          <Badge variant="secondary">{ad.variant_count}</Badge>
+                        </div>
+                        <div className="flex flex-wrap gap-1">
+                          {ad.variant_bitrates?.map((bitrate) => (
+                            <Badge key={bitrate} variant="outline" className="text-xs">
+                              {Math.round(bitrate / 1000)}k
+                            </Badge>
+                          ))}
+                        </div>
                       </div>
-                    )}
-                  </div>
-                  
-                  <div className="flex gap-2">
-                    {(ad.transcode_status === 'processing' || ad.transcode_status === 'queued') && (
-                      <button 
-                        onClick={() => handleRefresh(ad.id)}
-                        className="flex-1 px-3 py-1 text-sm border border-blue-600 text-blue-600 rounded-md hover:bg-blue-50"
-                      >
-                        🔄 Refresh Status
-                      </button>
-                    )}
-                    {ad.transcode_status === 'ready' && (
-                      <a
-                        href="/ad-pods"
-                        className="flex-1 px-3 py-1 text-sm text-center bg-green-600 text-white rounded-md hover:bg-green-700"
-                      >
-                        ➕ Add to Ad Pod
+                    </>
+                  )}
+                </CardContent>
+
+                <CardFooter className="gap-2">
+                  {ad.transcode_status === 'ready' && (
+                    <Button variant="default" size="sm" asChild className="flex-1">
+                      <a href="/ad-pods">
+                        <Play className="mr-1 h-3 w-3" />
+                        Add to Pod
                       </a>
-                    )}
-                    <button 
-                      onClick={() => handleDelete(ad.id, ad.name)}
-                      className="px-3 py-1 text-sm bg-red-600 text-white rounded-md hover:bg-red-700"
-                    >
-                      🗑️
-                    </button>
-                  </div>
-                </div>
-              </div>
+                    </Button>
+                  )}
+                  <Button
+                    variant="destructive"
+                    size="sm"
+                    onClick={() => handleDelete(ad.id, ad.name)}
+                  >
+                    <Trash2 className="h-3 w-3" />
+                  </Button>
+                </CardFooter>
+              </Card>
             ))}
           </div>
         )}
       </div>
 
       {/* Upload Modal */}
-      {uploadModalOpen && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50">
-          <div className="bg-white rounded-lg shadow-xl max-w-2xl w-full mx-4 max-h-[90vh] overflow-y-auto">
-            <div className="p-6">
-              <div className="flex justify-between items-center mb-6">
-                <h2 className="text-2xl font-bold">Upload Video Ad</h2>
-                <button 
-                  onClick={() => {
-                    setUploadModalOpen(false)
-                    setSelectedFile(null)
-                    setUploadName('')
-                    setUploadDescription('')
-                  }}
-                  className="text-2xl text-gray-400 hover:text-gray-600"
-                >
-                  &times;
-                </button>
-              </div>
-              
-              <div className="space-y-6">
-                {/* File Drop Zone */}
-                <div
-                  className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
-                    dragActive ? 'border-blue-500 bg-blue-50' : 'border-gray-300'
-                  }`}
-                  onDragEnter={handleDrag}
-                  onDragLeave={handleDrag}
-                  onDragOver={handleDrag}
-                  onDrop={handleDrop}
-                >
-                  {selectedFile ? (
-                    <div>
-                      <div className="text-6xl mb-2">🎬</div>
-                      <p className="font-medium">{selectedFile.name}</p>
-                      <p className="text-sm text-gray-500">{formatFileSize(selectedFile.size)}</p>
-                      <button
-                        onClick={() => setSelectedFile(null)}
-                        className="mt-4 px-4 py-2 border border-gray-300 rounded-md hover:bg-gray-50"
-                      >
-                        Choose different file
-                      </button>
-                    </div>
-                  ) : (
-                    <div>
-                      <div className="text-6xl mb-4">📤</div>
-                      <p className="text-lg font-medium mb-2">
-                        Drag and drop your video here
-                      </p>
-                      <p className="text-sm text-gray-500 mb-4">
-                        or
-                      </p>
-                      <label htmlFor="file-upload" className="cursor-pointer">
-                        <span className="px-4 py-2 border border-gray-300 rounded-md hover:bg-gray-50 inline-block">
-                          Browse files
-                        </span>
-                      </label>
-                      <input
-                        id="file-upload"
-                        type="file"
-                        accept="video/*"
-                        className="hidden"
-                        onChange={handleFileSelect}
-                      />
-                      <p className="text-xs text-gray-500 mt-4">
-                        Supported formats: MP4, MOV, AVI, etc.
-                      </p>
-                    </div>
-                  )}
-                </div>
+      <Dialog open={uploadModalOpen} onOpenChange={setUploadModalOpen}>
+        <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Upload Video Ad</DialogTitle>
+            <DialogDescription>
+              Select a channel and upload your video commercial
+            </DialogDescription>
+          </DialogHeader>
 
-                {/* Ad Details */}
-                {selectedFile && (
-                  <div className="space-y-4">
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">
-                        Ad Name *
-                      </label>
-                      <input
-                        type="text"
-                        value={uploadName}
-                        onChange={(e) => setUploadName(e.target.value)}
-                        placeholder="e.g., Summer Sale 2025"
-                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      />
-                    </div>
-                    
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-1">
-                        Description (Optional)
-                      </label>
-                      <textarea
-                        value={uploadDescription}
-                        onChange={(e) => setUploadDescription(e.target.value)}
-                        placeholder="Brief description of the ad..."
-                        rows={3}
-                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      />
-                    </div>
+          <div className="space-y-6 py-4">
+            {/* File Drop Zone */}
+            <div
+              className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
+                dragActive ? 'border-primary bg-primary/5' : 'border-muted-foreground/25'
+              }`}
+              onDragEnter={handleDrag}
+              onDragLeave={handleDrag}
+              onDragOver={handleDrag}
+              onDrop={handleDrop}
+            >
+              {selectedFile ? (
+                <div>
+                  <div className="text-6xl mb-2">🎬</div>
+                  <p className="font-medium">{selectedFile.name}</p>
+                  <p className="text-sm text-muted-foreground">{formatFileSize(selectedFile.size)}</p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="mt-4"
+                    onClick={() => setSelectedFile(null)}
+                  >
+                    Choose different file
+                  </Button>
+                </div>
+              ) : (
+                <div>
+                  <Upload className="mx-auto h-12 w-12 text-muted-foreground mb-4" />
+                  <p className="text-lg font-medium mb-2">
+                    Drag and drop your video here
+                  </p>
+                  <p className="text-sm text-muted-foreground mb-4">
+                    or
+                  </p>
+                  <Label htmlFor="file-upload">
+                    <Button variant="outline" asChild>
+                      <span>Browse files</span>
+                    </Button>
+                  </Label>
+                  <Input
+                    id="file-upload"
+                    type="file"
+                    accept="video/*"
+                    className="hidden"
+                    onChange={handleFileSelect}
+                  />
+                  <p className="text-xs text-muted-foreground mt-4">
+                    Supported formats: MP4, MOV, AVI, etc.
+                  </p>
+                </div>
+              )}
+            </div>
+
+            {/* Ad Details */}
+            {selectedFile && (
+              <>
+                <div className="space-y-4">
+                  <div className="space-y-2">
+                    <Label htmlFor="name">Ad Name *</Label>
+                    <Input
+                      id="name"
+                      value={uploadName}
+                      onChange={(e) => setUploadName(e.target.value)}
+                      placeholder="e.g., Summer Sale 2025"
+                    />
                   </div>
-                )}
 
-                {/* Actions */}
-                <div className="flex justify-end gap-3 pt-4 border-t">
-                  <button
-                    onClick={() => {
-                      setUploadModalOpen(false)
-                      setSelectedFile(null)
-                      setUploadName('')
-                      setUploadDescription('')
-                    }}
-                    disabled={uploading}
-                    className="px-4 py-2 border border-gray-300 rounded-md hover:bg-gray-50 disabled:opacity-50"
-                  >
-                    Cancel
-                  </button>
-                  <button
-                    onClick={handleUpload}
-                    disabled={!selectedFile || !uploadName || uploading}
-                    className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50"
-                  >
-                    {uploading ? (
-                      <>
-                        <span className="inline-block animate-spin mr-2">⏳</span>
-                        Uploading...
-                      </>
-                    ) : (
-                      <>
-                        📤 Upload to Cloudflare Stream
-                      </>
-                    )}
-                  </button>
-                </div>
-                
-                {uploading && (
-                  <div className="bg-blue-50 border border-blue-200 rounded p-4">
-                    <p className="text-sm text-blue-800">
-                      <strong>Uploading to Cloudflare Stream...</strong>
-                      <br />
-                      Your video will be automatically transcoded into multiple bitrates for optimal playback.
-                      This may take a few minutes depending on the file size.
+                  <div className="space-y-2">
+                    <Label htmlFor="description">Description (Optional)</Label>
+                    <Textarea
+                      id="description"
+                      value={uploadDescription}
+                      onChange={(e) => setUploadDescription(e.target.value)}
+                      placeholder="Brief description of the ad..."
+                      rows={3}
+                    />
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="channel">Target Channel *</Label>
+                    <Select value={selectedChannelId} onValueChange={setSelectedChannelId}>
+                      <SelectTrigger id="channel">
+                        <SelectValue placeholder="Select a channel..." />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {channels.map((ch) => (
+                          <SelectItem key={ch.id} value={ch.id}>
+                            {ch.name}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                    <p className="text-xs text-muted-foreground">
+                      The video will be transcoded to match this channel's bitrate ladder
                     </p>
                   </div>
+                </div>
+
+                {/* Preview Planned Variants */}
+                {plannedVariants.length > 0 && (
+                  <Alert>
+                    <AlertDescription>
+                      <div className="space-y-2">
+                        <p className="font-medium">Will create {plannedVariants.length} variants:</p>
+                        <div className="flex flex-wrap gap-2">
+                          {plannedVariants.map((v) => (
+                            <Badge key={v.bitrate} variant="secondary">
+                              {v.bitrate}k → {v.resolution}
+                            </Badge>
+                          ))}
+                        </div>
+                      </div>
+                    </AlertDescription>
+                  </Alert>
                 )}
-              </div>
-            </div>
+
+                {/* Upload Progress */}
+                {uploading && (
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between text-sm">
+                      <span className="text-muted-foreground">Uploading...</span>
+                      <span className="font-medium">{uploadProgress}%</span>
+                    </div>
+                    <Progress value={uploadProgress} />
+                  </div>
+                )}
+              </>
+            )}
           </div>
-        </div>
-      )}
+
+          <DialogFooter>
+            <Button
+              variant="outline"
+              onClick={() => {
+                setUploadModalOpen(false)
+                setSelectedFile(null)
+                setUploadName('')
+                setUploadDescription('')
+                setSelectedChannelId('')
+              }}
+              disabled={uploading}
+            >
+              Cancel
+            </Button>
+            <Button
+              onClick={handleUpload}
+              disabled={!selectedFile || !uploadName || !selectedChannelId || uploading}
+            >
+              {uploading ? (
+                <>
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                  Uploading...
+                </>
+              ) : (
+                <>
+                  <Upload className="mr-2 h-4 w-4" />
+                  Upload
+                </>
+              )}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

@@ -117,6 +117,7 @@ export default function ChannelsPage() {
       mode: 'auto',
       scte35_enabled: true,
       scte35_auto_insert: false,
+      tier: 0,
       vast_enabled: true,
       vast_url: '',
       vast_timeout_ms: 2000,

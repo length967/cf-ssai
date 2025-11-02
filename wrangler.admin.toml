@@ -19,6 +19,12 @@ bucket_name = "ssai-ads"
 binding = "TRANSCODE_QUEUE"
 queue = "transcode-queue"
 
+# Transcode Coordinator DO (for querying parallel transcode status)
+[[durable_objects.bindings]]
+name = "TRANSCODE_COORDINATOR"
+class_name = "TranscodeCoordinatorDO"
+script_name = "cf-ssai-transcode"
+
 # KV for channel config caching (to invalidate on updates)
 [[kv_namespaces]]
 binding = "CHANNEL_CONFIG_CACHE"

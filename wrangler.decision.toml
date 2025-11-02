@@ -9,11 +9,6 @@ binding = "DB"
 database_name = "ssai-admin"
 database_id = "0302f8ab-e592-4fa6-8bbf-7371759da6ed"
 
-# R2 bucket for ad pods
-[[r2_buckets]]
-binding = "ADS_BUCKET"
-bucket_name = "ads-bucket"
-
 # R2 bucket for transcoded HLS ads
 [[r2_buckets]]
 binding = "R2"

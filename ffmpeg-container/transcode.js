@@ -9,12 +9,52 @@ const { promisify } = require('util');
 
 const execAsync = promisify(exec);
 
-// Resolution mapping based on bitrate
-function getResolution(bitrateKbps) {
-  if (bitrateKbps < 600) return { width: 640, height: 360 };
-  if (bitrateKbps < 1200) return { width: 854, height: 480 };
-  if (bitrateKbps < 2500) return { width: 1280, height: 720 };
-  return { width: 1920, height: 1080 };
+// Detect source video resolution using ffprobe
+async function detectSourceResolution(filePath) {
+  try {
+    const { stdout } = await execAsync(
+      `ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "${filePath}"`
+    );
+    const [width, height] = stdout.trim().split('x').map(Number);
+    console.log(`[FFprobe] Detected source resolution: ${width}x${height}`);
+    return { width, height };
+  } catch (error) {
+    console.error('[FFprobe] Failed to detect resolution:', error.message);
+    // Fallback to conservative defaults
+    return { width: 1280, height: 720 };
+  }
+}
+
+// Calculate output resolution based on source and target bitrate
+// NEVER upscales - preserves aspect ratio
+function calculateOutputResolution(sourceRes, targetBitrateKbps) {
+  const aspectRatio = sourceRes.width / sourceRes.height;
+  
+  // Determine target height based on bitrate (max, never upscale)
+  let targetHeight;
+  if (targetBitrateKbps < 600) {
+    targetHeight = 360;
+  } else if (targetBitrateKbps < 1200) {
+    targetHeight = 480;
+  } else if (targetBitrateKbps < 2500) {
+    targetHeight = 720;
+  } else {
+    targetHeight = 1080;
+  }
+  
+  // CRITICAL: Never upscale beyond source resolution
+  targetHeight = Math.min(targetHeight, sourceRes.height);
+  
+  // Calculate width maintaining aspect ratio
+  const targetWidth = Math.round(targetHeight * aspectRatio);
+  
+  // Ensure even dimensions (required by x264 encoder)
+  const evenWidth = targetWidth - (targetWidth % 2);
+  const evenHeight = targetHeight - (targetHeight % 2);
+  
+  console.log(`[Resolution] ${targetBitrateKbps}k: ${sourceRes.width}x${sourceRes.height} → ${evenWidth}x${evenHeight} (aspect: ${aspectRatio.toFixed(2)})`);
+  
+  return { width: evenWidth, height: evenHeight };
 }
 
 // Create R2 client (S3-compatible)
@@ -108,8 +148,8 @@ async function getVideoDuration(filePath) {
 }
 
 // Transcode to a specific bitrate variant
-async function transcodeVariant(sourceFile, outputDir, bitrateKbps) {
-  const resolution = getResolution(bitrateKbps);
+async function transcodeVariant(sourceFile, outputDir, bitrateKbps, sourceResolution) {
+  const resolution = calculateOutputResolution(sourceResolution, bitrateKbps);
   const playlistPath = path.join(outputDir, 'playlist.m3u8');
   const segmentPattern = path.join(outputDir, 'segment_%03d.ts');
   
@@ -169,16 +209,16 @@ async function uploadDirectory(r2Client, bucket, localDir, remotePrefix) {
   console.log(`[R2] Uploaded ${files.length} files from ${localDir}`);
 }
 
-// Create master playlist
-function createMasterPlaylist(bitrates, publicBaseUrl) {
+// Create master playlist with actual variant resolutions
+function createMasterPlaylist(variants) {
   let playlist = '#EXTM3U\n#EXT-X-VERSION:3\n';
   
-  for (const bitrateKbps of bitrates) {
-    const resolution = getResolution(bitrateKbps);
-    const bandwidth = bitrateKbps * 1000;
+  for (const variant of variants) {
+    const bandwidth = variant.bitrate;
+    const resolution = variant.resolution;
     
     playlist += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${resolution.width}x${resolution.height}\n`;
-    playlist += `${bitrateKbps}k/playlist.m3u8\n`;
+    playlist += `${variant.bitrate / 1000}k/playlist.m3u8\n`;
   }
   
   return playlist;
@@ -207,24 +247,32 @@ async function transcodeVideo({ adId, sourceKey, bitrates, r2Config }) {
     const duration = await getVideoDuration(sourceFile);
     console.log(`[Transcode] Video duration: ${duration}s`);
     
-    // 3. Transcode each bitrate variant
+    // 3. Detect source resolution ONCE (before transcoding)
+    const sourceResolution = await detectSourceResolution(sourceFile);
+    console.log(`[Transcode] Source resolution: ${sourceResolution.width}x${sourceResolution.height}`);
+    
+    // 4. Transcode each bitrate variant with detected resolution
     const variants = [];
     for (const bitrateKbps of bitrates) {
       const variantDir = path.join(outputBaseDir, `${bitrateKbps}k`);
-      await transcodeVariant(sourceFile, variantDir, bitrateKbps);
+      const resolution = await transcodeVariant(sourceFile, variantDir, bitrateKbps, sourceResolution);
       
       // Upload variant to R2
       const remotePrefix = `transcoded-ads/${adId}/${bitrateKbps}k`;
       await uploadDirectory(r2Client, bucket, variantDir, remotePrefix);
       
+      // Calculate actual resolution used for this variant
+      const variantResolution = calculateOutputResolution(sourceResolution, bitrateKbps);
+      
       variants.push({
         bitrate: bitrateKbps * 1000,
         url: `${r2Config.publicUrl || 'https://pub-XXXXX.r2.dev'}/${remotePrefix}/playlist.m3u8`,
+        resolution: variantResolution  // Include actual resolution
       });
     }
     
-    // 4. Create and upload master playlist
-    const masterPlaylist = createMasterPlaylist(bitrates, r2Config.publicUrl);
+    // 5. Create and upload master playlist with actual variant resolutions
+    const masterPlaylist = createMasterPlaylist(variants);
     const masterKey = `transcoded-ads/${adId}/master.m3u8`;
     await uploadTextToR2(r2Client, bucket, masterKey, masterPlaylist);
     

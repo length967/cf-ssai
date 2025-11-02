@@ -27,6 +27,11 @@ dead_letter_queue = "transcode-dlq"
 name = "FFMPEG_CONTAINER"
 class_name = "FFmpegContainer"
 
+# Transcode Coordinator (Durable Object for parallel job coordination)
+[[durable_objects.bindings]]
+name = "TRANSCODE_COORDINATOR"
+class_name = "TranscodeCoordinatorDO"
+
 # Container configuration
 [[containers]]
 class_name = "FFmpegContainer"
@@ -34,10 +39,14 @@ image = "./ffmpeg-container/Dockerfile"
 instance_type = "standard-2"  # 1 vCPU, 6GB RAM, 12GB disk
 max_instances = 10
 
-# Migrations for the Container DO
+# Migrations for the Container DO and Coordinator DO
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["FFmpegContainer"]
+
+[[migrations]]
+tag = "v2"
+new_classes = ["TranscodeCoordinatorDO"]
 
 # Configuration
 [vars]

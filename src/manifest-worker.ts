@@ -7,7 +7,6 @@ import type { ViewerJWT, BeaconMessage } from "./types"
 // Bindings available to this Worker
 export interface Env {
   CHANNEL_DO: DurableObjectNamespace
-  ADS_BUCKET: R2Bucket
   BEACON_QUEUE: Queue
   
   // Service bindings
@@ -152,7 +151,52 @@ export default {
     const viewer = await authenticateViewer(req.headers.get("Authorization"), env)
     if (!entitled(viewer, env)) return new Response("forbidden", { status: 403 })
 
-    // Fetch per-channel configuration (if multi-tenant mode)
+    // PERFORMANCE OPTIMIZATION: Bypass DO entirely for segments
+    // Segments don't need manifest processing, just pass-through to origin
+    if (variant.endsWith('.ts') || variant.endsWith('.m4s') || variant.endsWith('.aac') || 
+        (!variant.endsWith('.m3u8') && !variant.includes('master'))) {
+      
+      // Fetch minimal config to get origin URL (cached in KV, fast)
+      let originUrl = env.ORIGIN_VARIANT_BASE
+      
+      if (orgSlug && env.DB) {
+        const config = await getChannelConfig(env, orgSlug, channelSlug)
+        if (config?.originUrl) {
+          originUrl = config.originUrl
+        }
+      }
+      
+      // Normalize origin URL and construct segment URL
+      let baseUrl = originUrl
+      if (baseUrl.endsWith('.m3u8') || baseUrl.endsWith('.isml/.m3u8')) {
+        const lastSlash = baseUrl.lastIndexOf('/')
+        if (lastSlash > 0) {
+          baseUrl = baseUrl.substring(0, lastSlash)
+        }
+      }
+      
+      const segmentUrl = `${baseUrl}/${variant}`
+      
+      // Proxy directly to origin, skip DO coordination entirely
+      const segmentResponse = await fetch(segmentUrl, {
+        cf: { cacheTtl: 60, cacheEverything: true }
+      })
+      
+      // Add CORS headers for browser playback
+      const headers = new Headers(segmentResponse.headers)
+      const cors = corsHeaders()
+      for (const [key, value] of Object.entries(cors)) {
+        headers.set(key, value)
+      }
+      
+      return new Response(segmentResponse.body, {
+        status: segmentResponse.status,
+        statusText: segmentResponse.statusText,
+        headers
+      })
+    }
+
+    // For manifests, proceed with normal DO processing
     let channelConfig = null
     let effectiveConfig = {
       originUrl: env.ORIGIN_VARIANT_BASE,

@@ -19,6 +19,9 @@ export interface Env {
   // Queue for transcode jobs
   TRANSCODE_QUEUE: Queue
   
+  // Coordinator DO for parallel transcoding
+  TRANSCODE_COORDINATOR: DurableObjectNamespace
+  
   // KV for channel config caching
   CHANNEL_CONFIG_CACHE?: KVNamespace
 }
@@ -1024,7 +1027,32 @@ class AdminAPI {
       SELECT * FROM ads WHERE organization_id = ? ORDER BY created_at DESC
     `).bind(auth.organizationId).all()
     
-    return new Response(JSON.stringify({ ads: ads.results || [] }), {
+    // Parse and format variants for each ad
+    const formattedAds = (ads.results || []).map((ad: any) => {
+      const formatted = { ...ad }
+      
+      // Parse variants JSON if present
+      if (ad.variants) {
+        try {
+          const variants = JSON.parse(ad.variants)
+          formatted.variants_parsed = variants
+          formatted.variant_count = variants.length
+          formatted.variant_bitrates = variants.map((v: any) => v.bitrate).sort((a: number, b: number) => a - b)
+        } catch (e) {
+          formatted.variants_parsed = []
+          formatted.variant_count = 0
+          formatted.variant_bitrates = []
+        }
+      } else {
+        formatted.variants_parsed = []
+        formatted.variant_count = 0
+        formatted.variant_bitrates = []
+      }
+      
+      return formatted
+    })
+    
+    return new Response(JSON.stringify({ ads: formattedAds }), {
       headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
     })
   }
@@ -1032,7 +1060,7 @@ class AdminAPI {
   async getAd(auth: AuthContext, adId: string): Promise<Response> {
     const ad = await this.env.DB.prepare(`
       SELECT * FROM ads WHERE id = ? AND organization_id = ?
-    `).bind(adId, auth.organizationId).first()
+    `).bind(adId, auth.organizationId).first<any>()
     
     if (!ad) {
       return new Response(JSON.stringify({ error: 'Ad not found' }), {
@@ -1041,7 +1069,37 @@ class AdminAPI {
       })
     }
     
-    return new Response(JSON.stringify({ ad }), {
+    // Parse and format variants
+    const formatted = { ...ad }
+    if (ad.variants) {
+      try {
+        const variants = JSON.parse(ad.variants)
+        formatted.variants_parsed = variants
+        formatted.variant_count = variants.length
+        formatted.variant_bitrates = variants.map((v: any) => v.bitrate).sort((a: number, b: number) => a - b)
+        
+        // Add detailed variant info with human-readable bitrates
+        formatted.variants_detailed = variants.map((v: any) => ({
+          bitrate: v.bitrate,
+          bitrate_kbps: Math.round(v.bitrate / 1000),
+          bitrate_mbps: (v.bitrate / 1000000).toFixed(2),
+          url: v.url,
+          resolution: v.resolution || 'unknown'
+        }))
+      } catch (e) {
+        formatted.variants_parsed = []
+        formatted.variant_count = 0
+        formatted.variant_bitrates = []
+        formatted.variants_detailed = []
+      }
+    } else {
+      formatted.variants_parsed = []
+      formatted.variant_count = 0
+      formatted.variant_bitrates = []
+      formatted.variants_detailed = []
+    }
+    
+    return new Response(JSON.stringify({ ad: formatted }), {
       headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
     })
   }
@@ -1135,8 +1193,20 @@ class AdminAPI {
         auth.user.id
       ).run()
       
-      // Queue transcode job
+      // Determine if we should use parallel transcoding
+      // Use parallel transcoding for videos longer than 30 seconds
+      const PARALLEL_THRESHOLD_SECONDS = 30;
+      const SEGMENT_DURATION = 10; // 10 seconds per segment
+      
+      // For now, we need to probe the video duration
+      // This is a limitation - we'll queue a single job that splits itself
+      // TODO: Probe video duration before queueing to decide parallel vs. single
+      
+      // Queue transcode job (will be split into segments by worker if needed)
       console.log(`Queueing transcode job for ad ${adId} with bitrates:`, bitrates)
+      
+      // For now, use traditional full-video transcode
+      // Parallel transcoding will be enabled once we add duration probing
       await this.env.TRANSCODE_QUEUE.send({
         adId,
         sourceKey,
@@ -1145,6 +1215,37 @@ class AdminAPI {
         channelId,
         retryCount: 0,
       })
+      
+      // TODO: Implement parallel transcoding job creation
+      // const jobGroupId = crypto.randomUUID();
+      // const segmentCount = Math.ceil(duration / SEGMENT_DURATION);
+      // 
+      // // Initialize coordinator DO
+      // const doId = this.env.TRANSCODE_COORDINATOR.idFromName(jobGroupId);
+      // const coordinator = this.env.TRANSCODE_COORDINATOR.get(doId);
+      // await coordinator.fetch('http://coordinator/init', {
+      //   method: 'POST',
+      //   body: JSON.stringify({
+      //     adId, segmentCount, bitrates,
+      //     organizationId: auth.organizationId,
+      //     channelId, sourceKey
+      //   })
+      // });
+      // 
+      // // Queue all segment jobs
+      // const segmentJobs = [];
+      // for (let i = 0; i < segmentCount; i++) {
+      //   segmentJobs.push({
+      //     type: 'SEGMENT',
+      //     adId, segmentId: i,
+      //     startTime: i * SEGMENT_DURATION,
+      //     duration: SEGMENT_DURATION,
+      //     sourceKey, bitrates,
+      //     organizationId: auth.organizationId,
+      //     channelId, jobGroupId
+      //   });
+      // }
+      // await this.env.TRANSCODE_QUEUE.sendBatch(segmentJobs);
       
       await this.logEvent(auth.organizationId, auth.user.id, 'ad.uploaded', 'ad', adId, { 
         source_key: sourceKey, 
