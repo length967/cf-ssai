@@ -254,6 +254,45 @@ export const SEGMENTATION_TYPE_NAMES: Record<number, string> = {
 }
 
 // ============================================================================
+// PTS ADJUSTMENT UTILITY
+// ============================================================================
+
+/**
+ * Apply PTS adjustment to splice commands (SCTE-35 spec section 9.2)
+ * Adds pts_adjustment to all PTS times and wraps at 33 bits (2^33)
+ */
+function applySCTE35PTSAdjustment(
+  spliceCommand: SpliceInsert | TimeSignal | BandwidthReservation,
+  ptsAdjustment: bigint
+): void {
+  if (ptsAdjustment === 0n) return
+  
+  // Apply to splice_insert command
+  if ('spliceEventId' in spliceCommand) {
+    const si = spliceCommand as SpliceInsert
+    if (si.spliceTime?.ptsTime) {
+      const adjusted = (si.spliceTime.ptsTime + ptsAdjustment) & 0x1FFFFFFFFn
+      console.log(`Applied PTS adjustment to splice_insert: ${ptsAdjustment} ticks (${ticksToSeconds(ptsAdjustment).toFixed(3)}s)`)
+      console.log(`  Original PTS: ${si.spliceTime.ptsTime} (${ticksToSeconds(si.spliceTime.ptsTime).toFixed(3)}s)`)
+      console.log(`  Adjusted PTS: ${adjusted} (${ticksToSeconds(adjusted).toFixed(3)}s)`)
+      si.spliceTime.ptsTime = adjusted
+    }
+  }
+  
+  // Apply to time_signal command
+  if ('spliceTime' in spliceCommand && !('spliceEventId' in spliceCommand)) {
+    const ts = spliceCommand as TimeSignal
+    if (ts.spliceTime?.ptsTime) {
+      const adjusted = (ts.spliceTime.ptsTime + ptsAdjustment) & 0x1FFFFFFFFn
+      console.log(`Applied PTS adjustment to time_signal: ${ptsAdjustment} ticks (${ticksToSeconds(ptsAdjustment).toFixed(3)}s)`)
+      console.log(`  Original PTS: ${ts.spliceTime.ptsTime} (${ticksToSeconds(ts.spliceTime.ptsTime).toFixed(3)}s)`)
+      console.log(`  Adjusted PTS: ${adjusted} (${ticksToSeconds(adjusted).toFixed(3)}s)`)
+      ts.spliceTime.ptsTime = adjusted
+    }
+  }
+}
+
+// ============================================================================
 // MAIN PARSING FUNCTION
 // ============================================================================
 
@@ -349,6 +388,11 @@ export function parseSCTE35Binary(base64Cmd: string): SCTE35BinaryData | null {
     
     // Validate CRC
     const crcValid = validateCRC32(buffer, crcOffset)
+    
+    // Apply PTS adjustment to splice commands (SCTE-35 spec section 9.2)
+    if (ptsAdjustment > 0n && spliceCommand) {
+      applySCTE35PTSAdjustment(spliceCommand, ptsAdjustment)
+    }
     
     return {
       valid: true,

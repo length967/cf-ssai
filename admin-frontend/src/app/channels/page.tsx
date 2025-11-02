@@ -13,6 +13,7 @@ type Channel = {
   mode: string
   scte35_enabled: number
   scte35_auto_insert?: number
+  tier?: number
   vast_enabled: number
   vast_url?: string
   vast_timeout_ms?: number
@@ -54,6 +55,7 @@ export default function ChannelsPage() {
     mode: 'auto',
     scte35_enabled: true,
     scte35_auto_insert: false,
+    tier: 0,
     vast_enabled: true,
     vast_url: '',
     vast_timeout_ms: 2000,
@@ -145,6 +147,7 @@ export default function ChannelsPage() {
       mode: channel.mode,
       scte35_enabled: Boolean(channel.scte35_enabled),
       scte35_auto_insert: Boolean(channel.scte35_auto_insert),
+      tier: channel.tier ?? 0,
       vast_enabled: Boolean(channel.vast_enabled),
       vast_url: channel.vast_url || '',
       vast_timeout_ms: channel.vast_timeout_ms || 2000,
@@ -523,6 +526,29 @@ export default function ChannelsPage() {
                     <span className="ml-2 text-sm text-gray-700">Auto-Insert Ads on SCTE-35 Signals</span>
                   </label>
                   <p className="text-sm text-gray-500">Automatically trigger ad insertion when SCTE-35 markers are detected (disable to only trigger manually via API)</p>
+                  
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-2">
+                      Authorization Tier (SCTE-35 Filtering)
+                    </label>
+                    <select
+                      value={formData.tier}
+                      onChange={(e) => setFormData({ ...formData, tier: parseInt(e.target.value) })}
+                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      disabled={!formData.scte35_enabled}
+                    >
+                      <option value={0}>No restrictions (0x000) - All ads allowed</option>
+                      <option value={1}>Tier 1 (0x001) - Basic subscribers</option>
+                      <option value={2}>Tier 2 (0x002) - Premium subscribers</option>
+                      <option value={3}>Tier 3 (0x003) - VIP subscribers</option>
+                      <option value={4}>Tier 4 (0x004) - Custom tier</option>
+                      <option value={5}>Tier 5 (0x005) - Custom tier</option>
+                    </select>
+                    <p className="mt-1 text-sm text-gray-500">
+                      Only insert ads from SCTE-35 signals matching this tier level. 
+                      Set to 0 to allow all ads. Higher tiers can be used for premium/ad-free services.
+                    </p>
+                  </div>
                 </div>
               </div>
 

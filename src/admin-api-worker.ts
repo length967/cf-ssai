@@ -336,9 +336,9 @@ class AdminAPI {
         id, organization_id, name, slug, origin_url, status, mode,
         scte35_enabled, scte35_auto_insert, vast_enabled, vast_url, default_ad_duration,
         ad_pod_base_url, sign_host, slate_pod_id, time_based_auto_insert,
-        segment_cache_max_age, manifest_cache_max_age, settings,
+        segment_cache_max_age, manifest_cache_max_age, tier, settings,
         created_at, updated_at, created_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       id,
       auth.organizationId,
@@ -358,6 +358,7 @@ class AdminAPI {
       data.time_based_auto_insert ?? 0,
       data.segment_cache_max_age || 60,
       data.manifest_cache_max_age || 4,
+      data.tier ?? 0,  // Default: no tier restrictions
       JSON.stringify(data.settings || {}),
       now,
       now,
@@ -398,7 +399,7 @@ class AdminAPI {
     
     const fields = ['name', 'origin_url', 'status', 'mode', 'scte35_enabled', 'scte35_auto_insert',
                     'vast_enabled', 'vast_url', 'default_ad_duration', 'ad_pod_base_url', 'sign_host', 
-                    'slate_pod_id', 'time_based_auto_insert', 'segment_cache_max_age', 'manifest_cache_max_age']
+                    'slate_pod_id', 'time_based_auto_insert', 'segment_cache_max_age', 'manifest_cache_max_age', 'tier']
     
     for (const field of fields) {
       if (data[field] !== undefined) {

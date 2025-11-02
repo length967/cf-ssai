@@ -541,18 +541,34 @@ export class ChannelDO {
         adSource = "api"
         console.log(`API-triggered ad break: duration=${breakDurationSec}s, podId=${adState!.podId}`)
       } else if (activeBreak && channelConfig?.scte35AutoInsert) {
-        // SCTE-35 signal detected - use it (only if auto-insert enabled)
-        shouldInsertAd = true
-        breakDurationSec = getBreakDuration(activeBreak)
-        adSource = "scte35"
+        // SCTE-35 signal detected - check tier filtering first
+        const channelTier = channelConfig?.tier ?? 0
+        const scte35Tier = activeBreak.binaryData?.tier ?? 0
         
-        // Find the PDT timestamp for the break
-        const pdts = extractPDTs(origin)
-        if (pdts.length > 0) {
-          scte35StartPDT = pdts[pdts.length - 1]  // Use most recent PDT near signal
+        // Tier filtering (SCTE-35 spec section 9.2)
+        // If channel tier is 0, accept all ads
+        // Otherwise, only accept ads matching the channel's tier
+        if (channelTier !== 0 && scte35Tier !== channelTier) {
+          console.log(`SCTE-35 tier mismatch: channel tier=${channelTier} (0x${channelTier.toString(16).padStart(3, '0')}), signal tier=${scte35Tier} (0x${scte35Tier.toString(16).padStart(3, '0')}) - skipping ad`)
+          // Don't insert this ad - wrong tier
+          shouldInsertAd = false
+        } else {
+          // Tier matches or no tier restriction - proceed with ad insertion
+          shouldInsertAd = true
+          breakDurationSec = getBreakDuration(activeBreak)
+          adSource = "scte35"
+          
+          // Find the PDT timestamp for the break
+          const pdts = extractPDTs(origin)
+          if (pdts.length > 0) {
+            scte35StartPDT = pdts[pdts.length - 1]  // Use most recent PDT near signal
+          }
+          
+          if (channelTier !== 0 && scte35Tier === channelTier) {
+            console.log(`SCTE-35 tier match: tier=${channelTier} (0x${channelTier.toString(16).padStart(3, '0')}) - allowing ad`)
+          }
+          console.log(`SCTE-35 break detected (auto-insert enabled): duration=${breakDurationSec}s, pdt=${scte35StartPDT}`)
         }
-        
-        console.log(`SCTE-35 break detected (auto-insert enabled): duration=${breakDurationSec}s, pdt=${scte35StartPDT}`)
       } else if (isBreakMinute && channelConfig?.timeBasedAutoInsert) {
         // Fallback to time-based schedule (only if auto-insert enabled)
         shouldInsertAd = true
