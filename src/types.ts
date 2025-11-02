@@ -83,7 +83,7 @@ export type ViewerJWT = {
   export type SCTE35Signal = {
     id: string
     type: SCTE35SignalType
-    pts?: number  // Presentation timestamp
+    pts?: number  // Presentation timestamp (from binary or X-PTS)
     duration?: number  // In seconds
     segmentationType?: SCTE35SegmentationType
     upid?: string  // Unique program ID
@@ -91,6 +91,20 @@ export type ViewerJWT = {
     autoReturn?: boolean
     segmentNum?: number
     segmentsExpected?: number
+    // Enhanced binary data (when parsed from SCTE35-CMD)
+    binaryData?: {
+      spliceEventId?: number
+      protocolVersion?: number
+      ptsAdjustment?: bigint
+      crcValid?: boolean
+      segmentationDescriptors?: any[]  // Full segmentation descriptor data
+      deliveryRestrictions?: {
+        webAllowed?: boolean
+        noRegionalBlackout?: boolean
+        archiveAllowed?: boolean
+        deviceRestrictions?: number
+      }
+    }
   }
   
   export type SCTE35Context = {

@@ -482,12 +482,24 @@ export class ChannelDO {
       const adState = await loadAdState(this.state)
       const adActive = !!adState && Date.now() < adState.endsAt
 
-      // Parse SCTE-35 signals from origin manifest
+      // Parse SCTE-35 signals from origin manifest (with enhanced binary parsing)
       const scte35Signals = parseSCTE35FromManifest(origin)
       const activeBreak = findActiveBreak(scte35Signals)
       
       if (scte35Signals.length > 0) {
-        console.log(`Found ${scte35Signals.length} SCTE-35 signals, activeBreak:`, activeBreak ? `${activeBreak.id} (${activeBreak.duration}s)` : 'none')
+        console.log(`Found ${scte35Signals.length} SCTE-35 signals`)
+        
+        if (activeBreak) {
+          // Log enhanced binary data if available
+          if (activeBreak.binaryData) {
+            console.log(`SCTE-35 Binary Parsing: Event ID=${activeBreak.binaryData.spliceEventId}, ` +
+              `PTS=${activeBreak.pts ? `${activeBreak.pts} (${(activeBreak.pts / 90000).toFixed(3)}s)` : 'N/A'}, ` +
+              `CRC Valid=${activeBreak.binaryData.crcValid}, ` +
+              `Duration=${activeBreak.duration}s`)
+          } else {
+            console.log(`SCTE-35 Attribute Parsing: ${activeBreak.id} (${activeBreak.duration}s)`)
+          }
+        }
       }
 
       // Determine ad insertion mode: SGAI (server-guided) or SSAI (server-side)
@@ -574,7 +586,12 @@ export class ChannelDO {
             scte35: activeBreak ? {
               id: activeBreak.id,
               type: activeBreak.type,
-              duration: activeBreak.duration
+              duration: activeBreak.duration,
+              // Enhanced binary metadata
+              spliceEventId: activeBreak.binaryData?.spliceEventId,
+              pts: activeBreak.pts,
+              crcValid: activeBreak.binaryData?.crcValid,
+              upid: activeBreak.upid
             } : undefined
           },
           tracking: {

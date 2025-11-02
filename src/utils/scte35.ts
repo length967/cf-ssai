@@ -1,7 +1,19 @@
 // SCTE-35 Parser for HLS Manifests
 // Parses SCTE-35 markers from #EXT-X-DATERANGE tags in HLS manifests
+// Enhanced with binary SCTE-35 command parsing for frame-accurate insertion
 
 import type { SCTE35Signal, SCTE35SignalType, SCTE35SegmentationType } from "../types"
+import {
+  parseSCTE35Binary,
+  createEnhancedSignal,
+  extractPrecisePTS,
+  getBreakDurationFromBinary,
+  hasAutoReturn,
+  getSegmentationDescriptors,
+  ticksToSeconds,
+  isSCTE35Encrypted,
+  validateCRC32
+} from "./scte35-binary"
 
 /**
  * Parse SCTE-35 signals from HLS manifest
@@ -27,6 +39,7 @@ export function parseSCTE35FromManifest(manifestText: string): SCTE35Signal[] {
 
 /**
  * Parse a single #EXT-X-DATERANGE line for SCTE-35 data
+ * Enhanced with binary parsing for frame-accurate timing
  */
 function parseDateRangeSCTE35(line: string): SCTE35Signal | null {
   // Parse attributes from DATERANGE tag
@@ -43,6 +56,18 @@ function parseDateRangeSCTE35(line: string): SCTE35Signal | null {
   }
   
   const id = attrs["ID"] || `scte35-${Date.now()}`
+  
+  // Try binary parsing first for enhanced metadata
+  const binaryCmd = scte35Cmd || scte35Out
+  if (binaryCmd && !isSCTE35Encrypted(binaryCmd)) {
+    const enhancedSignal = createEnhancedSignal(id, binaryCmd, attrs)
+    if (enhancedSignal) {
+      console.log(`SCTE-35 binary parsing successful: Event ID ${enhancedSignal.binaryData?.spliceEventId}, CRC valid: ${enhancedSignal.binaryData?.crcValid}`)
+      return enhancedSignal
+    }
+  }
+  
+  // Fall back to attribute-based parsing
   const duration = attrs["DURATION"] ? parseFloat(attrs["DURATION"]) : 
                    attrs["PLANNED-DURATION"] ? parseFloat(attrs["PLANNED-DURATION"]) : undefined
   const pts = attrs["X-PTS"] ? parseInt(attrs["X-PTS"], 10) : undefined
@@ -260,4 +285,28 @@ export function isValidSCTE35Signal(signal: SCTE35Signal): boolean {
   
   return true
 }
+
+// ============================================================================
+// RE-EXPORT BINARY PARSING UTILITIES
+// ============================================================================
+
+/**
+ * Re-export binary parsing functions for convenience
+ */
+export {
+  parseSCTE35Binary,
+  extractPrecisePTS,
+  getBreakDurationFromBinary,
+  hasAutoReturn as hasAutoReturnBinary,
+  getSegmentationDescriptors,
+  ticksToSeconds,
+  isSCTE35Encrypted,
+  validateCRC32,
+  type SCTE35BinaryData,
+  type SpliceInsert,
+  type TimeSignal,
+  type SegmentationDescriptor,
+  UPIDType,
+  SEGMENTATION_TYPE_NAMES
+} from "./scte35-binary"
 
