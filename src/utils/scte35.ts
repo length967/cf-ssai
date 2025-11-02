@@ -64,7 +64,11 @@ function parseDateRangeSCTE35(line: string): SCTE35Signal | null {
     if (enhancedSignal) {
       console.log(`SCTE-35 binary parsing successful: Event ID ${enhancedSignal.binaryData?.spliceEventId}, CRC valid: ${enhancedSignal.binaryData?.crcValid}`)
       return enhancedSignal
+    } else {
+      console.warn(`SCTE-35 binary parsing failed for ${id}, falling back to attribute parsing`)
     }
+  } else if (binaryCmd && isSCTE35Encrypted(binaryCmd)) {
+    console.log(`SCTE-35 command is encrypted for ${id}, using attribute parsing`)
   }
   
   // Fall back to attribute-based parsing

@@ -401,11 +401,11 @@ function parseSpliceInsert(buffer: BufferReader): SpliceInsert {
     }
   }
   
-  const outOfNetworkIndicator = (flags & 0x80) !== 0
-  const programSpliceFlag = (flags & 0x40) !== 0
-  const durationFlag = (flags & 0x20) !== 0
-  const spliceImmediateFlag = (flags & 0x10) !== 0
-  const eventIdComplianceFlag = (flags & 0x08) !== 0
+  const outOfNetworkIndicator = (flags & 0x40) !== 0
+  const programSpliceFlag = (flags & 0x20) !== 0
+  const durationFlag = (flags & 0x10) !== 0
+  const spliceImmediateFlag = (flags & 0x08) !== 0
+  const eventIdComplianceFlag = (flags & 0x04) !== 0
   
   // Parse splice time or component splices
   let spliceTime: SpliceTime | undefined
@@ -999,6 +999,20 @@ export function createEnhancedSignal(
     type = "splice_insert"
   }
   
+  // Extract delivery restrictions if available
+  let deliveryRestrictions: any = undefined
+  if (segmentationDescriptor) {
+    const sd = segmentationDescriptor.data as SegmentationDescriptor
+    if (sd.deliveryNotRestrictedFlag === false) {
+      deliveryRestrictions = {
+        webAllowed: sd.webDeliveryAllowedFlag,
+        noRegionalBlackout: sd.noRegionalBlackoutFlag,
+        archiveAllowed: sd.archiveAllowedFlag,
+        deviceRestrictions: sd.deviceRestrictions
+      }
+    }
+  }
+  
   return {
     id,
     type,
@@ -1015,7 +1029,11 @@ export function createEnhancedSignal(
       spliceEventId,
       protocolVersion: parsed.protocolVersion,
       ptsAdjustment: parsed.ptsAdjustment,
-      crcValid: parsed.crcValid
+      crcValid: parsed.crcValid,
+      segmentationDescriptors: parsed.descriptors
+        .filter(d => d.tag === 0x02)
+        .map(d => d.data),
+      deliveryRestrictions
     }
   }
 }

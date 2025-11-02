@@ -587,7 +587,6 @@ export class ChannelDO {
               id: activeBreak.id,
               type: activeBreak.type,
               duration: activeBreak.duration,
-              // Enhanced binary metadata
               spliceEventId: activeBreak.binaryData?.spliceEventId,
               pts: activeBreak.pts,
               crcValid: activeBreak.binaryData?.crcValid,
