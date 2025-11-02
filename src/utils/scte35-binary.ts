@@ -705,7 +705,7 @@ function parseSegmentationDescriptor(buffer: BufferReader): SegmentationDescript
 /**
  * Parse time_descriptor (Section 10.3.4)
  */
-function parseTimeDescriptor(buffer: Buffer): TimeDescriptor {
+function parseTimeDescriptor(buffer: BufferReader): TimeDescriptor {
   // Skip identifier "CUEI" (4 bytes)
   const taiSeconds = buffer.readBigUInt64BE(4) & 0xFFFFFFFFFFn  // 48 bits
   const taiNanoseconds = buffer.readUInt32BE(10)
@@ -722,7 +722,7 @@ function parseTimeDescriptor(buffer: Buffer): TimeDescriptor {
  * Parse UPID (Unique Program Identifier) based on type
  * Supports all 16 UPID types
  */
-function parseUPID(buffer: Buffer, offset: number, type: number, length: number): string {
+function parseUPID(buffer: BufferReader, offset: number, type: number, length: number): string {
   const upidData = buffer.slice(offset, offset + length)
   
   switch (type) {
@@ -823,7 +823,7 @@ export function secondsToTicks(seconds: number): bigint {
 /**
  * Validate CRC-32 checksum (Section 9.2)
  */
-export function validateCRC32(buffer: Buffer, crcOffset: number): boolean {
+export function validateCRC32(buffer: BufferReader, crcOffset: number): boolean {
   // CRC-32 covers from start to end of descriptor loop
   const dataToCheck = buffer.slice(0, crcOffset)
   const receivedCRC = buffer.readUInt32BE(crcOffset)
@@ -837,7 +837,7 @@ export function validateCRC32(buffer: Buffer, crcOffset: number): boolean {
 /**
  * Calculate CRC-32 using MPEG-2 polynomial
  */
-function calculateCRC32(buffer: Buffer): number {
+function calculateCRC32(buffer: Uint8Array): number {
   let crc = 0xFFFFFFFF
   
   for (let i = 0; i < buffer.length; i++) {
@@ -860,7 +860,8 @@ function calculateCRC32(buffer: Buffer): number {
  */
 export function isSCTE35Encrypted(base64Cmd: string): boolean {
   try {
-    const buffer = Buffer.from(base64Cmd, 'base64')
+    const rawBuffer = base64ToUint8Array(base64Cmd)
+    const buffer = new BufferReader(rawBuffer)
     if (buffer.length < 5) return false
     return (buffer.readUInt8(4) & 0x80) !== 0
   } catch {
