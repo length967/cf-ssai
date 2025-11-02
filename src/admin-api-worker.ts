@@ -703,6 +703,22 @@ class AdminAPI {
       values.push(JSON.stringify(data.settings))
     }
     
+    // Parallel transcoding settings
+    if (data.parallel_transcode_enabled !== undefined) {
+      updates.push('parallel_transcode_enabled = ?')
+      values.push(data.parallel_transcode_enabled ? 1 : 0)
+    }
+    
+    if (data.parallel_transcode_threshold !== undefined) {
+      updates.push('parallel_transcode_threshold = ?')
+      values.push(data.parallel_transcode_threshold)
+    }
+    
+    if (data.parallel_segment_duration !== undefined) {
+      updates.push('parallel_segment_duration = ?')
+      values.push(data.parallel_segment_duration)
+    }
+    
     updates.push('updated_at = ?')
     values.push(Date.now())
     
@@ -1019,6 +1035,302 @@ class AdminAPI {
   }
   
   // ============================================================================
+  // SLATES - "We'll Be Right Back" Videos
+  // ============================================================================
+  
+  async listSlates(auth: AuthContext): Promise<Response> {
+    const slates = await this.env.DB.prepare(`
+      SELECT * FROM slates WHERE organization_id = ? ORDER BY created_at DESC
+    `).bind(auth.organizationId).all()
+    
+    const formattedSlates = (slates.results || []).map((slate: any) => {
+      const formatted = { ...slate }
+      
+      if (slate.variants) {
+        try {
+          const variants = JSON.parse(slate.variants)
+          formatted.variants_parsed = variants
+          formatted.variant_count = variants.length
+        } catch (e) {
+          formatted.variants_parsed = []
+          formatted.variant_count = 0
+        }
+      }
+      
+      return formatted
+    })
+    
+    return new Response(JSON.stringify({ slates: formattedSlates }), {
+      headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+    })
+  }
+  
+  async getSlate(auth: AuthContext, slateId: string): Promise<Response> {
+    const slate = await this.env.DB.prepare(`
+      SELECT * FROM slates WHERE id = ? AND organization_id = ?
+    `).bind(slateId, auth.organizationId).first<any>()
+    
+    if (!slate) {
+      return new Response(JSON.stringify({ error: 'Slate not found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+      })
+    }
+    
+    return new Response(JSON.stringify({ slate }), {
+      headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+    })
+  }
+  
+  async createGeneratedSlate(auth: AuthContext, data: any): Promise<Response> {
+    try {
+      const { name, text_content, background_color, text_color, font_size, duration, channel_id } = data
+      
+      if (!name || !text_content) {
+        return new Response(JSON.stringify({ error: 'Name and text content are required' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+        })
+      }
+      
+      // Get channel bitrate ladder if specified
+      let bitrates = [1000, 2000, 3000]
+      if (channel_id) {
+        const channel = await this.env.DB.prepare(`
+          SELECT bitrate_ladder FROM channels WHERE id = ? AND organization_id = ?
+        `).bind(channel_id, auth.organizationId).first<any>()
+        
+        if (channel?.bitrate_ladder) {
+          try {
+            bitrates = JSON.parse(channel.bitrate_ladder)
+          } catch (e) {
+            console.warn('Failed to parse bitrate ladder')
+          }
+        }
+      }
+      
+      // Create slate record
+      const slateId = generateId('slate')
+      const now = Date.now()
+      const slateDuration = duration || 10 // Default 10 seconds
+      
+      // Create database record for generated slate
+      await this.env.DB.prepare(`
+        INSERT INTO slates (
+          id, organization_id, name, duration, status, slate_type,
+          text_content, background_color, text_color, font_size,
+          created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        slateId,
+        auth.organizationId,
+        name,
+        slateDuration,
+        'pending',
+        'generated',
+        text_content,
+        background_color || '#000000',
+        text_color || '#FFFFFF',
+        font_size || 48,
+        now,
+        now
+      ).run()
+      
+      // Queue generation job (transcode worker will handle FFmpeg generation)
+      await this.env.TRANSCODE_QUEUE.send({
+        adId: slateId,
+        bitrates: bitrates,
+        organizationId: auth.organizationId,
+        channelId: channel_id || undefined,
+        isSlate: true,
+        isGenerated: true,
+        slateConfig: {
+          text: text_content,
+          backgroundColor: background_color || '#000000',
+          textColor: text_color || '#FFFFFF',
+          fontSize: font_size || 48,
+          duration: slateDuration
+        }
+      })
+      
+      await this.logEvent(auth.organizationId, auth.user.id, 'slate.created', 'slate', slateId, { name, type: 'generated' })
+      
+      return new Response(JSON.stringify({ success: true, slate_id: slateId }), {
+        headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+      })
+    } catch (err) {
+      console.error('Generated slate creation error:', err)
+      return new Response(JSON.stringify({ error: 'Failed to create generated slate' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+      })
+    }
+  }
+  
+  async uploadSlate(auth: AuthContext, request: Request): Promise<Response> {
+    try {
+      const formData = await request.formData()
+      const file = formData.get('file') as File
+      const name = formData.get('name') as string || file?.name
+      const channelId = formData.get('channel_id') as string || null
+      
+      if (!file) {
+        return new Response(JSON.stringify({ error: 'No file provided' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+        })
+      }
+      
+      // Validate file type
+      if (!file.type.startsWith('video/') && !file.type.startsWith('image/')) {
+        return new Response(JSON.stringify({ error: 'File must be a video or image' }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+        })
+      }
+      
+      // Get channel bitrate ladder if specified
+      let bitrates = [1000, 2000, 3000] // Default
+      if (channelId) {
+        const channel = await this.env.DB.prepare(`
+          SELECT bitrate_ladder FROM channels WHERE id = ? AND organization_id = ?
+        `).bind(channelId, auth.organizationId).first<any>()
+        
+        if (channel?.bitrate_ladder) {
+          try {
+            bitrates = JSON.parse(channel.bitrate_ladder)
+          } catch (e) {
+            console.warn('Failed to parse bitrate ladder')
+          }
+        }
+      }
+      
+      // Create slate record
+      const slateId = generateId('slate')
+      const now = Date.now()
+      const sourceKey = `source-videos/${slateId}/original${file.type.startsWith('image/') ? '.jpg' : '.mp4'}`
+      
+      // Upload to R2
+      await this.env.R2.put(sourceKey, file.stream(), {
+        httpMetadata: { contentType: file.type },
+        customMetadata: {
+          originalFilename: file.name,
+          uploadedBy: auth.user.id,
+          organizationId: auth.organizationId,
+        }
+      })
+      
+      const sourceVideoUrl = `${this.env.R2_PUBLIC_URL}/${sourceKey}`
+      
+      // Create database record
+      await this.env.DB.prepare(`
+        INSERT INTO slates (
+          id, organization_id, name, duration, status,
+          source_video_url, source_file_size, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).bind(
+        slateId,
+        auth.organizationId,
+        name,
+        10, // Default duration, will be updated after probe
+        'pending',
+        sourceVideoUrl,
+        file.size,
+        now,
+        now
+      ).run()
+      
+      // Queue transcoding job
+      await this.env.TRANSCODE_QUEUE.send({
+        adId: slateId,
+        sourceUrl: sourceVideoUrl,
+        bitrates: bitrates,
+        organizationId: auth.organizationId,
+        channelId: channelId || undefined,
+        isSlate: true, // Mark as slate for special handling
+      })
+      
+      await this.logEvent(auth.organizationId, auth.user.id, 'slate.created', 'slate', slateId, { name })
+      
+      return new Response(JSON.stringify({ success: true, slate_id: slateId }), {
+        headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+      })
+    } catch (err) {
+      console.error('Slate upload error:', err)
+      return new Response(JSON.stringify({ error: 'Failed to upload slate' }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+      })
+    }
+  }
+  
+  async updateSlate(auth: AuthContext, slateId: string, data: any): Promise<Response> {
+    // Verify ownership
+    const slate = await this.env.DB.prepare(`
+      SELECT * FROM slates WHERE id = ? AND organization_id = ?
+    `).bind(slateId, auth.organizationId).first<any>()
+    
+    if (!slate) {
+      return new Response(JSON.stringify({ error: 'Slate not found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+      })
+    }
+    
+    // Update slate
+    await this.env.DB.prepare(`
+      UPDATE slates SET name = ?, updated_at = ? WHERE id = ?
+    `).bind(data.name || slate.name, Date.now(), slateId).run()
+    
+    await this.logEvent(auth.organizationId, auth.user.id, 'slate.updated', 'slate', slateId, data)
+    
+    return new Response(JSON.stringify({ success: true }), {
+      headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+    })
+  }
+  
+  async deleteSlate(auth: AuthContext, slateId: string): Promise<Response> {
+    const slate = await this.env.DB.prepare(`
+      SELECT * FROM slates WHERE id = ? AND organization_id = ?
+    `).bind(slateId, auth.organizationId).first<any>()
+    
+    if (!slate) {
+      return new Response(JSON.stringify({ error: 'Slate not found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+      })
+    }
+    
+    // Check if slate is in use by any channels
+    const channelsUsingSlate = await this.env.DB.prepare(`
+      SELECT COUNT(*) as count FROM channels WHERE slate_id = ?
+    `).bind(slateId).first<any>()
+    
+    if (channelsUsingSlate && channelsUsingSlate.count > 0) {
+      return new Response(JSON.stringify({ 
+        error: 'Cannot delete slate: it is currently assigned to one or more channels' 
+      }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+      })
+    }
+    
+    // Delete from database
+    await this.env.DB.prepare(`
+      DELETE FROM slates WHERE id = ?
+    `).bind(slateId).run()
+    
+    // Delete from R2 (best effort, non-blocking)
+    // The source video and transcoded files should be cleaned up
+    
+    await this.logEvent(auth.organizationId, auth.user.id, 'slate.deleted', 'slate', slateId, null)
+    
+    return new Response(JSON.stringify({ success: true }), {
+      headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+    })
+  }
+  
+  // ============================================================================
   // ADS LIBRARY - Cloudflare Stream Integration
   // ============================================================================
   
@@ -1193,59 +1505,116 @@ class AdminAPI {
         auth.user.id
       ).run()
       
-      // Determine if we should use parallel transcoding
-      // Use parallel transcoding for videos longer than 30 seconds
-      const PARALLEL_THRESHOLD_SECONDS = 30;
-      const SEGMENT_DURATION = 10; // 10 seconds per segment
+      // Get organization settings for parallel transcoding
+      const org = await this.env.DB.prepare(`
+        SELECT parallel_transcode_enabled, parallel_transcode_threshold, parallel_segment_duration
+        FROM organizations
+        WHERE id = ?
+      `).bind(auth.organizationId).first<{
+        parallel_transcode_enabled: number;
+        parallel_transcode_threshold: number;
+        parallel_segment_duration: number;
+      }>();
       
-      // For now, we need to probe the video duration
-      // This is a limitation - we'll queue a single job that splits itself
-      // TODO: Probe video duration before queueing to decide parallel vs. single
+      const parallelEnabled = org?.parallel_transcode_enabled === 1;
+      const thresholdSeconds = org?.parallel_transcode_threshold || 30;
+      const segmentDuration = org?.parallel_segment_duration || 10;
       
-      // Queue transcode job (will be split into segments by worker if needed)
-      console.log(`Queueing transcode job for ad ${adId} with bitrates:`, bitrates)
+      // For now, we estimate duration based on file size or use a simple heuristic
+      // TODO: Add proper duration probing with ffprobe
+      // Assume if file is > 10MB, it's likely > 30 seconds
+      const estimatedDuration = file.size > 10 * 1024 * 1024 ? 60 : 20; // rough estimate
+      const useParallel = parallelEnabled && estimatedDuration > thresholdSeconds;
       
-      // For now, use traditional full-video transcode
-      // Parallel transcoding will be enabled once we add duration probing
-      await this.env.TRANSCODE_QUEUE.send({
-        adId,
-        sourceKey,
-        bitrates,
-        organizationId: auth.organizationId,
-        channelId,
-        retryCount: 0,
-      })
+      console.log(`Queueing transcode job for ad ${adId}:`, {
+        parallelEnabled,
+        thresholdSeconds,
+        estimatedDuration,
+        useParallel,
+        bitrates
+      });
       
-      // TODO: Implement parallel transcoding job creation
-      // const jobGroupId = crypto.randomUUID();
-      // const segmentCount = Math.ceil(duration / SEGMENT_DURATION);
-      // 
-      // // Initialize coordinator DO
-      // const doId = this.env.TRANSCODE_COORDINATOR.idFromName(jobGroupId);
-      // const coordinator = this.env.TRANSCODE_COORDINATOR.get(doId);
-      // await coordinator.fetch('http://coordinator/init', {
-      //   method: 'POST',
-      //   body: JSON.stringify({
-      //     adId, segmentCount, bitrates,
-      //     organizationId: auth.organizationId,
-      //     channelId, sourceKey
-      //   })
-      // });
-      // 
-      // // Queue all segment jobs
-      // const segmentJobs = [];
-      // for (let i = 0; i < segmentCount; i++) {
-      //   segmentJobs.push({
-      //     type: 'SEGMENT',
-      //     adId, segmentId: i,
-      //     startTime: i * SEGMENT_DURATION,
-      //     duration: SEGMENT_DURATION,
-      //     sourceKey, bitrates,
-      //     organizationId: auth.organizationId,
-      //     channelId, jobGroupId
-      //   });
-      // }
-      // await this.env.TRANSCODE_QUEUE.sendBatch(segmentJobs);
+      if (useParallel) {
+        try {
+          // PARALLEL TRANSCODING: Split into segments
+          const jobGroupId = crypto.randomUUID();
+          const segmentCount = Math.ceil(estimatedDuration / segmentDuration);
+          
+          console.log(`Creating parallel transcode job: ${segmentCount} segments`);
+          
+          // Initialize coordinator DO
+          const doId = this.env.TRANSCODE_COORDINATOR.idFromName(jobGroupId);
+          const coordinator = this.env.TRANSCODE_COORDINATOR.get(doId);
+          
+          try {
+            const initRequest = new Request('http://coordinator/init', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                adId,
+                segmentCount,
+                bitrates,
+                organizationId: auth.organizationId,
+                channelId,
+                sourceKey
+              })
+            });
+            
+            const coordResponse = await coordinator.fetch(initRequest);
+            if (!coordResponse.ok) {
+              throw new Error(`Coordinator init failed: ${await coordResponse.text()}`);
+            }
+            console.log('Coordinator initialized successfully');
+          } catch (coordError: any) {
+            console.error('Coordinator initialization error:', coordError);
+            throw new Error(`Failed to initialize coordinator: ${coordError.message}`);
+          }
+          
+          // Queue all segment jobs
+          const segmentJobs = [];
+          for (let i = 0; i < segmentCount; i++) {
+            segmentJobs.push({
+              type: 'SEGMENT',
+              adId,
+              segmentId: i,
+              startTime: i * segmentDuration,
+              duration: segmentDuration,
+              sourceKey,
+              bitrates,
+              organizationId: auth.organizationId,
+              channelId,
+              jobGroupId
+            });
+          }
+          
+          console.log('Sending segment jobs to queue:', segmentJobs.length);
+          await this.env.TRANSCODE_QUEUE.sendBatch(segmentJobs);
+          console.log(`Queued ${segmentJobs.length} parallel segment jobs`);
+        } catch (parallelError: any) {
+          console.error('Parallel transcode setup failed:', parallelError);
+          console.log('Falling back to traditional transcode');
+          // Fall back to traditional transcode
+          await this.env.TRANSCODE_QUEUE.send({
+            adId,
+            sourceKey,
+            bitrates,
+            organizationId: auth.organizationId,
+            channelId,
+            retryCount: 0,
+          });
+        }
+      } else {
+        // TRADITIONAL TRANSCODING: Single full-video job
+        console.log('Using traditional single-container transcode');
+        await this.env.TRANSCODE_QUEUE.send({
+          adId,
+          sourceKey,
+          bitrates,
+          organizationId: auth.organizationId,
+          channelId,
+          retryCount: 0,
+        });
+      }
       
       await this.logEvent(auth.organizationId, auth.user.id, 'ad.uploaded', 'ad', adId, { 
         source_key: sourceKey, 
@@ -1439,6 +1808,31 @@ export default {
       if (url.pathname.match(/^\/api\/channels\/[^/]+$/) && request.method === 'DELETE') {
         const channelId = url.pathname.split('/').pop()!
         return api.deleteChannel(auth, channelId)
+      }
+      
+      // Slates
+      if (url.pathname === '/api/slates' && request.method === 'GET') {
+        return api.listSlates(auth)
+      }
+      if (url.pathname === '/api/slates/upload' && request.method === 'POST') {
+        return api.uploadSlate(auth, request)
+      }
+      if (url.pathname === '/api/slates/generate' && request.method === 'POST') {
+        const data = await request.json()
+        return api.createGeneratedSlate(auth, data)
+      }
+      if (url.pathname.match(/^\/api\/slates\/[^/]+$/) && request.method === 'GET') {
+        const slateId = url.pathname.split('/').pop()!
+        return api.getSlate(auth, slateId)
+      }
+      if (url.pathname.match(/^\/api\/slates\/[^/]+$/) && request.method === 'PUT') {
+        const slateId = url.pathname.split('/').pop()!
+        const data = await request.json()
+        return api.updateSlate(auth, slateId, data)
+      }
+      if (url.pathname.match(/^\/api\/slates\/[^/]+$/) && request.method === 'DELETE') {
+        const slateId = url.pathname.split('/').pop()!
+        return api.deleteSlate(auth, slateId)
       }
       
       // Ad Pods

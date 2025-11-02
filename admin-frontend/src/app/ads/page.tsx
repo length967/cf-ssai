@@ -93,10 +93,16 @@ export default function AdsPage() {
 
   const loadChannels = useCallback(async () => {
     try {
+      console.log('Loading channels...')
       const data = await api.listChannels()
+      console.log('Channels loaded:', data.channels)
       setChannels(data.channels || [])
-    } catch (err) {
+      if (!data.channels || data.channels.length === 0) {
+        setMessage({ type: 'error', text: 'No channels found. Please create a channel first.' })
+      }
+    } catch (err: any) {
       console.error('Failed to load channels:', err)
+      setMessage({ type: 'error', text: `Failed to load channels: ${err.message}` })
     }
   }, [])
 

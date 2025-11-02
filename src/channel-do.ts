@@ -391,6 +391,116 @@ export class ChannelDO {
     this.state = state
     this.env = env
   }
+  
+  /**
+   * Fetch slate segments to pad ad breaks
+   * Returns segments that fill the gap duration
+   */
+  private async fetchSlateSegments(
+    channelId: string,
+    viewerBitrate: number | null,
+    gapDuration: number
+  ): Promise<Array<{url: string, duration: number}>> {
+    try {
+      // Get channel's configured slate from database
+      const channel = await this.env.DB.prepare(`
+        SELECT slate_id FROM channels WHERE id = ?
+      `).bind(channelId).first<any>()
+      
+      if (!channel?.slate_id) {
+        console.log('No slate configured for channel, skipping padding')
+        return []
+      }
+      
+      // Get slate details
+      const slate = await this.env.DB.prepare(`
+        SELECT id, master_playlist_url, variants, duration FROM slates 
+        WHERE id = ? AND status = 'ready'
+      `).bind(channel.slate_id).first<any>()
+      
+      if (!slate || !slate.variants) {
+        console.warn('Slate not ready or has no variants')
+        return []
+      }
+      
+      // Parse variants and find best match for viewer bitrate
+      const variants = JSON.parse(slate.variants)
+      let slateVariant = variants[0]
+      
+      if (viewerBitrate) {
+        // Find closest bitrate match
+        slateVariant = variants.reduce((best: any, current: any) => {
+          const bestDiff = Math.abs(best.bitrate - viewerBitrate)
+          const currentDiff = Math.abs(current.bitrate - viewerBitrate)
+          return currentDiff < bestDiff ? current : best
+        })
+      }
+      
+      // Fetch slate playlist
+      const playlistResponse = await fetch(slateVariant.url)
+      if (!playlistResponse.ok) {
+        console.error(`Failed to fetch slate playlist: ${slateVariant.url}`)
+        return []
+      }
+      
+      const playlistContent = await playlistResponse.text()
+      const baseUrl = slateVariant.url.replace('/playlist.m3u8', '')
+      
+      // Parse slate segments
+      const slateSegments: Array<{url: string, duration: number}> = []
+      const lines = playlistContent.split('\n')
+      let currentDuration = 6.0
+      
+      for (const line of lines) {
+        const trimmed = line.trim()
+        
+        if (trimmed.startsWith('#EXTINF:')) {
+          const match = trimmed.match(/#EXTINF:([\d.]+)/)
+          if (match) {
+            currentDuration = parseFloat(match[1])
+          }
+          continue
+        }
+        
+        if (!trimmed || trimmed.startsWith('#')) continue
+        
+        slateSegments.push({
+          url: `${baseUrl}/${trimmed}`,
+          duration: currentDuration
+        })
+      }
+      
+      if (slateSegments.length === 0) {
+        console.warn('No segments found in slate playlist')
+        return []
+      }
+      
+      // Loop slate segments to fill gap duration
+      const paddingSegments: Array<{url: string, duration: number}> = []
+      let filledDuration = 0
+      let slateIndex = 0
+      
+      while (filledDuration < gapDuration) {
+        const segment = slateSegments[slateIndex % slateSegments.length]
+        paddingSegments.push(segment)
+        filledDuration += segment.duration
+        slateIndex++
+        
+        // Safety limit: don't add more than 100 segments
+        if (paddingSegments.length > 100) {
+          console.warn('Hit safety limit on slate padding segments')
+          break
+        }
+      }
+      
+      console.log(`Slate padding: added ${paddingSegments.length} segments (${filledDuration.toFixed(2)}s) to fill ${gapDuration.toFixed(2)}s gap`)
+      return paddingSegments
+      
+    } catch (err) {
+      console.error('Error fetching slate segments:', err)
+      return []
+    }
+  }
 
   async fetch(req: Request): Promise<Response> {
     return await this.state.blockConcurrencyWhile(async () => {
@@ -779,25 +889,40 @@ export class ChannelDO {
                 }
                 
                 // Round total duration to avoid floating-point precision issues
-                const totalDuration = Math.round(adSegments.reduce((sum, seg) => sum + seg.duration, 0) * 100) / 100
+                let totalDuration = Math.round(adSegments.reduce((sum, seg) => sum + seg.duration, 0) * 100) / 100
                 console.log(`Extracted ${adSegments.length} ad segments (total: ${totalDuration.toFixed(2)}s) from playlist: ${adItem.playlistUrl}`)
                 
-                // Warn if stable duration doesn't match actual ad duration
-                if (Math.abs(totalDuration - stableDuration) > 1.0) {
-                  console.warn(`Duration mismatch: Expected=${stableDuration}s, Actual ad=${totalDuration.toFixed(2)}s`)
+                // Pad with slate if ad is shorter than SCTE-35 break duration
+                if (totalDuration < stableDuration && Math.abs(totalDuration - stableDuration) > 1.0) {
+                  const gapDuration = stableDuration - totalDuration
+                  console.log(`Ad is ${gapDuration.toFixed(2)}s shorter than break duration, padding with slate`)
+                  
+                  // Fetch channel's slate configuration
+                  try {
+                    const slateSegments = await this.fetchSlateSegments(channelId, viewerBitrate, gapDuration)
+                    if (slateSegments.length > 0) {
+                      adSegments.push(...slateSegments)
+                      totalDuration = Math.round(adSegments.reduce((sum, seg) => sum + seg.duration, 0) * 100) / 100
+                      console.log(`Added ${slateSegments.length} slate segments, new total: ${totalDuration.toFixed(2)}s`)
+                    } else {
+                      console.warn('No slate segments available, gap will remain')
+                    }
+                  } catch (err) {
+                    console.error('Failed to fetch slate segments:', err)
+                  }
                 }
                 
                 if (adSegments.length > 0) {
                   const cleanOrigin = stripOriginSCTE35Markers(origin)
-                  // CRITICAL FIX: Pass both ad duration AND stable duration
-                  // - totalDuration: actual ad length (e.g., 30s) - for PDT of ad segments
-                  // - stableDuration: locked duration (e.g., 30s rounded) - for content skipping & resume PDT
+                  // CRITICAL: Use actual ad duration for BOTH parameters
+                  // This prevents cutting off the last few seconds of the ad
+                  // The totalDuration is calculated from actual segment durations
                   const ssai = replaceSegmentsWithAds(
                     cleanOrigin,
                     scte35StartPDT,
                     adSegments,
                     totalDuration,        // Actual ad duration (for ad segment PDTs)
-                    stableDuration        // Locked duration (for content skipping & resume PDT)
+                    totalDuration         // Use actual ad duration (not SCTE-35 duration) for content resume
                   )
                   await this.env.BEACON_QUEUE.send(beaconMsg)
                   return new Response(ssai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })

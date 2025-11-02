@@ -298,5 +298,226 @@ async function transcodeVideo({ adId, sourceKey, bitrates, r2Config }) {
   }
 }
 
-module.exports = { transcodeVideo };
+// Transcode a specific time segment of a video
+async function transcodeSegment({ adId, segmentId, sourceKey, startTime, duration, bitrates, r2Config }) {
+  const workDir = `/tmp/transcode-seg-${adId}-${segmentId}-${Date.now()}`;
+  const sourceFile = path.join(workDir, 'source.mp4');
+  const segmentFile = path.join(workDir, 'segment.mp4');
+  const outputBaseDir = path.join(workDir, 'output');
+  
+  // Create R2 client
+  const r2Client = createR2Client(r2Config);
+  const bucket = r2Config.bucket || 'ssai-ads';
+  
+  try {
+    // Create working directories
+    fs.mkdirSync(workDir, { recursive: true });
+    fs.mkdirSync(outputBaseDir, { recursive: true });
+    
+    // 1. Download source from R2
+    console.log(`[TranscodeSegment] Downloading source for segment ${segmentId}`);
+    await downloadFromR2(r2Client, bucket, sourceKey, sourceFile);
+    
+    // 2. Extract segment using FFmpeg (stream copy for speed)
+    console.log(`[TranscodeSegment] Extracting segment ${segmentId}: ${startTime}s-${startTime + duration}s`);
+    const extractCmd = `ffmpeg -ss ${startTime} -t ${duration} -i "${sourceFile}" -c copy -avoid_negative_ts 1 "${segmentFile}"`;
+    await execAsync(extractCmd, { maxBuffer: 10 * 1024 * 1024 });
+    
+    // Verify segment was created
+    if (!fs.existsSync(segmentFile)) {
+      throw new Error('Segment extraction failed');
+    }
+    
+    const segmentSize = fs.statSync(segmentFile).size;
+    console.log(`[TranscodeSegment] Extracted segment: ${segmentSize} bytes`);
+    
+    // 3. Detect source resolution (from segment)
+    const sourceResolution = await detectSourceResolution(segmentFile);
+    
+    // 4. Transcode segment to HLS for each bitrate
+    const variants = [];
+    for (const bitrateKbps of bitrates) {
+      const variantDir = path.join(outputBaseDir, `${bitrateKbps}k`);
+      await transcodeVariant(segmentFile, variantDir, bitrateKbps, sourceResolution);
+      
+      // Upload variant to R2
+      const remotePrefix = `transcoded-ads/${adId}/segment-${segmentId}/${bitrateKbps}k`;
+      await uploadDirectory(r2Client, bucket, variantDir, remotePrefix);
+      
+      variants.push({
+        bitrate: bitrateKbps,
+        path: remotePrefix
+      });
+    }
+    
+    // 5. Cleanup
+    fs.rmSync(workDir, { recursive: true, force: true });
+    console.log(`[TranscodeSegment] Segment ${segmentId} completed`);
+    
+    // Return R2 path prefix for this segment
+    const r2Path = `transcoded-ads/${adId}/segment-${segmentId}`;
+    
+    return {
+      success: true,
+      r2Path,
+      segmentId,
+      variants
+    };
+    
+  } catch (error) {
+    // Cleanup on error
+    if (fs.existsSync(workDir)) {
+      fs.rmSync(workDir, { recursive: true, force: true });
+    }
+    throw error;
+  }
+}
+
+// Download text content from R2
+async function downloadTextFromR2(r2Client, bucket, key) {
+  console.log(`[R2] Downloading text from ${key}`);
+  
+  try {
+    const command = new GetObjectCommand({ Bucket: bucket, Key: key });
+    const response = await r2Client.send(command);
+    const chunks = [];
+    
+    for await (const chunk of response.Body) {
+      chunks.push(chunk);
+    }
+    
+    const buffer = Buffer.concat(chunks);
+    return buffer.toString('utf-8');
+  } catch (error) {
+    console.error(`[R2] Download text error:`, error);
+    throw new Error(`Failed to download ${key}: ${error.message}`);
+  }
+}
+
+// Merge multiple HLS playlists into one
+function mergeHLSPlaylists(playlists, segmentPrefix) {
+  // Start with base tags from first playlist
+  let merged = '#EXTM3U\n';
+  merged += '#EXT-X-VERSION:3\n';
+  merged += '#EXT-X-TARGETDURATION:6\n';
+  
+  let segmentNumber = 0;
+  
+  // Extract segments from each playlist
+  for (let i = 0; i < playlists.length; i++) {
+    const lines = playlists[i].split('\n');
+    
+    for (let j = 0; j < lines.length; j++) {
+      const line = lines[j].trim();
+      
+      // Copy EXTINF tags
+      if (line.startsWith('#EXTINF:')) {
+        merged += line + '\n';
+        // Next line should be the segment URL
+        if (j + 1 < lines.length) {
+          const segmentUrl = lines[j + 1].trim();
+          if (segmentUrl && !segmentUrl.startsWith('#')) {
+            // Rewrite segment URL to include segment prefix
+            const segmentFilename = path.basename(segmentUrl);
+            merged += `../segment-${i}/${segmentPrefix}k/${segmentFilename}\n`;
+            segmentNumber++;
+          }
+        }
+      }
+    }
+  }
+  
+  merged += '#EXT-X-ENDLIST\n';
+  
+  console.log(`[Merge] Combined ${playlists.length} playlists into ${segmentNumber} segments`);
+  
+  return merged;
+}
+
+// Assemble transcoded segments into final HLS output
+async function assembleSegments({ adId, segmentPaths, bitrates, r2Config }) {
+  const workDir = `/tmp/assemble-${adId}-${Date.now()}`;
+  
+  // Create R2 client
+  const r2Client = createR2Client(r2Config);
+  const bucket = r2Config.bucket || 'ssai-ads';
+  
+  try {
+    fs.mkdirSync(workDir, { recursive: true });
+    
+    console.log(`[Assembly] Assembling ${segmentPaths.length} segments for ad ${adId}`);
+    
+    const variants = [];
+    
+    // For each bitrate, merge the segment playlists
+    for (const bitrateKbps of bitrates) {
+      console.log(`[Assembly] Processing ${bitrateKbps}k variant`);
+      
+      const segmentPlaylists = [];
+      
+      // Download all segment playlists for this bitrate
+      for (let i = 0; i < segmentPaths.length; i++) {
+        const segmentPath = segmentPaths[i];
+        const playlistKey = `${segmentPath}/${bitrateKbps}k/playlist.m3u8`;
+        
+        try {
+          const playlist = await downloadTextFromR2(r2Client, bucket, playlistKey);
+          segmentPlaylists.push(playlist);
+        } catch (error) {
+          console.error(`[Assembly] Failed to download ${playlistKey}:`, error.message);
+          throw new Error(`Missing segment playlist: ${playlistKey}`);
+        }
+      }
+      
+      // Merge playlists
+      const mergedPlaylist = mergeHLSPlaylists(segmentPlaylists, bitrateKbps);
+      
+      // Upload merged playlist to final location
+      const finalPlaylistKey = `transcoded-ads/${adId}/${bitrateKbps}k/playlist.m3u8`;
+      await uploadTextToR2(r2Client, bucket, finalPlaylistKey, mergedPlaylist);
+      
+      // Calculate resolution for master playlist
+      // Use a dummy source resolution - we'll detect it properly later
+      const sourceRes = { width: 1920, height: 1080 };
+      const resolution = calculateOutputResolution(sourceRes, bitrateKbps);
+      
+      variants.push({
+        bitrate: bitrateKbps * 1000,
+        url: `${r2Config.publicUrl}/${finalPlaylistKey}`,
+        resolution
+      });
+    }
+    
+    // Create master playlist
+    const masterPlaylist = createMasterPlaylist(variants);
+    const masterKey = `transcoded-ads/${adId}/master.m3u8`;
+    await uploadTextToR2(r2Client, bucket, masterKey, masterPlaylist);
+    
+    const masterUrl = `${r2Config.publicUrl}/${masterKey}`;
+    
+    // Get duration from first variant (all should be the same)
+    // TODO: Calculate actual duration from segments
+    const estimatedDuration = segmentPaths.length * 10; // Assuming 10s segments
+    
+    // Cleanup
+    fs.rmSync(workDir, { recursive: true, force: true });
+    console.log(`[Assembly] Assembly complete for ad ${adId}`);
+    
+    return {
+      success: true,
+      variants,
+      masterUrl,
+      duration: estimatedDuration
+    };
+    
+  } catch (error) {
+    // Cleanup on error
+    if (fs.existsSync(workDir)) {
+      fs.rmSync(workDir, { recursive: true, force: true });
+    }
+    throw error;
+  }
+}
+
+module.exports = { transcodeVideo, transcodeSegment, assembleSegments };
 

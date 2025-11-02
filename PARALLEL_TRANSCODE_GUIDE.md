@@ -127,32 +127,28 @@ No new environment variables required - uses existing R2 and queue configuration
 - [x] Transcode worker segment/assembly handlers
 - [x] Wrangler.toml bindings and migrations
 - [x] Failure handling and retry logic
-
-### ⏳ TODO (Next Steps)
-
-1. **FFmpeg Container Endpoints**
-   - Implement `/transcode-segment` endpoint
-   - Implement `/assemble-segments` endpoint
-   - Add segment duration extraction from source
-
-2. **Duration Probing**
+- [x] **FFmpeg container endpoints** (`/transcode-segment` and `/assemble-segments`)
+- [x] Segment extraction with FFmpeg `-ss` and `-t` flags
+- [x] Playlist merging and concatenation logic
+- [x] Test1. **Duration Probing**
    - Add ffprobe call before queueing in admin API
    - Decide parallel vs. single based on duration
    - Threshold: 30 seconds
 
-3. **Admin API Integration**
+2. **Admin API Integration**
    - Uncomment parallel job creation code
    - Add duration probe logic
    - Update upload UI to show segment progress
 
-4. **Testing**
-   - Unit tests for coordinator DO
-   - Integration tests for parallel flow
+3. **Testing & Deployment**
+   - Test with real R2 video file
+   - Deploy FFmpeg container
+   - Integration tests for full parallel flow
    - Load testing with 10 concurrent jobs
 
-## FFmpeg Container Changes Needed
+## FFmpeg Container Endpoints (✅ IMPLEMENTED)
 
-### New Endpoint: `/transcode-segment`
+### Endpoint: `/transcode-segment`
 
 ```javascript
 // Transcode a specific time segment of the source video
@@ -179,7 +175,7 @@ async function transcodeSegment({
 }
 ```
 
-### New Endpoint: `/assemble-segments`
+### Endpoint: `/assemble-segments`
 
 ```javascript
 // Concatenate all segments into final HLS playlist
@@ -277,16 +273,16 @@ wrangler durable-objects get TranscodeCoordinatorDO <jobGroupId> --local
    - Performance benchmarking
    - Tune segment duration (currently 10s)
 
-## Next Steps
+## Testing the Implementation
 
-To complete the implementation:
+Run the test script:
 
 ```bash
-# 1. Implement FFmpeg container endpoints
-cd ffmpeg-container
-# Add /transcode-segment and /assemble-segments to server.js
+# Test endpoints are available
+./test-parallel-transcode.sh
 
-# 2. Test locally
+# Test with real video (requires R2 upload first)
+cd ffmpeg-container
 npm run dev:transcode
 # Upload a long video, verify segments process in parallel
 
@@ -306,6 +302,6 @@ wrangler tail cf-ssai-transcode
 
 ---
 
-**Status**: Infrastructure complete, FFmpeg container endpoints pending
+**Status**: ✅ **FFmpeg endpoints complete** - Ready for testing and deployment
 **Target Speedup**: 5-10x for videos > 30 seconds
-**Next PR**: FFmpeg segment/assembly endpoints
+**Next Step**: Test with real video and enable in admin API

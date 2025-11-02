@@ -28,6 +28,11 @@ export default function SettingsPage() {
     cache_decision_ttl: 60,
     max_wrapper_depth: 5,
   })
+  
+  // Parallel transcoding settings
+  const [parallelTranscodeEnabled, setParallelTranscodeEnabled] = useState(true)
+  const [parallelThreshold, setParallelThreshold] = useState(30)
+  const [segmentDuration, setSegmentDuration] = useState(10)
 
   // Worker configuration
   const [workerConfig, setWorkerConfig] = useState({
@@ -86,6 +91,11 @@ export default function SettingsPage() {
           cache_decision_ttl: settings.cache_decision_ttl || 60,
           max_wrapper_depth: settings.max_wrapper_depth || 5,
         })
+        
+        // Load parallel transcoding settings
+        setParallelTranscodeEnabled(organization.parallel_transcode_enabled === 1)
+        setParallelThreshold(organization.parallel_transcode_threshold || 30)
+        setSegmentDuration(organization.parallel_segment_duration || 10)
       } else if (activeTab === 'users') {
         const { users: usersList } = await api.getUsers()
         setUsers(usersList)
@@ -111,6 +121,9 @@ export default function SettingsPage() {
       await api.updateOrganization({
         name: orgName,
         settings: orgSettings,
+        parallel_transcode_enabled: parallelTranscodeEnabled,
+        parallel_transcode_threshold: parallelThreshold,
+        parallel_segment_duration: segmentDuration,
       })
       showMessage('success', 'Organization settings saved successfully')
     } catch (err: any) {
@@ -427,6 +440,94 @@ export default function SettingsPage() {
                           className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                         />
                       </div>
+                    </div>
+
+                    <hr className="my-6" />
+
+                    <h3 className="text-lg font-semibold mb-4">Transcoding Settings</h3>
+                    
+                    <div className="space-y-6">
+                      <div className="flex items-start">
+                        <div className="flex items-center h-5">
+                          <input
+                            type="checkbox"
+                            checked={parallelTranscodeEnabled}
+                            onChange={(e) => setParallelTranscodeEnabled(e.target.checked)}
+                            className="h-4 w-4 text-blue-600 focus:ring-blue-500 border-gray-300 rounded"
+                          />
+                        </div>
+                        <div className="ml-3">
+                          <label className="font-medium text-gray-700">Enable Parallel Transcoding</label>
+                          <p className="text-sm text-gray-500">Process videos in parallel for 5-15x faster transcoding</p>
+                        </div>
+                      </div>
+                      
+                      {parallelTranscodeEnabled && (
+                        <div className="ml-7 space-y-4 pl-4 border-l-2 border-blue-200">
+                          <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                              Video Duration Threshold: {parallelThreshold} seconds
+                            </label>
+                            <input
+                              type="range"
+                              min="15"
+                              max="120"
+                              step="5"
+                              value={parallelThreshold}
+                              onChange={(e) => setParallelThreshold(parseInt(e.target.value))}
+                              className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                            />
+                            <div className="flex justify-between text-xs text-gray-500 mt-1">
+                              <span>15s</span>
+                              <span>120s</span>
+                            </div>
+                            <p className="mt-1 text-sm text-gray-500">
+                              Videos longer than this will use parallel transcoding
+                            </p>
+                          </div>
+                          
+                          <div>
+                            <label className="block text-sm font-medium text-gray-700 mb-2">
+                              Segment Duration: {segmentDuration} seconds
+                            </label>
+                            <input
+                              type="range"
+                              min="5"
+                              max="30"
+                              step="5"
+                              value={segmentDuration}
+                              onChange={(e) => setSegmentDuration(parseInt(e.target.value))}
+                              className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer"
+                            />
+                            <div className="flex justify-between text-xs text-gray-500 mt-1">
+                              <span>5s</span>
+                              <span>30s</span>
+                            </div>
+                            <p className="mt-1 text-sm text-gray-500">
+                              Length of each parallel segment (smaller = more parallelism)
+                            </p>
+                          </div>
+                          
+                          <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
+                            <div className="flex">
+                              <div className="flex-shrink-0">
+                                <svg className="h-5 w-5 text-blue-400" fill="currentColor" viewBox="0 0 20 20">
+                                  <path fillRule="evenodd" d="M18 10a8 8 0 11-16 0 8 8 0 0116 0zm-7-4a1 1 0 11-2 0 1 1 0 012 0zM9 9a1 1 0 000 2v3a1 1 0 001 1h1a1 1 0 100-2v-3a1 1 0 00-1-1H9z" clipRule="evenodd" />
+                                </svg>
+                              </div>
+                              <div className="ml-3">
+                                <h3 className="text-sm font-medium text-blue-800">Performance Estimate</h3>
+                                <div className="mt-2 text-sm text-blue-700">
+                                  <p className="mb-1">• 5-minute video with current settings:</p>
+                                  <p className="ml-4">300s ÷ {segmentDuration}s = {Math.ceil(300 / segmentDuration)} segments</p>
+                                  <p className="ml-4 font-semibold">Estimated time: ~{Math.ceil(300 / segmentDuration / 10 * 30)}-{Math.ceil(300 / segmentDuration / 10 * 30 + 20)} seconds</p>
+                                  <p className="mt-1 text-xs text-blue-600">vs ~1,500 seconds (25 minutes) single-threaded</p>
+                                </div>
+                              </div>
+                            </div>
+                          </div>
+                        </div>
+                      )}
                     </div>
 
                     <hr className="my-6" />
