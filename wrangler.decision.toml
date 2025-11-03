@@ -28,8 +28,7 @@ service = "cf-ssai-vast-parser"
 [vars]
 AD_POD_BASE = "https://pub-24423d0273094578a7f498bd462c2e20.r2.dev/transcoded-ads"
 DECISION_TIMEOUT_MS = "2000"
-CACHE_DECISION_TTL = "60"
-SLATE_POD_ID = "slate"
+CACHE_DECISION_TTL = "0"  # Disabled for testing - set to 60 in production
 # VAST_URL = "https://example.com/vast.xml"  # Optional: Static VAST URL for testing
 
 # Secrets (optional - for external ad API)

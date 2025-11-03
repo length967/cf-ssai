@@ -30,9 +30,6 @@ export interface Env {
   DECISION_TIMEOUT_MS?: string
   CACHE_DECISION_TTL?: string
   VAST_URL?: string  // Optional: Static VAST URL for testing
-  
-  // Fallback settings
-  SLATE_POD_ID?: string
 }
 
 interface DecisionRequest {
@@ -55,7 +52,7 @@ interface ChannelConfig {
   adPodBaseUrl?: string
   vastUrl?: string
   vastEnabled: boolean
-  slatePodId?: string
+  slateId?: string
   bitrateLadder?: string // JSON array of bitrates in kbps
 }
 
@@ -113,7 +110,7 @@ async function cacheDecision(
   decision: DecisionResponse,
   ttlSec: number
 ): Promise<void> {
-  if (!kv) return
+  if (!kv || ttlSec <= 0) return
   
   await kv.put(cacheKey, JSON.stringify(decision), {
     expirationTtl: ttlSec,
@@ -137,7 +134,7 @@ async function getChannelConfig(
         c.ad_pod_base_url as adPodBaseUrl,
         c.vast_url as vastUrl,
         c.vast_enabled as vastEnabled,
-        c.slate_pod_id as slatePodId,
+        c.slate_id as slateId,
         c.bitrate_ladder as bitrateLadder
       FROM channels c
       WHERE c.id = ? AND c.status = 'active'
@@ -151,7 +148,7 @@ async function getChannelConfig(
       adPodBaseUrl: result.adPodBaseUrl,
       vastUrl: result.vastUrl,
       vastEnabled: Boolean(result.vastEnabled),
-      slatePodId: result.slatePodId,
+      slateId: result.slateId,
       bitrateLadder: result.bitrateLadder
     }
   } catch (error) {
@@ -210,6 +207,59 @@ async function getAdsById(
   } catch (error) {
     console.error(`Failed to get ads: ${error}`)
     return []
+  }
+}
+
+/**
+ * Get slate by ID from D1 database
+ */
+async function getSlateById(
+  env: Env,
+  slateId: string
+): Promise<DBAd | null> {
+  try {
+    const result = await env.DB.prepare(`
+      SELECT id, name, status as transcode_status, master_playlist_url, variants, duration
+      FROM slates
+      WHERE id = ? AND status = 'ready'
+    `).bind(slateId).first<any>()
+    
+    if (!result) {
+      console.warn(`Slate ${slateId} not found or not ready`)
+      return null
+    }
+    
+    return result as DBAd
+  } catch (error) {
+    console.error(`Failed to get slate: ${error}`)
+    return null
+  }
+}
+
+/**
+ * Get organization's default slate
+ */
+async function getOrgDefaultSlate(
+  env: Env,
+  organizationId: string
+): Promise<DBAd | null> {
+  try {
+    const result = await env.DB.prepare(`
+      SELECT s.id, s.name, s.status as transcode_status, s.master_playlist_url, s.variants, s.duration
+      FROM slates s
+      JOIN organizations o ON s.id = o.default_slate_id
+      WHERE o.id = ? AND s.status = 'ready'
+    `).bind(organizationId).first<any>()
+    
+    if (!result) {
+      console.warn(`No default slate found for org ${organizationId}`)
+      return null
+    }
+    
+    return result as DBAd
+  } catch (error) {
+    console.error(`Failed to get org default slate: ${error}`)
+    return null
   }
 }
 
@@ -282,51 +332,8 @@ function buildAdItemsFromAd(
   }
 }
 
-/**
- * Build ad pod items for different bitrates (legacy/fallback)
- */
-function buildAdItems(
-  env: Env,
-  podId: string,
-  adId: string,
-  trackingUrls?: string[]
-): AdItem[] {
-  const baseUrl = env.AD_POD_BASE
-  
-  return [
-    {
-      adId,
-      bitrate: 800000,
-      playlistUrl: `${baseUrl}/${podId}/v_800k/playlist.m3u8`,
-      tracking: trackingUrls ? { impression: trackingUrls } : undefined,
-    },
-    {
-      adId,
-      bitrate: 1600000,
-      playlistUrl: `${baseUrl}/${podId}/v_1600k/playlist.m3u8`,
-      tracking: trackingUrls ? { impression: trackingUrls } : undefined,
-    },
-    {
-      adId,
-      bitrate: 2500000,
-      playlistUrl: `${baseUrl}/${podId}/v_2500k/playlist.m3u8`,
-      tracking: trackingUrls ? { impression: trackingUrls } : undefined,
-    },
-  ]
-}
-
-/**
- * Create slate fallback pod (used when no ads available)
- */
-function createSlatePod(env: Env, durationSec: number): AdPod {
-  const podId = env.SLATE_POD_ID || "slate"
-  
-  return {
-    podId,
-    durationSec,
-    items: buildAdItems(env, podId, "slate-filler"),
-  }
-}
+// Legacy buildAdItems and createSlatePod functions removed
+// Use buildAdItemsFromAd() with slates from the database instead
 
 /**
  * Parse VAST XML using the VAST parser service
@@ -527,14 +534,54 @@ async function makeDecision(
   // Fallback to slate
   console.log("Falling back to slate")
   
-  // Use channel-specific slate pod ID if configured
-  const slatePodId = channelConfig?.slatePodId || env.SLATE_POD_ID || 'slate'
+  // Priority 1: Channel-specific slate
+  if (channelConfig?.slateId) {
+    const slate = await getSlateById(env, channelConfig.slateId)
+    if (slate) {
+      const slateItems = buildAdItemsFromAd(slate)
+      if (slateItems.length > 0) {
+        console.log(`Using channel slate ${channelConfig.slateId} for fallback`)
+        return {
+          pod: {
+            podId: `slate-${channelConfig.slateId}`,
+            durationSec: req.durationSec,
+            items: slateItems
+          }
+        }
+      }
+    } else {
+      console.warn(`Configured channel slate ${channelConfig.slateId} not available`)
+    }
+  }
+  
+  // Priority 2: Organization default slate
+  if (channelConfig?.organizationId) {
+    const orgSlate = await getOrgDefaultSlate(env, channelConfig.organizationId)
+    if (orgSlate) {
+      const slateItems = buildAdItemsFromAd(orgSlate)
+      if (slateItems.length > 0) {
+        console.log(`Using org default slate ${orgSlate.id} for fallback`)
+        return {
+          pod: {
+            podId: `slate-${orgSlate.id}`,
+            durationSec: req.durationSec,
+            items: slateItems
+          }
+        }
+      }
+    } else {
+      console.warn(`No default slate set for org ${channelConfig.organizationId}`)
+    }
+  }
+  
+  // No slate available - return empty pod (will show black screen or skip)
+  console.error('No slate available for fallback - no channel slate, no org default slate')
   
   return {
     pod: {
-      podId: slatePodId,
+      podId: 'no-slate-available',
       durationSec: req.durationSec,
-      items: buildAdItems(env, slatePodId, 'slate-filler')
+      items: []
     }
   }
 }
@@ -584,9 +631,13 @@ export default {
       } catch (err) {
         console.error("Decision error:", err)
         
-        // Return slate on any error
+        // Return empty pod on error (no ads available)
         const fallback = {
-          pod: createSlatePod(env, 30),
+          pod: {
+            podId: 'error-fallback',
+            durationSec: 30,
+            items: []
+          }
         }
         
         return new Response(JSON.stringify(fallback), {

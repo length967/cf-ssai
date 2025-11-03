@@ -46,7 +46,7 @@ interface ChannelConfigEnv {
   CHANNEL_CONFIG_CACHE?: KVNamespace;
 }
 
-const CACHE_TTL_SECONDS = 300; // 5 minutes
+const CACHE_TTL_SECONDS = 0; // DISABLED FOR DEBUGGING - Set to 300 (5 min) for production
 
 /**
  * Fetch channel configuration by organization slug and channel slug
@@ -117,14 +117,14 @@ export async function getChannelConfig(
     vastEnabled: Boolean(result.vastEnabled),
     vastTimeoutMs: result.vastTimeoutMs || 2000,
     defaultAdDuration: result.defaultAdDuration || 30,
-    slatePodId: result.slatePodId || 'slate',
+    // slatePodId removed - use slateId instead
     timeBasedAutoInsert: Boolean(result.timeBasedAutoInsert),
     segmentCacheMaxAge: result.segmentCacheMaxAge || 60,
     manifestCacheMaxAge: result.manifestCacheMaxAge || 4,
   };
   
-  // Cache in KV for next time (if available)
-  if (env.CHANNEL_CONFIG_CACHE) {
+  // Cache in KV for next time (if available and TTL > 0)
+  if (env.CHANNEL_CONFIG_CACHE && CACHE_TTL_SECONDS > 0) {
     await env.CHANNEL_CONFIG_CACHE.put(
       cacheKey,
       JSON.stringify(config),

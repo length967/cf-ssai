@@ -427,7 +427,7 @@ class AdminAPI {
       INSERT INTO channels (
         id, organization_id, name, slug, origin_url, status, mode,
         scte35_enabled, scte35_auto_insert, vast_enabled, vast_url, default_ad_duration,
-        ad_pod_base_url, sign_host, slate_pod_id, time_based_auto_insert,
+        ad_pod_base_url, sign_host, slate_id, time_based_auto_insert,
         segment_cache_max_age, manifest_cache_max_age, tier, settings,
         bitrate_ladder, bitrate_ladder_source, detected_bitrates, last_bitrate_detection,
         created_at, updated_at, created_by
@@ -447,7 +447,7 @@ class AdminAPI {
       data.default_ad_duration || 30,
       data.ad_pod_base_url || null,
       data.sign_host || null,
-      data.slate_pod_id || 'slate',
+      data.slate_id || null,
       data.time_based_auto_insert ?? 0,
       data.segment_cache_max_age || 60,
       data.manifest_cache_max_age || 4,
@@ -496,7 +496,7 @@ class AdminAPI {
     
     const fields = ['name', 'origin_url', 'status', 'mode', 'scte35_enabled', 'scte35_auto_insert',
                     'vast_enabled', 'vast_url', 'default_ad_duration', 'ad_pod_base_url', 'sign_host', 
-                    'slate_pod_id', 'time_based_auto_insert', 'segment_cache_max_age', 'manifest_cache_max_age', 'tier']
+                    'slate_id', 'time_based_auto_insert', 'segment_cache_max_age', 'manifest_cache_max_age', 'tier']
     
     for (const field of fields) {
       if (data[field] !== undefined) {
@@ -1317,6 +1317,9 @@ class AdminAPI {
       
       await this.logEvent(auth.organizationId, auth.user.id, 'slate.created', 'slate', slateId, { name, type: 'generated' })
       
+      // Auto-set as default if this is the first slate
+      await this.autoSetDefaultSlateIfNeeded(auth.organizationId, slateId)
+      
       return new Response(JSON.stringify({ success: true, slate_id: slateId }), {
         headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
       })
@@ -1401,6 +1404,9 @@ class AdminAPI {
       
       await this.logEvent(auth.organizationId, auth.user.id, 'slate.created', 'slate', slateId, { name })
       
+      // Auto-set as default if this is the first slate
+      await this.autoSetDefaultSlateIfNeeded(auth.organizationId, slateId)
+      
       return new Response(JSON.stringify({ success: true, slate_id: slateId }), {
         headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
       })
@@ -1438,6 +1444,58 @@ class AdminAPI {
     })
   }
   
+  private async autoSetDefaultSlateIfNeeded(organizationId: string, slateId: string): Promise<void> {
+    try {
+      // Check if org already has a default slate
+      const org = await this.env.DB.prepare(`
+        SELECT default_slate_id FROM organizations WHERE id = ?
+      `).bind(organizationId).first<any>()
+      
+      // If no default slate is set, set this one (will be updated when slate becomes ready)
+      if (!org?.default_slate_id) {
+        await this.env.DB.prepare(`
+          UPDATE organizations SET default_slate_id = ?, updated_at = ? WHERE id = ?
+        `).bind(slateId, Date.now(), organizationId).run()
+        console.log(`Auto-set slate ${slateId} as default for org ${organizationId}`)
+      }
+    } catch (error) {
+      console.error('Failed to auto-set default slate:', error)
+      // Non-critical - don't fail the slate creation
+    }
+  }
+  
+  async setDefaultSlate(auth: AuthContext, slateId: string): Promise<Response> {
+    // Verify ownership
+    const slate = await this.env.DB.prepare(`
+      SELECT * FROM slates WHERE id = ? AND organization_id = ?
+    `).bind(slateId, auth.organizationId).first<any>()
+    
+    if (!slate) {
+      return new Response(JSON.stringify({ error: 'Slate not found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+      })
+    }
+    
+    if (slate.status !== 'ready') {
+      return new Response(JSON.stringify({ error: 'Can only set ready slates as default' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+      })
+    }
+    
+    // Update organization's default slate
+    await this.env.DB.prepare(`
+      UPDATE organizations SET default_slate_id = ?, updated_at = ? WHERE id = ?
+    `).bind(slateId, Date.now(), auth.organizationId).run()
+    
+    await this.logEvent(auth.organizationId, auth.user.id, 'organization.default_slate_set', 'slate', slateId, null)
+    
+    return new Response(JSON.stringify({ success: true }), {
+      headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+    })
+  }
+  
   async deleteSlate(auth: AuthContext, slateId: string): Promise<Response> {
     const slate = await this.env.DB.prepare(`
       SELECT * FROM slates WHERE id = ? AND organization_id = ?
@@ -1458,6 +1516,20 @@ class AdminAPI {
     if (channelsUsingSlate && channelsUsingSlate.count > 0) {
       return new Response(JSON.stringify({ 
         error: 'Cannot delete slate: it is currently assigned to one or more channels' 
+      }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+      })
+    }
+    
+    // Check if this is the organization's default slate
+    const org = await this.env.DB.prepare(`
+      SELECT default_slate_id FROM organizations WHERE id = ?
+    `).bind(auth.organizationId).first<any>()
+    
+    if (org?.default_slate_id === slateId) {
+      return new Response(JSON.stringify({ 
+        error: 'Cannot delete the default slate. Please set another slate as default first.' 
       }), {
         status: 400,
         headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
@@ -2118,6 +2190,10 @@ export default {
       if (url.pathname.match(/^\/api\/slates\/[^/]+$/) && request.method === 'DELETE') {
         const slateId = url.pathname.split('/').pop()!
         return api.deleteSlate(auth, slateId)
+      }
+      if (url.pathname.match(/^\/api\/slates\/[^/]+\/set-default$/) && request.method === 'POST') {
+        const slateId = url.pathname.split('/')[3]
+        return api.setDefaultSlate(auth, slateId)
       }
       
       // Ad Pods

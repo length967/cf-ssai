@@ -246,97 +246,7 @@ function selectAdVariant(viewerBitrate: number | null): string {
   return best.path
 }
 
-// -----------------------------------------------------------------------------
-// Helper: fetch slate pod from database
-// -----------------------------------------------------------------------------
-async function getSlatePodFromDB(env: Env, slatePodId: string, adPodBase: string, durationSec: number): Promise<DecisionResponse> {
-  try {
-    // Fetch slate pod from database
-    const pod = await env.DB.prepare(`
-      SELECT id, name, ads FROM ad_pods 
-      WHERE id = ? AND status = 'active'
-    `).bind(slatePodId).first<any>()
-    
-    if (!pod || !pod.ads) {
-      console.error(`Slate pod not found or has no ads: ${slatePodId}`)
-      // Return empty response as last resort
-      return {
-        pod: {
-          podId: slatePodId,
-          durationSec,
-          items: []
-        }
-      }
-    }
-    
-    // Parse ad IDs and fetch ad details
-    const adIds = JSON.parse(pod.ads)
-    if (adIds.length === 0) {
-      console.error(`Slate pod ${slatePodId} has no ads configured`)
-      return {
-        pod: {
-          podId: pod.id,
-          durationSec,
-          items: []
-        }
-      }
-    }
-    
-    // Fetch ad details
-    const placeholders = adIds.map(() => '?').join(',')
-    const adsResult = await env.DB.prepare(`
-      SELECT id, name, variants, duration 
-      FROM ads 
-      WHERE id IN (${placeholders}) AND transcode_status = 'ready'
-    `).bind(...adIds).all()
-    
-    const ads = adsResult.results || []
-    if (ads.length === 0) {
-      console.error(`No ready ads found for slate pod ${slatePodId}`)
-      return {
-        pod: {
-          podId: pod.id,
-          durationSec,
-          items: []
-        }
-      }
-    }
-    
-    // Build pod items from ad variants
-    const items: any[] = []
-    for (const ad of ads) {
-      const variants = ad.variants ? JSON.parse(ad.variants as string) : []
-      for (const variant of variants) {
-        items.push({
-          adId: ad.id,
-          bitrate: variant.bitrate,
-          playlistUrl: variant.url,
-          duration: ad.duration || durationSec
-        })
-      }
-    }
-    
-    console.log(`Loaded slate pod from DB: ${pod.id} with ${items.length} variants`)
-    
-    return {
-      pod: {
-        podId: pod.id,
-        durationSec: items[0]?.duration || durationSec,
-        items
-      }
-    }
-  } catch (error) {
-    console.error(`Failed to fetch slate pod from DB:`, error)
-    // Return empty response
-    return {
-      pod: {
-        podId: slatePodId,
-        durationSec,
-        items: []
-      }
-    }
-  }
-}
+// getSlatePodFromDB function removed - use decision service with org default slate instead
 
 // -----------------------------------------------------------------------------
 // Helper: make ad decision via decision service worker
@@ -366,10 +276,15 @@ async function decision(env: Env, adPodBase: string, channel: string, durationSe
     }
   }
   
-  // Fallback: fetch slate pod from database instead of hardcoded values
-  console.warn("Using fallback slate pod - decision service unavailable")
-  const slatePodId = env.SLATE_POD_ID || "pod_demo_slate"
-  return await getSlatePodFromDB(env, slatePodId, adPodBase, durationSec)
+  // Fallback: return empty response when decision service unavailable
+  console.error("Decision service unavailable and no fallback configured")
+  return {
+    pod: {
+      podId: 'decision-unavailable',
+      durationSec,
+      items: []
+    }
+  }
 }
 
 // -----------------------------------------------------------------------------
