@@ -59,15 +59,23 @@ export async function queueOnDemandTranscode(
   const lockKey = `transcode_lock:${adId}:${missingBitrates.sort().join(',')}`;
   const lockTTL = 600; // 10 minutes
   
-  // Try to acquire lock (prevent duplicate transcode jobs)
-  const existingLock = await env.KV.get(lockKey);
-  if (existingLock) {
-    console.log(`Transcode already in progress for ${adId} bitrates ${missingBitrates}`);
-    return { queued: false, lockKey };
+  // CRITICAL FIX: Check if KV is available before accessing
+  if (!env.KV) {
+    console.warn('KV namespace not available, skipping transcode lock');
+    // Continue anyway - worst case is duplicate jobs
   }
   
-  // Acquire lock
-  await env.KV.put(lockKey, Date.now().toString(), { expirationTtl: lockTTL });
+  // Try to acquire lock (prevent duplicate transcode jobs)
+  if (env.KV) {
+    const existingLock = await env.KV.get(lockKey);
+    if (existingLock) {
+      console.log(`Transcode already in progress for ${adId} bitrates ${missingBitrates}`);
+      return { queued: false, lockKey };
+    }
+    
+    // Acquire lock
+    await env.KV.put(lockKey, Date.now().toString(), { expirationTtl: lockTTL });
+  }
   
   // Fetch ad details
   const ad = await env.DB.prepare(`
@@ -168,11 +176,32 @@ export async function getVariantsForChannel(
   const missingBitrates = await getMissingVariants(env, adId, channelBitrates);
   
   // Fetch current variants
-  const ad = await env.DB.prepare(`
-    SELECT variants FROM ads WHERE id = ?
-  `).bind(adId).first<any>();
+  // CRITICAL FIX: Add null safety for DB prepare chain
+  let existingVariants: VariantInfo[] = [];
   
-  const existingVariants: VariantInfo[] = ad?.variants ? JSON.parse(ad.variants) : [];
+  if (!env.DB) {
+    console.error('DB not available for fetching variants');
+    return {
+      variants: [],
+      missingBitrates: channelBitrates,
+      transcodeQueued: false
+    };
+  }
+  
+  try {
+    const ad = await env.DB.prepare(`
+      SELECT variants FROM ads WHERE id = ?
+    `).bind(adId).first<any>();
+    
+    existingVariants = ad?.variants ? JSON.parse(ad.variants) : [];
+  } catch (err) {
+    console.error(`Failed to fetch variants for ad ${adId}:`, err);
+    return {
+      variants: [],
+      missingBitrates: channelBitrates,
+      transcodeQueued: false
+    };
+  }
   
   let transcodeQueued = false;
   

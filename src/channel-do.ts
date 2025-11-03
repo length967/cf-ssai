@@ -15,6 +15,10 @@ interface AdState {
   startedAt: number // ms epoch
   endsAt: number    // ms epoch
   durationSec: number
+  // CRITICAL: Stable segment skipping tracking (prevents double ads and sticking)
+  scte35StartPDT?: string  // PDT where ad break starts
+  contentSegmentsToSkip?: number  // Number of content segments to skip
+  skippedDuration?: number  // Duration of skipped content in seconds
 }
 
 const AD_STATE_KEY = "ad_state"
@@ -378,6 +382,33 @@ export class ChannelDO {
   }
   
   /**
+   * Generate synthetic slate segments when no slate is configured
+   * Creates black segments to fill gap duration
+   */
+  private generateSyntheticSlate(gapDuration: number): Array<{url: string, duration: number}> {
+    console.log(`Generating synthetic slate for ${gapDuration.toFixed(2)}s gap`)
+    
+    // Create synthetic segments with 6-second duration (standard HLS segment)
+    const segments: Array<{url: string, duration: number}> = []
+    const segmentDuration = 6.0
+    const segmentCount = Math.ceil(gapDuration / segmentDuration)
+    
+    for (let i = 0; i < segmentCount; i++) {
+      // Generate a synthetic URL that won't resolve but maintains manifest structure
+      // In production, this should point to actual black slate segments in R2
+      segments.push({
+        url: `/slate/synthetic_black_${i}.ts`,
+        duration: i === segmentCount - 1 
+          ? gapDuration - (i * segmentDuration)  // Last segment gets remaining duration
+          : segmentDuration
+      })
+    }
+    
+    console.log(`Generated ${segments.length} synthetic slate segments (total: ${gapDuration.toFixed(2)}s)`)
+    return segments
+  }
+  
+  /**
    * Fetch slate segments to pad ad breaks
    * Returns segments that fill the gap duration
    */
@@ -392,16 +423,36 @@ export class ChannelDO {
         SELECT slate_id FROM channels WHERE id = ?
       `).bind(channelId).first<any>()
       
-      if (!channel?.slate_id) {
-        console.log('No slate configured for channel, skipping padding')
-        return []
+      // CRITICAL FIX: Fallback to organization-level slate or global slate
+      let slateId = channel?.slate_id
+      
+      if (!slateId) {
+        console.log('No channel-specific slate, checking organization defaults...')
+        
+        // Try organization-level slate
+        const orgSlate = await this.env.DB.prepare(`
+          SELECT s.id FROM slates s
+          JOIN organizations o ON s.organization_id = o.id
+          JOIN channels c ON c.organization_id = o.id
+          WHERE c.id = ? AND s.status = 'ready'
+          ORDER BY s.created_at DESC
+          LIMIT 1
+        `).bind(channelId).first<any>()
+        
+        slateId = orgSlate?.id
+      }
+      
+      if (!slateId) {
+        console.warn('No slate configured for channel or organization')
+        // FALLBACK: Generate synthetic slate segments from content stream
+        return this.generateSyntheticSlate(gapDuration)
       }
       
       // Get slate details
       const slate = await this.env.DB.prepare(`
         SELECT id, master_playlist_url, variants, duration FROM slates 
         WHERE id = ? AND status = 'ready'
-      `).bind(channel.slate_id).first<any>()
+      `).bind(slateId).first<any>()
       
       if (!slate || !slate.variants) {
         console.warn('Slate not ready or has no variants')
@@ -684,9 +735,20 @@ export class ChannelDO {
             scte35StartPDT = pdts[pdts.length - 1]  // Use most recent PDT near signal
           }
           
-          // CRITICAL: Persist SCTE-35 break to storage for stable timing
-          // Only create new ad state if one doesn't exist (don't overwrite existing)
-          if (!adActive) {
+          // CRITICAL FIX: Check if existing ad state is still active and overlaps with this SCTE-35 signal
+          // This prevents creating duplicate ad breaks for rolling SCTE-35 signals in live manifests
+          const existingAdState = await loadAdState(this.state)
+          const hasActiveAdBreak = existingAdState && existingAdState.active && Date.now() < existingAdState.endsAt
+          
+          if (hasActiveAdBreak) {
+            // Reuse existing ad state - don't create a new one!
+            // This prevents "ad played twice" when SCTE-35 signals roll in the manifest window
+            const remainingMs = existingAdState!.endsAt - Date.now()
+            console.log(`🔄 Reusing active ad break: id=${existingAdState!.podId}, remaining=${(remainingMs / 1000).toFixed(1)}s`)
+            adState = existingAdState
+            adActive = true
+          } else if (!adActive) {
+            // Only create new ad state if no active break exists
             const startTime = scte35StartPDT ? new Date(scte35StartPDT).getTime() : now
           // CRITICAL FIX: Use integer milliseconds to avoid floating-point drift
             // This prevents HLS.js from detecting schedule changes mid-playback
@@ -705,9 +767,12 @@ export class ChannelDO {
               startedAt: startTime,
               endsAt: startTime + stableDuration * 1000,
               durationSec: stableDuration,
+              scte35StartPDT: scte35StartPDT || undefined,  // Stable PDT reference
+              contentSegmentsToSkip: 0,  // Will be calculated during first manifest generation
+              skippedDuration: 0,  // Will be calculated during first manifest generation
             }
             await saveAdState(this.state, newAdState)
-            console.log(`Persisted SCTE-35 break to storage: id=${stableId}, start=${new Date(startTime).toISOString()}, duration=${stableDuration}s (rounded from ${breakDurationSec}s)`)
+            console.log(`✨ Created new SCTE-35 ad break: id=${stableId}, start=${new Date(startTime).toISOString()}, duration=${stableDuration}s (rounded from ${breakDurationSec}s), pdt=${scte35StartPDT}`)
             
             // Reload ad state for use in manifest generation below
             adState = newAdState
@@ -892,7 +957,7 @@ export class ChannelDO {
                 // Pad with slate if ad is shorter than SCTE-35 break duration
                 if (totalDuration < stableDuration && Math.abs(totalDuration - stableDuration) > 1.0) {
                   const gapDuration = stableDuration - totalDuration
-                  console.log(`Ad is ${gapDuration.toFixed(2)}s shorter than break duration, padding with slate`)
+                  console.log(`⚠️  Ad duration mismatch: ad=${totalDuration.toFixed(2)}s, break=${stableDuration.toFixed(2)}s, gap=${gapDuration.toFixed(2)}s, padding with slate`)
                   
                   // Fetch channel's slate configuration
                   try {
@@ -911,18 +976,30 @@ export class ChannelDO {
                 
                 if (adSegments.length > 0) {
                   const cleanOrigin = stripOriginSCTE35Markers(origin)
-                  // CRITICAL: Use actual ad duration for BOTH parameters
-                  // This prevents cutting off the last few seconds of the ad
-                  // The totalDuration is calculated from actual segment durations
-                  const ssai = replaceSegmentsWithAds(
+                  // CRITICAL: Pass actual ad duration calculated from segments
+                  // This ensures PDT timeline continuity
+                  // Use stable skip count from ad state if available (prevents concurrent request inconsistency)
+                  const stableSkipCount = adState?.contentSegmentsToSkip || undefined
+                  
+                  const result = replaceSegmentsWithAds(
                     cleanOrigin,
                     scte35StartPDT,
                     adSegments,
-                    totalDuration,        // Actual ad duration (for ad segment PDTs)
-                    totalDuration         // Use actual ad duration (not SCTE-35 duration) for content resume
+                    totalDuration,        // Actual ad duration from segment sum
+                    stableDuration,       // SCTE-35 break duration for content skipping
+                    stableSkipCount       // Use cached skip count if available
                   )
+                  
+                  // CRITICAL: Persist skip stats on first request for subsequent use
+                  if (adState && (!adState.contentSegmentsToSkip || adState.contentSegmentsToSkip === 0)) {
+                    adState.contentSegmentsToSkip = result.segmentsSkipped
+                    adState.skippedDuration = result.durationSkipped
+                    await saveAdState(this.state, adState)
+                    console.log(`Persisted stable skip count: ${result.segmentsSkipped} segments (${result.durationSkipped.toFixed(2)}s)`)
+                  }
+                  
                   await this.env.BEACON_QUEUE.send(beaconMsg)
-                  return new Response(ssai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
+                  return new Response(result.manifest, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
                 }
               } catch (err) {
                 console.error(`Error fetching/parsing ad playlist:`, err)

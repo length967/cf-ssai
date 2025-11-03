@@ -144,14 +144,17 @@ function getAverageSegmentDuration(lines: string[]): number {
  * @param adSegments - Ad segments with actual durations
  * @param adDuration - Actual ad duration (sum of ad segment durations)
  * @param scte35Duration - SCTE-35 break duration (how much content to skip)
+ * @param stableSkipCount - Optional: Pre-calculated stable segment skip count from ad state
+ * @returns Object with manifest and skip statistics
  */
 export function replaceSegmentsWithAds(
   variantText: string,
   scte35StartPDT: string,
   adSegments: Array<{url: string, duration: number}> | string[],
   adDuration: number,
-  scte35Duration?: number  // Optional: SCTE-35 duration if different from ad duration
-): string {
+  scte35Duration?: number,  // Optional: SCTE-35 duration if different from ad duration
+  stableSkipCount?: number  // Optional: Use pre-calculated skip count for stability
+): { manifest: string, segmentsSkipped: number, durationSkipped: number } {
   // Use SCTE-35 duration for content skipping, or fall back to ad duration
   const contentSkipDuration = scte35Duration || adDuration
   const lines = variantText.split("\n")
@@ -211,31 +214,59 @@ export function replaceSegmentsWithAds(
       // Add DISCONTINUITY after ad
       output.push("#EXT-X-DISCONTINUITY")
       
-      // CRITICAL FIX: Skip segments by actual duration sum, not count
-      // This handles variable segment durations correctly
+      // CRITICAL FIX: Use stable skip count if provided, otherwise calculate
+      // This ensures all concurrent requests skip the same segments
       let skippedDuration = 0
       let skippedCount = 0
       const skipStartIndex = i
       let resumeIndex = i + 1
       
-      while (resumeIndex < lines.length && skippedDuration < contentSkipDuration) {
-        const line = lines[resumeIndex]
+      if (stableSkipCount !== undefined && stableSkipCount > 0) {
+        // Use pre-calculated stable skip count (from ad state persistence)
+        console.log(`Using stable skip count: ${stableSkipCount} segments (cached from first request)`)
         
-        // Parse EXTINF duration for this segment
-        if (line.startsWith('#EXTINF:')) {
-          const match = line.match(/#EXTINF:([\d.]+)/)
-          if (match) {
-            const segDuration = parseFloat(match[1])
-            skippedDuration += segDuration
+        // Skip exactly stableSkipCount segments
+        let segmentsSeen = 0
+        while (resumeIndex < lines.length && segmentsSeen < stableSkipCount) {
+          const line = lines[resumeIndex]
+          
+          // Parse EXTINF duration for tracking
+          if (line.startsWith('#EXTINF:')) {
+            const match = line.match(/#EXTINF:([\d.]+)/)
+            if (match) {
+              skippedDuration += parseFloat(match[1])
+            }
           }
+          
+          // Count actual segment URIs (not tags)
+          if (!line.startsWith('#') && line.trim().length > 0) {
+            segmentsSeen++
+          }
+          
+          resumeIndex++
         }
-        
-        // Count actual segment URIs (not tags)
-        if (!line.startsWith('#') && line.trim().length > 0) {
-          skippedCount++
+        skippedCount = segmentsSeen
+      } else {
+        // First request: calculate skip based on duration
+        while (resumeIndex < lines.length && skippedDuration < contentSkipDuration) {
+          const line = lines[resumeIndex]
+          
+          // Parse EXTINF duration for this segment
+          if (line.startsWith('#EXTINF:')) {
+            const match = line.match(/#EXTINF:([\d.]+)/)
+            if (match) {
+              const segDuration = parseFloat(match[1])
+              skippedDuration += segDuration
+            }
+          }
+          
+          // Count actual segment URIs (not tags)
+          if (!line.startsWith('#') && line.trim().length > 0) {
+            skippedCount++
+          }
+          
+          resumeIndex++
         }
-        
-        resumeIndex++
       }
       
       console.log(`Skipped ${skippedCount} content segments (${skippedDuration.toFixed(2)}s of ${contentSkipDuration}s target) from index ${skipStartIndex} to ${resumeIndex}`)
@@ -243,20 +274,30 @@ export function replaceSegmentsWithAds(
       // CRITICAL FIX: Calculate resume PDT as last ad PDT + total ad duration
       // This preserves linear timeline consistency and avoids playback jumps
       // The PDT timeline must be continuous: start -> ad segments -> resume
-      const lastAdPDT = addSecondsToTimestamp(startPDT, totalDuration)
+      const lastAdPDT = addSecondsToTimestamp(startPDT, adDuration)
       output.push(`#EXT-X-PROGRAM-DATE-TIME:${lastAdPDT}`)
-      console.log(`Inserted calculated resume PDT for buffer continuity: ${lastAdPDT} (start: ${startPDT} + ${totalDuration}s)`)
+      console.log(`Inserted calculated resume PDT for buffer continuity: ${lastAdPDT} (start: ${startPDT} + ${adDuration}s)`)
       
       // Update loop index to resume point
       i = resumeIndex - 1  // -1 because outer loop will increment
       
-      continue
+      // Return skip stats for persistence
+      return {
+        manifest: output.join("\n"),
+        segmentsSkipped: skippedCount,
+        durationSkipped: skippedDuration
+      }
     }
     
     output.push(line)
   }
   
-  return output.join("\n")
+  // No ad insertion occurred, return original manifest
+  return {
+    manifest: output.join("\n"),
+    segmentsSkipped: 0,
+    durationSkipped: 0
+  }
 }
 
 /**

@@ -305,7 +305,7 @@ export function parseSCTE35Binary(base64Cmd: string): SCTE35BinaryData | null {
   try {
     // Decode base64 using Workers-compatible API
     const rawBuffer = base64ToUint8Array(base64Cmd)
-    const buffer = new BufferReader(rawBuffer)
+    let buffer = new BufferReader(rawBuffer)
     
     // Validate minimum length
     if (buffer.length < 14) {
@@ -314,10 +314,31 @@ export function parseSCTE35Binary(base64Cmd: string): SCTE35BinaryData | null {
     }
     
     // Parse splice info section (Section 9.2)
-    const tableId = buffer.readUInt8(0)
+    let tableId = buffer.readUInt8(0)
+    let offset = 0
+    
+    // CRITICAL FIX: Handle wrapped/offset SCTE-35 data
+    // Some encoders wrap SCTE-35 in extra bytes - scan for 0xFC table_id
     if (tableId !== 0xFC) {
-      console.error(`Invalid table_id: ${tableId} (expected 0xFC)`)
-      return null
+      console.warn(`Invalid table_id at offset 0: ${tableId} (0x${tableId.toString(16)}), scanning for 0xFC...`)
+      
+      // Scan up to first 16 bytes for the 0xFC marker
+      let found = false
+      for (let i = 1; i < Math.min(16, buffer.length - 14); i++) {
+        if (buffer.readUInt8(i) === 0xFC) {
+          console.log(`Found 0xFC table_id at offset ${i}, using adjusted buffer`)
+          offset = i
+          buffer = new BufferReader(rawBuffer.slice(i))
+          tableId = 0xFC
+          found = true
+          break
+        }
+      }
+      
+      if (!found) {
+        console.error(`No valid SCTE-35 table_id (0xFC) found in first 16 bytes, falling back to attribute parsing`)
+        return null
+      }
     }
     
     const sectionSyntaxIndicator = (buffer.readUInt8(1) & 0x80) !== 0
