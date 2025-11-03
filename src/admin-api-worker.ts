@@ -2,6 +2,7 @@
 // REST API for admin platform with multi-tenant support
 
 import { invalidateChannelConfigCache } from './utils/channel-config'
+import { detectBitratesFromOrigin, validateBitrateLadder } from './utils/bitrate-detection'
 
 export interface Env {
   DB: D1Database
@@ -197,6 +198,81 @@ function corsHeaders(env: Env, requestOrigin?: string | null): Record<string, st
 class AdminAPI {
   constructor(private env: Env, private requestOrigin?: string | null) {}
   
+  /**
+   * Get bitrate ladder with smart fallbacks
+   * Priority: specified channel → org channels → sensible defaults
+   * 
+   * This method prioritizes explicitly configured bitrate_ladder (from detection or manual override)
+   * over legacy detected_bitrates for maximum reliability.
+   */
+  private async getBitrateLadder(
+    organizationId: string,
+    channelId?: string | null
+  ): Promise<number[]> {
+    // Priority 1: Use specified channel's explicit bitrate ladder
+    if (channelId) {
+      const channel = await this.env.DB.prepare(`
+        SELECT bitrate_ladder, bitrate_ladder_source, detected_bitrates FROM channels 
+        WHERE id = ? AND organization_id = ?
+      `).bind(channelId, organizationId).first<any>()
+      
+      if (channel) {
+        // Always prioritize bitrate_ladder if configured (manual or auto-detected)
+        if (channel.bitrate_ladder) {
+          try {
+            const ladder = JSON.parse(channel.bitrate_ladder)
+            if (Array.isArray(ladder) && ladder.length > 0) {
+              const source = channel.bitrate_ladder_source || 'unknown'
+              console.log(`✅ Using channel bitrate ladder (${source}): ${ladder.join(', ')} kbps`)
+              return ladder
+            }
+          } catch (e) {
+            console.warn('Failed to parse bitrate_ladder, falling back')
+          }
+        }
+        
+        // Legacy fallback: detected_bitrates (for channels not yet migrated to explicit workflow)
+        if (channel.detected_bitrates) {
+          try {
+            const detected = JSON.parse(channel.detected_bitrates)
+            if (Array.isArray(detected) && detected.length > 0) {
+              console.log(`⚠️  Using legacy detected bitrates: ${detected.join(', ')} kbps (consider re-detecting)`)
+              return detected
+            }
+          } catch (e) {
+            console.warn('Failed to parse detected_bitrates')
+          }
+        }
+      }
+    }
+    
+    // Priority 2: Use first active channel's bitrates from same organization
+    console.log('No channel bitrates found, checking organization channels')
+    const orgChannel = await this.env.DB.prepare(`
+      SELECT bitrate_ladder, bitrate_ladder_source, detected_bitrates FROM channels 
+      WHERE organization_id = ? AND status = 'active' AND bitrate_ladder IS NOT NULL
+      ORDER BY last_bitrate_detection DESC, created_at DESC
+      LIMIT 1
+    `).bind(organizationId).first<any>()
+    
+    if (orgChannel?.bitrate_ladder) {
+      try {
+        const ladder = JSON.parse(orgChannel.bitrate_ladder)
+        if (Array.isArray(ladder) && ladder.length > 0) {
+          const source = orgChannel.bitrate_ladder_source || 'unknown'
+          console.log(`ℹ️  Using org channel bitrate ladder (${source}): ${ladder.join(', ')} kbps`)
+          return ladder
+        }
+      } catch (e) {
+        console.warn('Failed to parse org channel bitrate_ladder')
+      }
+    }
+    
+    // Priority 3: Fallback to sensible defaults for common streaming
+    console.log('⚠️  Using default bitrate ladder (no channel-specific configuration found)')
+    return [800, 1600, 2400, 3600] // Balanced ladder covering mobile to 4K
+  }
+  
   private corsHeaders(): Record<string, string> {
     return corsHeaders(this.env, this.requestOrigin)
   }
@@ -334,14 +410,28 @@ class AdminAPI {
     const id = generateId('ch')
     const now = Date.now()
     
+    // Validate bitrate ladder if provided
+    if (data.bitrate_ladder) {
+      const validation = validateBitrateLadder(data.bitrate_ladder)
+      if (!validation.valid) {
+        return new Response(JSON.stringify({ 
+          error: `Invalid bitrate ladder: ${validation.error}` 
+        }), {
+          status: 400,
+          headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+        })
+      }
+    }
+    
     await this.env.DB.prepare(`
       INSERT INTO channels (
         id, organization_id, name, slug, origin_url, status, mode,
         scte35_enabled, scte35_auto_insert, vast_enabled, vast_url, default_ad_duration,
         ad_pod_base_url, sign_host, slate_pod_id, time_based_auto_insert,
         segment_cache_max_age, manifest_cache_max_age, tier, settings,
+        bitrate_ladder, bitrate_ladder_source, detected_bitrates, last_bitrate_detection,
         created_at, updated_at, created_by
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).bind(
       id,
       auth.organizationId,
@@ -363,6 +453,10 @@ class AdminAPI {
       data.manifest_cache_max_age || 4,
       data.tier ?? 0,  // Default: no tier restrictions
       JSON.stringify(data.settings || {}),
+      data.bitrate_ladder ? JSON.stringify(data.bitrate_ladder) : null,
+      data.bitrate_ladder_source || null,
+      data.detected_bitrates ? JSON.stringify(data.detected_bitrates) : null,
+      data.last_bitrate_detection || null,
       now,
       now,
       auth.user.id
@@ -416,6 +510,39 @@ class AdminAPI {
       values.push(JSON.stringify(data.settings))
     }
     
+    // Handle bitrate ladder updates
+    if (data.bitrate_ladder !== undefined) {
+      // Validate if provided
+      if (data.bitrate_ladder !== null) {
+        const validation = validateBitrateLadder(data.bitrate_ladder)
+        if (!validation.valid) {
+          return new Response(JSON.stringify({ 
+            error: `Invalid bitrate ladder: ${validation.error}` 
+          }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+          })
+        }
+      }
+      updates.push('bitrate_ladder = ?')
+      values.push(data.bitrate_ladder ? JSON.stringify(data.bitrate_ladder) : null)
+    }
+    
+    if (data.bitrate_ladder_source !== undefined) {
+      updates.push('bitrate_ladder_source = ?')
+      values.push(data.bitrate_ladder_source)
+    }
+    
+    if (data.detected_bitrates !== undefined) {
+      updates.push('detected_bitrates = ?')
+      values.push(data.detected_bitrates ? JSON.stringify(data.detected_bitrates) : null)
+    }
+    
+    if (data.last_bitrate_detection !== undefined) {
+      updates.push('last_bitrate_detection = ?')
+      values.push(data.last_bitrate_detection)
+    }
+    
     updates.push('updated_at = ?')
     values.push(Date.now())
     
@@ -454,6 +581,52 @@ class AdminAPI {
     await this.logEvent(auth.organizationId, auth.user.id, 'channel.deleted', 'channel', channelId, null)
     
     return new Response(JSON.stringify({ success: true }), {
+      headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+    })
+  }
+  
+  /**
+   * Detect bitrates from origin stream URL
+   * POST body: { originUrl: string }
+   * Returns: { success, bitrates, variants, error? }
+   */
+  async detectBitrates(auth: AuthContext, data: any): Promise<Response> {
+    if (!data.originUrl) {
+      return new Response(JSON.stringify({ 
+        success: false,
+        error: 'originUrl is required' 
+      }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+      })
+    }
+    
+    console.log(`🔍 Detecting bitrates from: ${data.originUrl}`)
+    
+    // Call bitrate detection utility
+    const result = await detectBitratesFromOrigin(data.originUrl, 15000) // 15s timeout
+    
+    if (!result.success) {
+      console.error(`❌ Bitrate detection failed: ${result.error}`)
+      return new Response(JSON.stringify(result), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+      })
+    }
+    
+    console.log(`✅ Detected ${result.bitrates.length} bitrates: ${result.bitrates.join(', ')} kbps`)
+    
+    // Log event
+    await this.logEvent(
+      auth.organizationId, 
+      auth.user.id, 
+      'bitrates.detected', 
+      'origin', 
+      data.originUrl, 
+      { bitrates: result.bitrates, variants: result.variants }
+    )
+    
+    return new Response(JSON.stringify(result), {
       headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
     })
   }
@@ -770,7 +943,7 @@ class AdminAPI {
         headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
       })
     }
-
+    
     const id = generateId('user')
     const now = Date.now()
     const passwordHash = await hashPassword(data.password)
@@ -1093,21 +1266,8 @@ class AdminAPI {
         })
       }
       
-      // Get channel bitrate ladder if specified
-      let bitrates = [1000, 2000, 3000]
-      if (channel_id) {
-        const channel = await this.env.DB.prepare(`
-          SELECT bitrate_ladder FROM channels WHERE id = ? AND organization_id = ?
-        `).bind(channel_id, auth.organizationId).first<any>()
-        
-        if (channel?.bitrate_ladder) {
-          try {
-            bitrates = JSON.parse(channel.bitrate_ladder)
-          } catch (e) {
-            console.warn('Failed to parse bitrate ladder')
-          }
-        }
-      }
+      // Get bitrate ladder
+      const bitrates = await this.getBitrateLadder(auth.organizationId, channel_id)
       
       // Create slate record
       const slateId = generateId('slate')
@@ -1189,21 +1349,8 @@ class AdminAPI {
         })
       }
       
-      // Get channel bitrate ladder if specified
-      let bitrates = [1000, 2000, 3000] // Default
-      if (channelId) {
-        const channel = await this.env.DB.prepare(`
-          SELECT bitrate_ladder FROM channels WHERE id = ? AND organization_id = ?
-        `).bind(channelId, auth.organizationId).first<any>()
-        
-        if (channel?.bitrate_ladder) {
-          try {
-            bitrates = JSON.parse(channel.bitrate_ladder)
-          } catch (e) {
-            console.warn('Failed to parse bitrate ladder')
-          }
-        }
-      }
+      // Get bitrate ladder with smart defaults
+      const bitrates = await this.getBitrateLadder(auth.organizationId, channelId)
       
       // Create slate record
       const slateId = generateId('slate')
@@ -1444,24 +1591,8 @@ class AdminAPI {
         })
       }
       
-      // Get channel bitrate ladder (if channel specified)
-      let bitrates = [1000, 2000, 3000] // Default bitrates in kbps
-      if (channelId) {
-        const channel = await this.env.DB.prepare(`
-          SELECT bitrate_ladder FROM channels WHERE id = ? AND organization_id = ?
-        `).bind(channelId, auth.organizationId).first<any>()
-        
-        if (channel?.bitrate_ladder) {
-          try {
-            const ladder = JSON.parse(channel.bitrate_ladder)
-            if (Array.isArray(ladder) && ladder.length > 0) {
-              bitrates = ladder
-            }
-          } catch (e) {
-            console.warn('Failed to parse bitrate ladder, using defaults')
-          }
-        }
-      }
+      // Get bitrate ladder with smart defaults
+      const bitrates = await this.getBitrateLadder(auth.organizationId, channelId)
       
       // Create ad record
       const adId = generateId('ad')
@@ -1678,6 +1809,152 @@ class AdminAPI {
     })
   }
   
+  async retranscodeAd(auth: AuthContext, adId: string, data: any): Promise<Response> {
+    // Get ad details
+    const ad = await this.env.DB.prepare(`
+      SELECT * FROM ads WHERE id = ? AND organization_id = ?
+    `).bind(adId, auth.organizationId).first<any>()
+    
+    if (!ad) {
+      return new Response(JSON.stringify({ error: 'Ad not found' }), {
+        status: 404,
+        headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+      })
+    }
+    
+    if (!ad.source_key) {
+      return new Response(JSON.stringify({ error: 'Ad has no source video to re-transcode' }), {
+        status: 400,
+        headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+      })
+    }
+    
+    // Get bitrates (either from request body or auto-detect from channel)
+    let bitrates: number[]
+    
+    if (data.bitrates && Array.isArray(data.bitrates) && data.bitrates.length > 0) {
+      // Manual bitrates specified
+      bitrates = data.bitrates
+      console.log(`Re-transcoding ad ${adId} with manual bitrates: ${bitrates}`)
+    } else {
+      // Auto-detect from channel
+      const channelId = data.channel_id || ad.channel_id
+      bitrates = await this.getBitrateLadder(auth.organizationId, channelId)
+      console.log(`Re-transcoding ad ${adId} with auto-detected bitrates: ${bitrates}`)
+    }
+    
+    // Construct source URL
+    const sourceUrl = ad.source_key.startsWith('http') 
+      ? ad.source_key 
+      : `${this.env.R2_PUBLIC_URL}/${ad.source_key}`
+    
+    // Reset transcode status
+    await this.env.DB.prepare(`
+      UPDATE ads 
+      SET transcode_status = 'queued',
+          error_message = NULL,
+          updated_at = ?
+      WHERE id = ?
+    `).bind(Date.now(), adId).run()
+    
+    // Get organization settings for parallel transcoding
+    const org = await this.env.DB.prepare(`
+      SELECT parallel_transcode_enabled, parallel_transcode_threshold, parallel_segment_duration
+      FROM organizations
+      WHERE id = ?
+    `).bind(auth.organizationId).first<{
+      parallel_transcode_enabled: number;
+      parallel_transcode_threshold: number;
+      parallel_segment_duration: number;
+    }>()
+    
+    const parallelEnabled = org?.parallel_transcode_enabled === 1
+    const thresholdSeconds = org?.parallel_transcode_threshold || 30
+    const segmentDuration = org?.parallel_segment_duration || 10
+    
+    // Use stored duration if available, otherwise estimate
+    const estimatedDuration = ad.duration || (ad.file_size > 10 * 1024 * 1024 ? 60 : 20)
+    const useParallel = parallelEnabled && estimatedDuration > thresholdSeconds
+    
+    console.log(`Re-queueing transcode job for ad ${adId}:`, {
+      parallelEnabled,
+      thresholdSeconds,
+      estimatedDuration,
+      useParallel,
+      bitrates
+    })
+    
+    if (useParallel) {
+      try {
+        // PARALLEL TRANSCODING
+        const jobGroupId = crypto.randomUUID()
+        const segmentCount = Math.ceil(estimatedDuration / segmentDuration)
+        
+        const doId = this.env.TRANSCODE_COORDINATOR.idFromName(jobGroupId)
+        const coordinator = this.env.TRANSCODE_COORDINATOR.get(doId)
+        
+        const initRequest = new Request('http://coordinator/init', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            adId,
+            segmentCount,
+            bitrates,
+            organizationId: auth.organizationId
+          })
+        })
+        
+        await coordinator.fetch(initRequest)
+        
+        // Queue segment jobs
+        for (let i = 0; i < segmentCount; i++) {
+          await this.env.TRANSCODE_QUEUE.send({
+            adId,
+            sourceUrl,
+            bitrates,
+            organizationId: auth.organizationId,
+            channelId: ad.channel_id || undefined,
+            isParallel: true,
+            segmentIndex: i,
+            segmentDuration,
+            jobGroupId
+          })
+        }
+        
+        console.log(`Queued ${segmentCount} parallel transcode jobs for ad ${adId}`)
+      } catch (err) {
+        console.error('Failed to setup parallel transcode, falling back to traditional:', err)
+        // Fallback to traditional
+        await this.env.TRANSCODE_QUEUE.send({
+          adId,
+          sourceUrl,
+          bitrates,
+          organizationId: auth.organizationId,
+          channelId: ad.channel_id || undefined
+        })
+      }
+    } else {
+      // TRADITIONAL TRANSCODING
+      await this.env.TRANSCODE_QUEUE.send({
+        adId,
+        sourceUrl,
+        bitrates,
+        organizationId: auth.organizationId,
+        channelId: ad.channel_id || undefined
+      })
+    }
+    
+    await this.logEvent(auth.organizationId, auth.user.id, 'ad.retranscode', 'ad', adId, { bitrates })
+    
+    return new Response(JSON.stringify({ 
+      success: true, 
+      message: 'Re-transcode job queued',
+      bitrates 
+    }), {
+      headers: { 'Content-Type': 'application/json', ...this.corsHeaders() }
+    })
+  }
+  
   async deleteAd(auth: AuthContext, adId: string): Promise<Response> {
     const ad = await this.env.DB.prepare(`
       SELECT * FROM ads WHERE id = ? AND organization_id = ?
@@ -1810,6 +2087,12 @@ export default {
         return api.deleteChannel(auth, channelId)
       }
       
+      // Bitrate Detection
+      if (url.pathname === '/api/channels/detect-bitrates' && request.method === 'POST') {
+        const data = await request.json()
+        return api.detectBitrates(auth, data)
+      }
+      
       // Slates
       if (url.pathname === '/api/slates' && request.method === 'GET') {
         return api.listSlates(auth)
@@ -1924,6 +2207,11 @@ export default {
       if (url.pathname.match(/^\/api\/ads\/[^/]+\/refresh$/) && request.method === 'POST') {
         const adId = url.pathname.split('/')[3]
         return api.refreshAdStatus(auth, adId)
+      }
+      if (url.pathname.match(/^\/api\/ads\/[^/]+\/retranscode$/) && request.method === 'POST') {
+        const adId = url.pathname.split('/')[3]
+        const data = await request.json()
+        return api.retranscodeAd(auth, adId, data)
       }
       
       

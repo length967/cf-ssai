@@ -102,6 +102,13 @@ class APIClient {
     })
   }
 
+  async detectBitrates(originUrl: string) {
+    return this.request('/api/channels/detect-bitrates', {
+      method: 'POST',
+      body: JSON.stringify({ originUrl })
+    })
+  }
+
   // Analytics
   async getAnalytics(params: { channel_id?: string; start_time?: number; end_time?: number }) {
     const query = new URLSearchParams()

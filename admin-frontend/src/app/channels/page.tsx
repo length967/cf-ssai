@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { api } from '@/lib/api'
+import { BitrateDetector } from '@/components/BitrateDetector'
 
 type Channel = {
   id: string
@@ -25,6 +26,10 @@ type Channel = {
   segment_cache_max_age?: number
   manifest_cache_max_age?: number
   settings?: string
+  bitrate_ladder?: string
+  bitrate_ladder_source?: string
+  detected_bitrates?: string
+  last_bitrate_detection?: number
   created_at: number
   updated_at: number
 }
@@ -70,7 +75,10 @@ export default function ChannelsPage() {
       max_bitrate: null,
       min_bitrate: null,
       prefer_hls: true,
-    }
+    },
+    bitrate_ladder: [] as number[],
+    bitrate_ladder_source: null as 'auto' | 'manual' | null,
+    detected_bitrates: [] as number[]
   })
 
   useEffect(() => {
@@ -132,7 +140,10 @@ export default function ChannelsPage() {
         max_bitrate: null,
         min_bitrate: null,
         prefer_hls: true,
-      }
+      },
+      bitrate_ladder: [],
+      bitrate_ladder_source: null,
+      detected_bitrates: []
     })
     setShowModal(true)
   }
@@ -140,6 +151,22 @@ export default function ChannelsPage() {
   const openEditModal = (channel: Channel) => {
     setEditingChannel(channel)
     const settings = channel.settings ? JSON.parse(channel.settings) : {}
+    
+    let bitrateLadder: number[] = []
+    let detectedBitrates: number[] = []
+    
+    if (channel.bitrate_ladder) {
+      try {
+        bitrateLadder = JSON.parse(channel.bitrate_ladder)
+      } catch (e) {}
+    }
+    
+    if (channel.detected_bitrates) {
+      try {
+        detectedBitrates = JSON.parse(channel.detected_bitrates)
+      } catch (e) {}
+    }
+    
     setFormData({
       name: channel.name,
       slug: channel.slug,
@@ -163,7 +190,10 @@ export default function ChannelsPage() {
         max_bitrate: settings.max_bitrate || null,
         min_bitrate: settings.min_bitrate || null,
         prefer_hls: settings.prefer_hls ?? true,
-      }
+      },
+      bitrate_ladder: bitrateLadder,
+      bitrate_ladder_source: (channel.bitrate_ladder_source as 'auto' | 'manual' | null) || null,
+      detected_bitrates: detectedBitrates
     })
     setShowModal(true)
   }
@@ -185,6 +215,10 @@ export default function ChannelsPage() {
         vast_enabled: formData.vast_enabled ? 1 : 0,
         time_based_auto_insert: formData.time_based_auto_insert ? 1 : 0,
         settings: formData.settings,
+        bitrate_ladder: formData.bitrate_ladder.length > 0 ? formData.bitrate_ladder : undefined,
+        bitrate_ladder_source: formData.bitrate_ladder_source,
+        detected_bitrates: formData.detected_bitrates.length > 0 ? formData.detected_bitrates : undefined,
+        last_bitrate_detection: formData.bitrate_ladder_source === 'auto' ? Date.now() : undefined
       }
 
       if (editingChannel) {
@@ -319,6 +353,24 @@ export default function ChannelsPage() {
                       <td className="px-6 py-4 whitespace-nowrap">
                         <div className="text-sm font-medium text-gray-900">{channel.name}</div>
                         <div className="text-sm text-gray-500">{channel.origin_url}</div>
+                        {channel.bitrate_ladder && (() => {
+                          try {
+                            const bitrates = JSON.parse(channel.bitrate_ladder)
+                            return (
+                              <div className="mt-1 flex items-center gap-1">
+                                <span className="text-xs text-gray-400">Bitrates:</span>
+                                <span className="text-xs font-mono text-gray-600">
+                                  {bitrates.join(', ')} kbps
+                                </span>
+                                {channel.bitrate_ladder_source === 'auto' && (
+                                  <span className="text-xs text-blue-600">✓</span>
+                                )}
+                              </div>
+                            )
+                          } catch (e) {
+                            return null
+                          }
+                        })()}
                       </td>
                       <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                         {channel.slug}
@@ -499,6 +551,34 @@ export default function ChannelsPage() {
                     <p className="mt-1 text-sm text-gray-500">Ad insertion mode</p>
                   </div>
                 </div>
+              </div>
+
+              {/* Bitrate Detection */}
+              <div>
+                <h3 className="text-lg font-semibold mb-4">Bitrate Configuration</h3>
+                <p className="text-sm text-gray-600 mb-4">
+                  Detect and configure bitrate variants for this channel. Ads will be transcoded to match these exact bitrates.
+                </p>
+                <BitrateDetector
+                  originUrl={formData.origin_url}
+                  bitrateLadder={formData.bitrate_ladder}
+                  bitrateSource={formData.bitrate_ladder_source}
+                  onBitratesDetected={(bitrates, source) => {
+                    setFormData({
+                      ...formData,
+                      bitrate_ladder: bitrates,
+                      bitrate_ladder_source: source,
+                      detected_bitrates: bitrates
+                    })
+                  }}
+                  onBitratesChanged={(bitrates, source) => {
+                    setFormData({
+                      ...formData,
+                      bitrate_ladder: bitrates,
+                      bitrate_ladder_source: source
+                    })
+                  }}
+                />
               </div>
 
               {/* SCTE-35 Configuration */}
