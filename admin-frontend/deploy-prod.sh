@@ -29,11 +29,23 @@ echo "🔧 Building Admin Frontend with production API..."
 echo "   API URL: $ADMIN_API_URL"
 echo ""
 
-# Set the environment variable for the build
+# Clean previous builds to prevent cache issues
+echo "🧹 Cleaning previous build..."
+rm -rf .next out
+
+# Set the environment variable for the build (this overrides .env.local)
 export NEXT_PUBLIC_API_URL="$ADMIN_API_URL"
 
+echo "📦 Building frontend..."
 # Build the frontend
 npm run build
+
+# Verify the API URL is in the build
+if grep -q "$ADMIN_API_URL" out/_next/static/chunks/app/login/*.js 2>/dev/null; then
+  echo "✅ Verified: Production API URL is in the build"
+else
+  echo "⚠️  Warning: Could not verify API URL in build files"
+fi
 
 echo ""
 echo "🚀 Deploying to Cloudflare Pages..."

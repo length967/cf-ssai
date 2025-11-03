@@ -125,6 +125,27 @@ export default function Home() {
             </div>
 
             <div
+              onClick={() => router.push('/slates')}
+              className="bg-white overflow-hidden shadow rounded-lg cursor-pointer hover:shadow-md transition-shadow"
+            >
+              <div className="p-5">
+                <div className="flex items-center">
+                  <div className="flex-shrink-0">
+                    <svg className="h-6 w-6 text-primary" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                    </svg>
+                  </div>
+                  <div className="ml-5 w-0 flex-1">
+                    <dl>
+                      <dt className="text-sm font-medium text-gray-500 truncate">Slates</dt>
+                      <dd className="text-lg font-medium text-gray-900">Ad Break Placeholders</dd>
+                    </dl>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div
               onClick={() => router.push('/analytics')}
               className="bg-white overflow-hidden shadow rounded-lg cursor-pointer hover:shadow-md transition-shadow"
             >
@@ -175,7 +196,9 @@ export default function Home() {
             </p>
             <ul className="list-disc list-inside space-y-2 text-sm text-blue-700">
               <li><strong>Channels:</strong> Create and manage your live stream channels with SCTE-35 and VAST configuration</li>
-              <li><strong>Ad Pods:</strong> Manage pre-transcoded ad assets with multi-bitrate support</li>
+              <li><strong>Ads Library:</strong> Upload video commercials and manage transcoded ad variants</li>
+              <li><strong>Ad Pods:</strong> Create ad pods from transcoded assets with multi-bitrate support</li>
+              <li><strong>Slates:</strong> Generate or upload "We'll Be Right Back" videos for ad break padding</li>
               <li><strong>Analytics:</strong> View beacon tracking and performance metrics</li>
               <li><strong>Settings:</strong> Configure organization, workers, users, and API keys</li>
             </ul>

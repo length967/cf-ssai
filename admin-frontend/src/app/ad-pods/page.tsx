@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { api } from '@/lib/api'
+import Navigation from '@/components/Navigation'
 
 type AdPod = {
   id: string
@@ -262,39 +263,7 @@ export default function AdPodsPage() {
 
   return (
     <div className="min-h-screen bg-gray-50">
-      {/* Navigation */}
-      <nav className="bg-white shadow-sm border-b">
-        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
-          <div className="flex justify-between h-16">
-            <div className="flex items-center">
-              <button
-                onClick={() => router.push('/')}
-                className="text-xl font-bold text-blue-600 hover:text-blue-800"
-              >
-                SSAI Admin
-              </button>
-              <nav className="ml-8 flex space-x-4">
-                <a href="/" className="text-gray-600 hover:text-gray-900 px-3 py-2">Dashboard</a>
-                <a href="/channels" className="text-gray-600 hover:text-gray-900 px-3 py-2">Channels</a>
-                <a href="/ad-pods" className="text-blue-600 font-medium px-3 py-2">Ad Pods</a>
-                <a href="/analytics" className="text-gray-600 hover:text-gray-900 px-3 py-2">Analytics</a>
-                <a href="/settings" className="text-gray-600 hover:text-gray-900 px-3 py-2">Settings</a>
-              </nav>
-            </div>
-            <div className="flex items-center">
-              <button
-                onClick={() => {
-                  api.clearToken()
-                  router.push('/login')
-                }}
-                className="text-sm text-gray-700 hover:text-gray-900"
-              >
-                Logout
-              </button>
-            </div>
-          </div>
-        </div>
-      </nav>
+      <Navigation />
 
       <main className="max-w-7xl mx-auto py-6 sm:px-6 lg:px-8">
         <div className="px-4 py-6 sm:px-0">

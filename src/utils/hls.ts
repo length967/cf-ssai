@@ -1,20 +1,24 @@
 // Minimal HLS helpers suitable for Workers
 
-export type VariantInfo = { bandwidth?: number; resolution?: string; uri: string }
+export type VariantInfo = { bandwidth?: number; resolution?: string; uri: string; isVideo?: boolean }
 
 /**
  * Extract bitrates (in kbps) from HLS master manifest
  * Returns sorted array of bitrates for transcoding ladder matching
+ * Filters out audio-only variants (< 200 kbps or no video codec/resolution)
  */
 export function extractBitrates(masterManifest: string): number[] {
   const lines = masterManifest.split('\n')
   const variants = parseVariant(lines)
   
   // Extract bandwidths and convert from bps to kbps
+  // Filter out audio-only variants (isVideo=false or very low bitrate)
   const bitrates = variants
+    .filter(v => v.isVideo !== false) // Keep only video variants
     .map(v => v.bandwidth)
     .filter((bw): bw is number => bw !== undefined)
     .map(bw => Math.round(bw / 1000)) // Convert bps to kbps
+    .filter(kbps => kbps >= 200) // Extra safety: filter very low bitrates (audio-only)
     .sort((a, b) => a - b) // Sort ascending
   
   // Remove duplicates
@@ -34,15 +38,23 @@ export function parseVariant(lines: string[]): VariantInfo[] {
           .map((kv) => {
             const idx = kv.indexOf("=")
             const k = kv.slice(0, idx)
-            const v = kv.slice(idx + 1).replace(/^"|"$/g, "")
+            const v = kv.slice(idx + 1).replace(/^\"|\"$/g, "")
             return [k, v]
           })
       ) as any
       const uri = (lines[i + 1] || "").trim()
+      
+      // Check if this is video variant (has resolution OR video codec)
+      const hasResolution = !!attrs["RESOLUTION"]
+      const codecs = attrs["CODECS"] || ""
+      const hasVideoCodec = codecs.includes("avc") || codecs.includes("hvc") || codecs.includes("vp")
+      const isVideoVariant = hasResolution || hasVideoCodec
+      
       out.push({
         bandwidth: attrs["BANDWIDTH"] ? Number(attrs["BANDWIDTH"]) : undefined,
         resolution: attrs["RESOLUTION"],
         uri,
+        isVideo: isVideoVariant  // Add flag to identify video variants
       })
     }
   }

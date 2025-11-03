@@ -64,6 +64,16 @@ export default function Navigation() {
                 Ad Pods
               </a>
               <a
+                href="/slates"
+                className={`px-3 py-2 ${
+                  isActive('/slates')
+                    ? 'text-blue-600 font-medium'
+                    : 'text-gray-600 hover:text-gray-900'
+                }`}
+              >
+                Slates
+              </a>
+              <a
                 href="/analytics"
                 className={`px-3 py-2 ${
                   isActive('/analytics')

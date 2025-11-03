@@ -265,6 +265,68 @@ class APIClient {
       method: 'POST'
     })
   }
+  
+  // Slates
+  async listSlates() {
+    return this.request('/api/slates')
+  }
+  
+  async getSlate(id: string) {
+    return this.request(`/api/slates/${id}`)
+  }
+  
+  async uploadSlate(file: File, name: string, channelId?: string) {
+    const token = this.getToken()
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('name', name)
+    if (channelId) {
+      formData.append('channel_id', channelId)
+    }
+    
+    const response = await fetch(`${API_URL}/api/slates/upload`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${token}`
+      },
+      body: formData
+    })
+    
+    if (!response.ok) {
+      const error = await response.json()
+      throw new Error(error.error || 'Upload failed')
+    }
+    
+    return response.json()
+  }
+  
+  async generateSlate(data: {
+    name: string
+    text_content: string
+    background_color?: string
+    text_color?: string
+    font_size?: number
+    duration?: number
+    channel_id?: string
+  }) {
+    return this.request('/api/slates/generate', {
+      method: 'POST',
+      body: JSON.stringify(data)
+    })
+  }
+  
+  async updateSlate(id: string, data: any) {
+    return this.request(`/api/slates/${id}`, {
+      method: 'PUT',
+      body: JSON.stringify(data)
+    })
+  }
+  
+  async deleteSlate(id: string) {
+    return this.request(`/api/slates/${id}`, {
+      method: 'DELETE'
+    })
+  }
 }
 
 export const api = new APIClient()
