@@ -61,23 +61,14 @@ export function parseVariant(lines: string[]): VariantInfo[] {
   return out
 }
 
-/** Insert a DISCONTINUITY marker.
- *  If insertAfterPDT is provided, place it immediately after that PDT line.
- *  Otherwise, inject before the last media segment to simulate an ad splice.
+/** Insert a DISCONTINUITY marker before the last media segment.
+ *  Used as fallback when ad playlist fetch fails.
+ *  DEPRECATED: This is a legacy fallback path only.
  */
-export function insertDiscontinuity(variantText: string, insertAfterPDT?: string): string {
+export function insertDiscontinuity(variantText: string): string {
   const lines = variantText.split("\n")
-  if (insertAfterPDT) {
-    const out: string[] = []
-    for (let i = 0; i < lines.length; i++) {
-      out.push(lines[i])
-      if (lines[i].startsWith("#EXT-X-PROGRAM-DATE-TIME:") && lines[i].includes(insertAfterPDT)) {
-        out.push("#EXT-X-DISCONTINUITY")
-      }
-    }
-    return out.join("\n")
-  }
-  // No PDT provided: inject before tail media segment
+  
+  // Inject before tail media segment
   for (let i = lines.length - 1; i >= 0; i--) {
     const l = lines[i]
     if (!l.startsWith("#") && l.trim().length > 0) {
@@ -220,43 +211,41 @@ export function replaceSegmentsWithAds(
       // Add DISCONTINUITY after ad
       output.push("#EXT-X-DISCONTINUITY")
       
-      // Skip the next N content segments FIRST
-      // (We'll insert the resume PDT after finding the actual resume point)
-      let skipped = 0
+      // CRITICAL FIX: Skip segments by actual duration sum, not count
+      // This handles variable segment durations correctly
+      let skippedDuration = 0
+      let skippedCount = 0
       const skipStartIndex = i
-      let resumeIndex = i
+      let resumeIndex = i + 1
       
-      while (resumeIndex < lines.length && skipped < segmentsToReplace) {
+      while (resumeIndex < lines.length && skippedDuration < contentSkipDuration) {
+        const line = lines[resumeIndex]
+        
+        // Parse EXTINF duration for this segment
+        if (line.startsWith('#EXTINF:')) {
+          const match = line.match(/#EXTINF:([\d.]+)/)
+          if (match) {
+            const segDuration = parseFloat(match[1])
+            skippedDuration += segDuration
+          }
+        }
+        
+        // Count actual segment URIs (not tags)
+        if (!line.startsWith('#') && line.trim().length > 0) {
+          skippedCount++
+        }
+        
         resumeIndex++
-        if (resumeIndex < lines.length && !lines[resumeIndex].startsWith("#") && lines[resumeIndex].trim().length > 0) {
-          skipped++
-        }
       }
       
-      console.log(`Skipped ${skipped} content segments (target: ${segmentsToReplace}) from index ${skipStartIndex} to ${resumeIndex}`)
+      console.log(`Skipped ${skippedCount} content segments (${skippedDuration.toFixed(2)}s of ${contentSkipDuration}s target) from index ${skipStartIndex} to ${resumeIndex}`)
       
-      // Now find the actual PDT of the first content segment we're resuming at
-      // Look backward from resume point to find its PDT tag
-      let actualResumePDT: string | null = null
-      for (let j = resumeIndex; j >= 0; j--) {
-        if (lines[j].startsWith("#EXT-X-PROGRAM-DATE-TIME:")) {
-          actualResumePDT = lines[j].replace("#EXT-X-PROGRAM-DATE-TIME:", "").trim()
-          console.log(`Found actual resume PDT from content: ${actualResumePDT}`)
-          break
-        }
-      }
-      
-      // CRITICAL FIX: Insert resume PDT based on actual content timeline, not calculated offset
-      // This ensures buffer continuity - the PDT matches the actual content segment timestamp
-      if (actualResumePDT) {
-        output.push(`#EXT-X-PROGRAM-DATE-TIME:${actualResumePDT}`)
-        console.log(`Inserted resume PDT from actual content: ${actualResumePDT}`)
-      } else {
-        // Fallback: calculate if we can't find actual PDT
-        const calculatedResumePDT = addSecondsToTimestamp(startPDT, contentSkipDuration)
-        output.push(`#EXT-X-PROGRAM-DATE-TIME:${calculatedResumePDT}`)
-        console.warn(`Could not find actual resume PDT, using calculated: ${calculatedResumePDT} (SCTE-35 skip: ${contentSkipDuration}s)`)
-      }
+      // CRITICAL FIX: Calculate resume PDT as last ad PDT + total ad duration
+      // This preserves linear timeline consistency and avoids playback jumps
+      // The PDT timeline must be continuous: start -> ad segments -> resume
+      const lastAdPDT = addSecondsToTimestamp(startPDT, totalDuration)
+      output.push(`#EXT-X-PROGRAM-DATE-TIME:${lastAdPDT}`)
+      console.log(`Inserted calculated resume PDT for buffer continuity: ${lastAdPDT} (start: ${startPDT} + ${totalDuration}s)`)
       
       // Update loop index to resume point
       i = resumeIndex - 1  // -1 because outer loop will increment

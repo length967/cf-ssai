@@ -332,9 +332,6 @@ function buildAdItemsFromAd(
   }
 }
 
-// Legacy buildAdItems and createSlatePod functions removed
-// Use buildAdItemsFromAd() with slates from the database instead
-
 /**
  * Parse VAST XML using the VAST parser service
  */

@@ -1725,10 +1725,9 @@ class AdminAPI {
       const thresholdSeconds = org?.parallel_transcode_threshold || 30;
       const segmentDuration = org?.parallel_segment_duration || 10;
       
-      // For now, we estimate duration based on file size or use a simple heuristic
-      // TODO: Add proper duration probing with ffprobe
-      // Assume if file is > 10MB, it's likely > 30 seconds
-      const estimatedDuration = file.size > 10 * 1024 * 1024 ? 60 : 20; // rough estimate
+      // Estimate duration based on file size (rough heuristic)
+      // Files > 10MB are likely > 30 seconds
+      const estimatedDuration = file.size > 10 * 1024 * 1024 ? 60 : 20;
       const useParallel = parallelEnabled && estimatedDuration > thresholdSeconds;
       
       console.log(`Queueing transcode job for ad ${adId}:`, {

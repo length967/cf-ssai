@@ -22,21 +22,13 @@ seg_1002.m4s
 `;
 
 describe("utils/hls.ts", () => {
-  test("insertDiscontinuity(): injects before last media segment when no PDT provided", () => {
+  test("insertDiscontinuity(): injects before last media segment (legacy fallback)", () => {
     const out = insertDiscontinuity(ORIGIN);
     // Find the last segment line and ensure a discontinuity is inserted before it.
     const lines = out.trim().split("\n");
     const lastSegIdx = lines.findIndex((l) => l.trim() === "seg_1002.m4s");
     assert.ok(lastSegIdx > 0, "last segment not found");
     assert.equal(lines[lastSegIdx - 1].trim(), "#EXT-X-DISCONTINUITY");
-  });
-
-  test("insertDiscontinuity(): injects immediately after a matching PDT when provided", () => {
-    const out = insertDiscontinuity(ORIGIN, "2025-10-31T12:00:04Z");
-    const lines = out.trim().split("\n");
-    const pdtIdx = lines.findIndex((l) => l.includes("2025-10-31T12:00:04Z"));
-    assert.ok(pdtIdx >= 0, "PDT line not found");
-    assert.equal(lines[pdtIdx + 1].trim(), "#EXT-X-DISCONTINUITY");
   });
 
   test("addDaterangeInterstitial(): inserts a valid interstitial DATERANGE tag", () => {

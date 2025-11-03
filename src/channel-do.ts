@@ -27,10 +27,18 @@ async function loadAdState(state: DurableObjectState): Promise<AdState | null> {
 }
 
 async function saveAdState(state: DurableObjectState, s: AdState): Promise<void> {
-  await state.storage.put(AD_STATE_KEY, s)
+  // Increment version to detect concurrent modifications
+  const currentVersion = await state.storage.get<number>('ad_state_version') || 0
+  await state.storage.put({
+    [AD_STATE_KEY]: s,
+    'ad_state_version': currentVersion + 1
+  })
 }
 
 async function clearAdState(state: DurableObjectState): Promise<void> {
+  // Increment version when clearing state
+  const currentVersion = await state.storage.get<number>('ad_state_version') || 0
+  await state.storage.put('ad_state_version', currentVersion + 1)
   await state.storage.delete(AD_STATE_KEY)
 }
 
@@ -102,31 +110,70 @@ async function detectAndStoreBitrates(
 }
 
 /**
+ * Parse DATERANGE attributes from a tag line
+ */
+function parseDateRangeAttributes(line: string): Record<string, string> {
+  const attrs: Record<string, string> = {}
+  const content = line.replace('#EXT-X-DATERANGE:', '')
+  const regex = /([A-Z0-9-]+)=(?:"([^"]*)"|([^,]*))/g
+  let match
+  
+  while ((match = regex.exec(content)) !== null) {
+    const key = match[1]
+    const value = match[2] || match[3]
+    attrs[key] = value
+  }
+  
+  return attrs
+}
+
+/**
  * Strip origin SCTE-35 markers from manifest
  * Safari can be confused by origin SCTE-35 markers; we only want our own ad markers
+ * CRITICAL FIX: Properly parse DATERANGE tags to avoid breaking manifest structure
  */
 function stripOriginSCTE35Markers(manifest: string): string {
   const lines = manifest.split('\n')
   const filtered: string[] = []
-  let skipNext = false
   
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     
-    // Skip SCTE-35 related tags from origin
+    // Handle #EXT-X-DATERANGE tags with proper attribute parsing
+    if (line.startsWith('#EXT-X-DATERANGE:')) {
+      const attrs = parseDateRangeAttributes(line)
+      
+      // Keep our own interstitials
+      if (attrs['CLASS'] === 'com.apple.hls.interstitial') {
+        filtered.push(line)
+        continue
+      }
+      
+      // Skip origin SCTE-35 markers (SCTE35-CMD, SCTE35-OUT, SCTE35-IN)
+      if (attrs['SCTE35-CMD'] || attrs['SCTE35-OUT'] || attrs['SCTE35-IN']) {
+        continue
+      }
+      
+      // Skip SCTE-35 class markers
+      if (attrs['CLASS'] && (
+        attrs['CLASS'].includes('scte35') ||
+        attrs['CLASS'].includes('SCTE35')
+      )) {
+        continue
+      }
+      
+      // Keep other DATERANGE tags (chapter markers, etc.)
+      filtered.push(line)
+      continue
+    }
+    
+    // Skip legacy SCTE-35 comment markers
     if (
-      line.includes('#EXT-X-DATERANGE') ||
       line.includes('#EXT-X-CUE-OUT') ||
       line.includes('#EXT-X-CUE-IN') ||
       line.includes('## splice_insert') ||
       line.includes('## Auto Return Mode')
     ) {
-      // Skip this line unless it's OUR interstitial (has CLASS="com.apple.hls.interstitial")
-      if (line.includes('CLASS="com.apple.hls.interstitial"')) {
-        // This is our SGAI interstitial - keep it!
-        filtered.push(line)
-      }
-      // Otherwise skip origin SCTE-35 markers
       continue
     }
     
@@ -246,8 +293,6 @@ function selectAdVariant(viewerBitrate: number | null): string {
   return best.path
 }
 
-// getSlatePodFromDB function removed - use decision service with org default slate instead
-
 // -----------------------------------------------------------------------------
 // Helper: make ad decision via decision service worker
 // -----------------------------------------------------------------------------
@@ -285,6 +330,31 @@ async function decision(env: Env, adPodBase: string, channel: string, durationSe
       items: []
     }
   }
+}
+
+// -----------------------------------------------------------------------------
+// Helper: Fetch with exponential backoff retry
+// -----------------------------------------------------------------------------
+async function fetchWithRetry(url: string, retries = 3): Promise<Response> {
+  for (let attempt = 0; attempt < retries; attempt++) {
+    try {
+      const response = await fetch(url, {
+        cf: { cacheTtl: 60, cacheEverything: true }
+      })
+      if (response.ok) return response
+      
+      console.warn(`Fetch attempt ${attempt + 1} failed with status ${response.status}: ${url}`)
+    } catch (err) {
+      console.error(`Fetch attempt ${attempt + 1} error: ${err}`)
+    }
+    
+    // Exponential backoff: 100ms, 200ms, 400ms
+    if (attempt < retries - 1) {
+      await new Promise(resolve => setTimeout(resolve, Math.pow(2, attempt) * 100))
+    }
+  }
+  
+  throw new Error(`Failed to fetch after ${retries} retries: ${url}`)
 }
 
 // -----------------------------------------------------------------------------
@@ -351,10 +421,13 @@ export class ChannelDO {
         })
       }
       
-      // Fetch slate playlist
-      const playlistResponse = await fetch(slateVariant.url)
-      if (!playlistResponse.ok) {
-        console.error(`Failed to fetch slate playlist: ${slateVariant.url}`)
+      // Fetch slate playlist with retry
+      const playlistResponse = await fetchWithRetry(slateVariant.url, 3).catch(err => {
+        console.error(`Failed to fetch slate playlist after retries: ${slateVariant.url}`, err)
+        return null
+      })
+      
+      if (!playlistResponse) {
         return []
       }
       
@@ -418,6 +491,9 @@ export class ChannelDO {
   }
 
   async fetch(req: Request): Promise<Response> {
+    // CRITICAL FIX: Load ad state version before blocking to detect mid-request changes
+    const initialAdStateVersion = await this.state.storage.get<number>('ad_state_version') || 0
+    
     return await this.state.blockConcurrencyWhile(async () => {
       const u = new URL(req.url)
 
@@ -521,8 +597,15 @@ export class ChannelDO {
       }
 
       // Load live ad state (if any) - this takes priority over other signals
+      // Check if state was modified during request queueing
+      const currentAdStateVersion = await this.state.storage.get<number>('ad_state_version') || 0
       let adState = await loadAdState(this.state)
       let adActive = !!adState && Date.now() < adState.endsAt
+      
+      // If version changed, state was updated by /cue API or another request
+      if (currentAdStateVersion !== initialAdStateVersion) {
+        console.log(`Ad state version changed during request (${initialAdStateVersion} -> ${currentAdStateVersion}), using latest state`)
+      }
 
       // Parse SCTE-35 signals from origin manifest (with enhanced binary parsing)
       const scte35Signals = parseSCTE35FromManifest(origin)
@@ -605,9 +688,10 @@ export class ChannelDO {
           // Only create new ad state if one doesn't exist (don't overwrite existing)
           if (!adActive) {
             const startTime = scte35StartPDT ? new Date(scte35StartPDT).getTime() : now
-            // CRITICAL FIX: Round duration to 2 decimal places to avoid floating-point drift
+          // CRITICAL FIX: Use integer milliseconds to avoid floating-point drift
             // This prevents HLS.js from detecting schedule changes mid-playback
-            const stableDuration = Math.round(breakDurationSec * 100) / 100
+            const durationMs = Math.round(breakDurationSec * 1000)
+            const stableDuration = durationMs / 1000  // Exact representation
             
             // CRITICAL: Use stable, time-based ID to prevent HLS.js from canceling interstitials
             // The ID must remain constant across all manifest requests during the break
@@ -659,9 +743,10 @@ export class ChannelDO {
           console.log(`Using persisted ad state: start=${startISO}, duration=${stableDuration}s`)
         } else {
           startISO = scte35StartPDT || new Date(Math.floor(now / 1000) * 1000).toISOString()
-          // Round duration to avoid floating-point precision issues
-          stableDuration = Math.round(breakDurationSec * 100) / 100
-          console.log(`Using calculated values: start=${startISO}, duration=${stableDuration}s (rounded from ${breakDurationSec}s)`)
+          // Use integer milliseconds to avoid floating-point precision issues
+          const durationMs = Math.round(breakDurationSec * 1000)
+          stableDuration = durationMs / 1000  // Exact representation
+          console.log(`Using calculated values: start=${startISO}, duration=${stableDuration}s (from ${breakDurationSec}s)`)
         }
         
         // Extract viewer bitrate from variant and select matching ad pod
@@ -767,12 +852,9 @@ export class ChannelDO {
               const baseUrl = adItem.playlistUrl.replace("/playlist.m3u8", "")
               
               // Fetch the actual ad playlist to get real segment URLs
+              // CRITICAL FIX: Add retry logic with exponential backoff
               try {
-                const playlistResponse = await fetch(adItem.playlistUrl)
-                if (!playlistResponse.ok) {
-                  console.error(`Failed to fetch ad playlist: ${adItem.playlistUrl} - ${playlistResponse.status}`)
-                  throw new Error(`Ad playlist fetch failed: ${playlistResponse.status}`)
-                }
+                const playlistResponse = await fetchWithRetry(adItem.playlistUrl, 3)
                 
                 const playlistContent = await playlistResponse.text()
                 const adSegments: Array<{url: string, duration: number}> = []

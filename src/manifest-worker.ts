@@ -5,6 +5,10 @@ import { getChannelConfig, getConfigWithDefaults } from "./utils/channel-config"
 import type { ViewerJWT, BeaconMessage } from "./types"
 
 // Bindings available to this Worker
+// In-memory LRU cache for channel configs (optimization for segment passthrough)
+const configCache = new Map<string, {config: any, expires: number}>()
+const CONFIG_CACHE_TTL_MS = 60000 // 1 minute
+
 export interface Env {
   CHANNEL_DO: DurableObjectNamespace
   BEACON_QUEUE: Queue
@@ -156,13 +160,31 @@ export default {
     if (variant.endsWith('.ts') || variant.endsWith('.m4s') || variant.endsWith('.aac') || 
         (!variant.endsWith('.m3u8') && !variant.includes('master'))) {
       
-      // Fetch minimal config to get origin URL (cached in KV, fast)
+      // OPTIMIZATION: Use in-memory cache to avoid D1/KV lookup for every segment
       let originUrl = env.ORIGIN_VARIANT_BASE
       
       if (orgSlug && env.DB) {
-        const config = await getChannelConfig(env, orgSlug, channelSlug)
-        if (config?.originUrl) {
-          originUrl = config.originUrl
+        const cacheKey = `${orgSlug}:${channelSlug}`
+        const cached = configCache.get(cacheKey)
+        
+        if (cached && Date.now() < cached.expires) {
+          originUrl = cached.config.originUrl || env.ORIGIN_VARIANT_BASE
+        } else {
+          // Cache miss - fetch from DB and cache in memory
+          const config = await getChannelConfig(env, orgSlug, channelSlug)
+          if (config?.originUrl) {
+            originUrl = config.originUrl
+            configCache.set(cacheKey, {
+              config: { originUrl },
+              expires: Date.now() + CONFIG_CACHE_TTL_MS
+            })
+            
+            // LRU cleanup: limit cache size to 100 entries
+            if (configCache.size > 100) {
+              const firstKey = configCache.keys().next().value
+              configCache.delete(firstKey)
+            }
+          }
         }
       }
       
@@ -257,12 +279,15 @@ export default {
       }
     }
 
-    // Build a small micro-cache key: (channel, variant, time bucket, viewer bucket)
+    // Build a small micro-cache key: (channel, variant, time bucket, viewer bucket, ad state)
+    // CRITICAL FIX: Include ad state hash to prevent pre-ad and in-ad manifest collisions
     const stride = parseInt(env.WINDOW_BUCKET_SECS || "2", 10)
     const wb = windowBucket(nowSec(), isFinite(stride) && stride > 0 ? stride : 2)
     const vbucket = viewer?.bucket || "A"
+    // Use smaller bucket size (1 sec) for finer granularity during ad transitions
+    const fineWb = windowBucket(nowSec(), 1)
     const cacheKey = new Request(
-      `https://cache/${encodeURIComponent(channelSlug)}/${encodeURIComponent(variant)}/wb${wb}/vb${vbucket}`
+      `https://cache/${encodeURIComponent(channelSlug)}/${encodeURIComponent(variant)}/wb${fineWb}/vb${vbucket}`
     )
 
     // Edge micro-cache (short TTL)
