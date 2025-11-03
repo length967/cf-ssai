@@ -18,13 +18,21 @@ app.post('/transcode', async (req, res) => {
   console.log('[Transcode] Starting job:', req.body);
 
   try {
-    const { adId, sourceKey, bitrates, r2Config } = req.body;
+    const { adId, sourceKey, bitrates, r2Config, isSlate, isGenerated, slateConfig } = req.body;
 
-    // Validation
-    if (!adId || !sourceKey || !bitrates || !r2Config) {
+    // Validation - different requirements for generated slates
+    if (!adId || !bitrates || !r2Config) {
       return res.status(400).json({
         success: false,
-        error: 'Missing required fields: adId, sourceKey, bitrates, r2Config'
+        error: 'Missing required fields: adId, bitrates, r2Config'
+      });
+    }
+
+    // Generated slates don't need sourceKey
+    if (!isGenerated && !sourceKey) {
+      return res.status(400).json({
+        success: false,
+        error: 'sourceKey required for non-generated content'
       });
     }
 
@@ -35,12 +43,15 @@ app.post('/transcode', async (req, res) => {
       });
     }
 
-    // Transcode video
+    // Transcode video (or generate if isGenerated)
     const result = await transcodeVideo({
       adId,
       sourceKey,
       bitrates,
       r2Config,
+      isSlate,
+      isGenerated,
+      slateConfig,
     });
 
     const duration = (Date.now() - startTime) / 1000;

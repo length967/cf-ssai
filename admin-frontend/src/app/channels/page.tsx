@@ -22,7 +22,7 @@ type Channel = {
   default_ad_duration: number
   ad_pod_base_url?: string
   sign_host?: string
-  slate_pod_id?: string
+  slate_id?: string
   time_based_auto_insert?: number
   segment_cache_max_age?: number
   manifest_cache_max_age?: number
@@ -42,10 +42,20 @@ type Organization = {
   status: string
 }
 
+type Slate = {
+  id: string
+  name: string
+  slate_type: 'video' | 'generated'
+  duration: number
+  status: string
+  text_content?: string
+}
+
 export default function ChannelsPage() {
   const router = useRouter()
   const [channels, setChannels] = useState<Channel[]>([])
   const [organization, setOrganization] = useState<Organization | null>(null)
+  const [slates, setSlates] = useState<Slate[]>([])
   const [loading, setLoading] = useState(true)
   const [showModal, setShowModal] = useState(false)
   const [editingChannel, setEditingChannel] = useState<Channel | null>(null)
@@ -68,7 +78,7 @@ export default function ChannelsPage() {
     default_ad_duration: 30,
     ad_pod_base_url: '',
     sign_host: '',
-    slate_pod_id: 'slate',
+    slate_id: '',
     time_based_auto_insert: false,
     segment_cache_max_age: 60,
     manifest_cache_max_age: 4,
@@ -89,12 +99,14 @@ export default function ChannelsPage() {
   const loadData = async () => {
     setLoading(true)
     try {
-      const [channelsData, orgData] = await Promise.all([
+      const [channelsData, orgData, slatesData] = await Promise.all([
         api.getChannels(),
-        api.getOrganization()
+        api.getOrganization(),
+        api.listSlates().catch(() => ({ slates: [] })) // Fallback if slates not available
       ])
       setChannels(channelsData.channels)
       setOrganization(orgData.organization)
+      setSlates(slatesData.slates || [])
     } catch (err: any) {
       showMessage('error', err.message || 'Failed to load data')
     } finally {
@@ -133,7 +145,7 @@ export default function ChannelsPage() {
       default_ad_duration: 30,
       ad_pod_base_url: '',
       sign_host: '',
-      slate_pod_id: 'slate',
+      slate_id: '',
       time_based_auto_insert: false,
       segment_cache_max_age: 60,
       manifest_cache_max_age: 4,
@@ -183,7 +195,7 @@ export default function ChannelsPage() {
       default_ad_duration: channel.default_ad_duration,
       ad_pod_base_url: channel.ad_pod_base_url || '',
       sign_host: channel.sign_host || '',
-      slate_pod_id: channel.slate_pod_id || 'slate',
+      slate_id: channel.slate_id || '',
       time_based_auto_insert: Boolean(channel.time_based_auto_insert),
       segment_cache_max_age: channel.segment_cache_max_age || 60,
       manifest_cache_max_age: channel.manifest_cache_max_age || 4,
@@ -718,14 +730,26 @@ export default function ChannelsPage() {
                   </div>
                   <div>
                     <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Slate Pod ID
+                      Slate Video
                     </label>
-                    <input
-                      type="text"
-                      value={formData.slate_pod_id}
-                      onChange={(e) => setFormData({ ...formData, slate_pod_id: e.target.value })}
+                    <select
+                      value={formData.slate_id}
+                      onChange={(e) => setFormData({ ...formData, slate_id: e.target.value })}
                       className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    />
+                    >
+                      <option value="">No slate (use ad pod fallback)</option>
+                      {slates.filter(s => s.status === 'ready').map(slate => (
+                        <option key={slate.id} value={slate.id}>
+                          {slate.name} ({slate.slate_type} - {slate.duration}s)
+                        </option>
+                      ))}
+                    </select>
+                    <p className="mt-1 text-sm text-gray-500">
+                      Select a slate video to pad ad breaks when ads are shorter than SCTE-35 duration.
+                      {slates.length === 0 && (
+                        <span className="text-blue-600"> No slates available - create one in the Slates section.</span>
+                      )}
+                    </p>
                   </div>
                 </div>
 

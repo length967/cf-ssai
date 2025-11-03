@@ -224,8 +224,53 @@ function createMasterPlaylist(variants) {
   return playlist;
 }
 
+// Generate slate video with FFmpeg
+async function generateSlateVideo(workDir, slateConfig) {
+  const outputFile = path.join(workDir, 'generated_slate.mp4');
+  const duration = slateConfig.duration || 10;
+  const text = slateConfig.text || '...back soon!';
+  const bgColor = slateConfig.backgroundColor || '#000000';
+  const textColor = slateConfig.textColor || '#FFFFFF';
+  const fontSize = slateConfig.fontSize || 48;
+  
+  // Convert hex colors to FFmpeg format (without #)
+  const bgHex = bgColor.replace('#', '0x');
+  
+  console.log(`[GenerateSlate] Creating ${duration}s slate with text: "${text}"`);
+  console.log(`[GenerateSlate] Colors: bg=${bgColor}, text=${textColor}, fontSize=${fontSize}`);
+  
+  // Escape text for FFmpeg drawtext filter
+  const escapedText = text.replace(/'/g, "'\\\''").replace(/:/g, '\\:');
+  
+  // Generate video with color background and text overlay
+  // Using 1280x720 resolution as default for slates
+  // Use DejaVu Sans font (installed in Alpine)
+  const cmd = `ffmpeg -f lavfi -i color=c=${bgHex}:s=1280x720:d=${duration}:r=30 \
+    -vf "drawtext=text='${escapedText}':fontfile=/usr/share/fonts/ttf-dejavu/DejaVuSans.ttf:fontcolor=${textColor}:fontsize=${fontSize}:x=(w-text_w)/2:y=(h-text_h)/2" \
+    -c:v libx264 -preset fast -crf 23 -pix_fmt yuv420p \
+    -t ${duration} \
+    "${outputFile}"`
+  
+  try {
+    console.log(`[GenerateSlate] Running FFmpeg...`);
+    await execAsync(cmd, { maxBuffer: 10 * 1024 * 1024 });
+    
+    if (!fs.existsSync(outputFile)) {
+      throw new Error('Generated slate file not created');
+    }
+    
+    const fileSize = fs.statSync(outputFile).size;
+    console.log(`[GenerateSlate] Generated slate: ${fileSize} bytes`);
+    
+    return outputFile;
+  } catch (error) {
+    console.error(`[GenerateSlate] Error:`, error.message);
+    throw new Error(`Failed to generate slate: ${error.message}`);
+  }
+}
+
 // Main transcode function
-async function transcodeVideo({ adId, sourceKey, bitrates, r2Config }) {
+async function transcodeVideo({ adId, sourceKey, bitrates, r2Config, isSlate, isGenerated, slateConfig }) {
   const workDir = `/tmp/transcode-${adId}-${Date.now()}`;
   const sourceFile = path.join(workDir, 'source.mp4');
   const outputBaseDir = path.join(workDir, 'output');
@@ -239,9 +284,22 @@ async function transcodeVideo({ adId, sourceKey, bitrates, r2Config }) {
     fs.mkdirSync(workDir, { recursive: true });
     fs.mkdirSync(outputBaseDir, { recursive: true });
     
-    // 1. Download source from R2
-    const fileSize = await downloadFromR2(r2Client, bucket, sourceKey, sourceFile);
-    console.log(`[Transcode] Source file size: ${fileSize} bytes`);
+    let fileSize;
+    
+    // 1. Get source file (either download or generate)
+    if (isGenerated && slateConfig) {
+      // Generate slate video with FFmpeg
+      console.log(`[Transcode] Generating slate video`);
+      const generatedFile = await generateSlateVideo(workDir, slateConfig);
+      // Copy to expected source location
+      fs.copyFileSync(generatedFile, sourceFile);
+      fileSize = fs.statSync(sourceFile).size;
+      console.log(`[Transcode] Using generated slate: ${fileSize} bytes`);
+    } else {
+      // Download source from R2
+      fileSize = await downloadFromR2(r2Client, bucket, sourceKey, sourceFile);
+      console.log(`[Transcode] Source file size: ${fileSize} bytes`);
+    }
     
     // 2. Get video duration
     const duration = await getVideoDuration(sourceFile);

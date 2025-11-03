@@ -1,11 +1,13 @@
 FROM node:20-alpine
 
-# Install FFmpeg and other dependencies
+# Install FFmpeg, fonts, and other dependencies
 RUN apk add --no-cache \
     ffmpeg \
     python3 \
     py3-pip \
-    ca-certificates
+    ca-certificates \
+    ttf-dejavu \
+    fontconfig
 
 # Create app directory
 WORKDIR /app

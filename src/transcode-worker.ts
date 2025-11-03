@@ -61,14 +61,18 @@ export default {
         continue;
       }
       
-      // Legacy full-video transcode job
+      // Legacy full-video transcode job (ads or slates)
       try {
-        console.log(`[TranscodeWorker] Starting full-video job for ad ${job.adId}`);
+        const isSlate = 'isSlate' in job && job.isSlate;
+        const table = isSlate ? 'slates' : 'ads';
+        const itemType = isSlate ? 'slate' : 'ad';
+        
+        console.log(`[TranscodeWorker] Starting full-video job for ${itemType} ${job.adId}`);
         
         // Update status: processing
         await env.DB.prepare(`
-          UPDATE ads 
-          SET transcode_status = 'processing', 
+          UPDATE ${table} 
+          SET status = 'transcoding', 
               updated_at = ?
           WHERE id = ?
         `).bind(Date.now(), job.adId).run();
@@ -88,17 +92,39 @@ export default {
         };
         
         // Call container to transcode
-        console.log(`[TranscodeWorker] Calling FFmpeg container for ad ${job.adId}`);
+        console.log(`[TranscodeWorker] Calling FFmpeg container for ${itemType} ${job.adId}`);
         const containerUrl = env.CONTAINER_URL || 'http://localhost:8080';
+        
+        // Build request body based on type
+        const requestBody: any = {
+          adId: job.adId,
+          bitrates: job.bitrates,
+          r2Config,
+        };
+        
+        // Add slate-specific configuration
+        if (isSlate) {
+          requestBody.isSlate = true;
+          if ('isGenerated' in job && job.isGenerated) {
+            // Generated slate - no source key needed
+            requestBody.isGenerated = true;
+            requestBody.slateConfig = job.slateConfig;
+            console.log(`[TranscodeWorker] Generated slate config:`, job.slateConfig);
+          } else {
+            // Uploaded slate - needs source key
+            requestBody.sourceKey = job.sourceKey;
+          }
+        } else {
+          // Regular ad - needs source key
+          requestBody.sourceKey = job.sourceKey;
+        }
+        
+        console.log(`[TranscodeWorker] Request body:`, JSON.stringify(requestBody, null, 2));
+        
         const response = await containerInstance.fetch(`${containerUrl}/transcode`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            adId: job.adId,
-            sourceKey: job.sourceKey,
-            bitrates: job.bitrates,
-            r2Config,
-          }),
+          body: JSON.stringify(requestBody),
         });
         
         if (!response.ok) {
@@ -112,30 +138,48 @@ export default {
           throw new Error(result.error || 'Transcode failed');
         }
         
-        console.log(`[TranscodeWorker] Transcode successful for ad ${job.adId}:`, result);
+        console.log(`[TranscodeWorker] Transcode successful for ${itemType} ${job.adId}:`, result);
         
         // Update database with results
-        await env.DB.prepare(`
-          UPDATE ads 
-          SET transcode_status = 'ready',
-              variants = ?,
-              master_playlist_url = ?,
-              duration = ?,
-              transcoded_at = ?,
-              error_message = NULL,
-              updated_at = ?
-          WHERE id = ?
-        `).bind(
-          JSON.stringify(result.variants),
-          result.masterUrl,
-          result.duration,
-          Date.now(),
-          Date.now(),
-          job.adId
-        ).run();
+        if (isSlate) {
+          await env.DB.prepare(`
+            UPDATE slates 
+            SET status = 'ready',
+                variants = ?,
+                master_playlist_url = ?,
+                duration = ?,
+                updated_at = ?
+            WHERE id = ?
+          `).bind(
+            JSON.stringify(result.variants),
+            result.masterUrl,
+            result.duration,
+            Date.now(),
+            job.adId
+          ).run();
+        } else {
+          await env.DB.prepare(`
+            UPDATE ads 
+            SET transcode_status = 'ready',
+                variants = ?,
+                master_playlist_url = ?,
+                duration = ?,
+                transcoded_at = ?,
+                error_message = NULL,
+                updated_at = ?
+            WHERE id = ?
+          `).bind(
+            JSON.stringify(result.variants),
+            result.masterUrl,
+            result.duration,
+            Date.now(),
+            Date.now(),
+            job.adId
+          ).run();
+        }
         
         const processingTime = (Date.now() - startTime) / 1000;
-        console.log(`[TranscodeWorker] Job completed for ad ${job.adId} in ${processingTime}s`);
+        console.log(`[TranscodeWorker] Job completed for ${itemType} ${job.adId} in ${processingTime}s`);
         
         // Release on-demand transcode lock if applicable
         if (job.isOnDemand) {
@@ -150,15 +194,20 @@ export default {
         message.ack();
         
       } catch (error: any) {
+        const isSlate = 'isSlate' in job && job.isSlate;
+        const table = isSlate ? 'slates' : 'ads';
+        const itemType = isSlate ? 'slate' : 'ad';
+        const statusField = isSlate ? 'status' : 'transcode_status';
+        
         const processingTime = (Date.now() - startTime) / 1000;
-        console.error(`[TranscodeWorker] Job failed for ad ${job.adId} after ${processingTime}s:`, error);
+        console.error(`[TranscodeWorker] Job failed for ${itemType} ${job.adId} after ${processingTime}s:`, error);
         
         const retryCount = (job.retryCount || 0) + 1;
         const maxRetries = 3;
         
         if (retryCount < maxRetries) {
           // Retry the job
-          console.log(`[TranscodeWorker] Retrying job for ad ${job.adId} (attempt ${retryCount + 1}/${maxRetries})`);
+          console.log(`[TranscodeWorker] Retrying job for ${itemType} ${job.adId} (attempt ${retryCount + 1}/${maxRetries})`);
           
           // Update retry count and requeue
           message.retry({
@@ -166,30 +215,40 @@ export default {
           });
           
           // Update status in database
-          await env.DB.prepare(`
-            UPDATE ads 
-            SET transcode_status = 'queued',
-                error_message = ?,
-                updated_at = ?
-            WHERE id = ?
-          `).bind(
-            `Retry ${retryCount}/${maxRetries}: ${error.message}`,
-            Date.now(),
-            job.adId
-          ).run();
+          if (isSlate) {
+            await env.DB.prepare(`
+              UPDATE slates 
+              SET status = 'pending',
+                  updated_at = ?
+              WHERE id = ?
+            `).bind(
+              Date.now(),
+              job.adId
+            ).run();
+          } else {
+            await env.DB.prepare(`
+              UPDATE ads 
+              SET transcode_status = 'queued',
+                  error_message = ?,
+                  updated_at = ?
+              WHERE id = ?
+            `).bind(
+              `Retry ${retryCount}/${maxRetries}: ${error.message}`,
+              Date.now(),
+              job.adId
+            ).run();
+          }
           
         } else {
           // Max retries exceeded, mark as error
-          console.error(`[TranscodeWorker] Max retries exceeded for ad ${job.adId}`);
+          console.error(`[TranscodeWorker] Max retries exceeded for ${itemType} ${job.adId}`);
           
           await env.DB.prepare(`
-            UPDATE ads 
-            SET transcode_status = 'error',
-                error_message = ?,
+            UPDATE ${table} 
+            SET ${statusField} = 'error',
                 updated_at = ?
             WHERE id = ?
           `).bind(
-            `Failed after ${maxRetries} attempts: ${error.message}`,
             Date.now(),
             job.adId
           ).run();

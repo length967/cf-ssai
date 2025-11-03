@@ -1297,8 +1297,10 @@ class AdminAPI {
       ).run()
       
       // Queue generation job (transcode worker will handle FFmpeg generation)
+      // No sourceKey needed for generated slates - FFmpeg will create from scratch
       await this.env.TRANSCODE_QUEUE.send({
         adId: slateId,
+        sourceKey: null, // Generated slates don't have a source
         bitrates: bitrates,
         organizationId: auth.organizationId,
         channelId: channel_id || undefined,
@@ -1390,7 +1392,7 @@ class AdminAPI {
       // Queue transcoding job
       await this.env.TRANSCODE_QUEUE.send({
         adId: slateId,
-        sourceUrl: sourceVideoUrl,
+        sourceKey: sourceKey, // R2 key for the uploaded video
         bitrates: bitrates,
         organizationId: auth.organizationId,
         channelId: channelId || undefined,
