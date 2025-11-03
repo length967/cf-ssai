@@ -3,6 +3,12 @@
 import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { api } from '@/lib/api'
+import { Button } from '@/components/ui/button'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { CheckCircle2, XCircle } from 'lucide-react'
 
 type Tab = 'organization' | 'workers' | 'users' | 'api-keys'
 
@@ -260,9 +266,12 @@ export default function SettingsPage() {
 
           {/* Message banner */}
           {message && (
-            <div className={`mb-6 p-4 rounded-lg ${message.type === 'success' ? 'bg-green-50 text-green-800 border border-green-200' : 'bg-red-50 text-red-800 border border-red-200'}`}>
-              {message.text}
-            </div>
+            <Alert variant={message.type === 'error' ? 'destructive' : 'default'} className={message.type === 'success' ? 'border-green-500 bg-green-50 mb-6' : 'mb-6'}>
+              {message.type === 'success' ? <CheckCircle2 className="h-4 w-4 text-green-600" /> : <XCircle className="h-4 w-4" />}
+              <AlertDescription className={message.type === 'success' ? 'text-green-600' : ''}>
+                {message.text}
+              </AlertDescription>
+            </Alert>
           )}
 
           {/* Tabs */}
@@ -325,51 +334,43 @@ export default function SettingsPage() {
                   
                   <div className="space-y-6">
                     <div className="grid grid-cols-2 gap-6">
-                      <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                          Organization Name
-                        </label>
-                        <input
+                      <div className="space-y-2">
+                        <Label htmlFor="org-name">Organization Name</Label>
+                        <Input
+                          id="org-name"
                           type="text"
                           value={orgName}
                           onChange={(e) => setOrgName(e.target.value)}
-                          className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                         />
                       </div>
-                      <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                          Slug
-                        </label>
-                        <input
+                      <div className="space-y-2">
+                        <Label htmlFor="org-slug">Slug</Label>
+                        <Input
+                          id="org-slug"
                           type="text"
                           value={orgSlug}
                           disabled
-                          className="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100"
                         />
                       </div>
                     </div>
 
                     <div className="grid grid-cols-2 gap-6">
-                      <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                          Plan
-                        </label>
-                        <input
+                      <div className="space-y-2">
+                        <Label htmlFor="org-plan">Plan</Label>
+                        <Input
+                          id="org-plan"
                           type="text"
                           value={orgPlan}
                           disabled
-                          className="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100"
                         />
                       </div>
-                      <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                          Status
-                        </label>
-                        <input
+                      <div className="space-y-2">
+                        <Label htmlFor="org-status">Status</Label>
+                        <Input
+                          id="org-status"
                           type="text"
                           value={orgStatus}
                           disabled
-                          className="w-full px-3 py-2 border border-gray-300 rounded-md bg-gray-100"
                         />
                       </div>
                     </div>
@@ -378,41 +379,35 @@ export default function SettingsPage() {
 
                     <h3 className="text-lg font-semibold mb-4">Default Settings</h3>
 
-                    <div>
-                      <label className="block text-sm font-medium text-gray-700 mb-2">
-                        Default VAST URL
-                      </label>
-                      <input
+                    <div className="space-y-2">
+                      <Label htmlFor="vast-url">Default VAST URL</Label>
+                      <Input
+                        id="vast-url"
                         type="text"
                         value={orgSettings.default_vast_url}
                         onChange={(e) => setOrgSettings({ ...orgSettings, default_vast_url: e.target.value })}
                         placeholder="https://example.com/vast.xml"
-                        className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                       />
-                      <p className="mt-1 text-sm text-gray-500">Default VAST server URL for new channels</p>
+                      <p className="text-sm text-muted-foreground">Default VAST server URL for new channels</p>
                     </div>
 
                     <div className="grid grid-cols-2 gap-6">
-                      <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                          VAST Timeout (ms)
-                        </label>
-                        <input
+                      <div className="space-y-2">
+                        <Label htmlFor="vast-timeout">VAST Timeout (ms)</Label>
+                        <Input
+                          id="vast-timeout"
                           type="number"
                           value={orgSettings.default_vast_timeout_ms}
                           onChange={(e) => setOrgSettings({ ...orgSettings, default_vast_timeout_ms: parseInt(e.target.value) })}
-                          className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                         />
                       </div>
-                      <div>
-                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                          Default Ad Duration (sec)
-                        </label>
-                        <input
+                      <div className="space-y-2">
+                        <Label htmlFor="ad-duration">Default Ad Duration (sec)</Label>
+                        <Input
+                          id="ad-duration"
                           type="number"
                           value={orgSettings.default_ad_duration}
                           onChange={(e) => setOrgSettings({ ...orgSettings, default_ad_duration: parseInt(e.target.value) })}
-                          className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                         />
                       </div>
                     </div>
@@ -567,13 +562,13 @@ export default function SettingsPage() {
                     </div>
 
                     <div className="mt-6 flex justify-end">
-                      <button
+                      <Button
                         onClick={saveOrganizationSettings}
                         disabled={saving}
-                        className="px-6 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                        variant="default"
                       >
                         {saving ? 'Saving...' : 'Save Settings'}
-                      </button>
+                      </Button>
                     </div>
                   </div>
                 </div>
@@ -699,13 +694,13 @@ export default function SettingsPage() {
                     </div>
 
                     <div className="mt-6 flex justify-end">
-                      <button
+                      <Button
                         onClick={saveWorkerConfig}
                         disabled={saving}
-                        className="px-6 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                        variant="default"
                       >
                         {saving ? 'Saving...' : 'Save Configuration'}
-                      </button>
+                      </Button>
                     </div>
                   </div>
                 </div>
@@ -772,13 +767,13 @@ export default function SettingsPage() {
                     </div>
 
                     <div className="mt-6 flex justify-end">
-                      <button
+                      <Button
                         onClick={createUser}
                         disabled={saving}
-                        className="px-6 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                        variant="default"
                       >
                         {saving ? 'Creating...' : 'Create User'}
-                      </button>
+                      </Button>
                     </div>
                   </div>
 
@@ -956,13 +951,13 @@ export default function SettingsPage() {
                     </div>
 
                     <div className="mt-6 flex justify-end">
-                      <button
+                      <Button
                         onClick={createApiKey}
                         disabled={saving}
-                        className="px-6 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                        variant="default"
                       >
                         {saving ? 'Creating...' : 'Create API Key'}
-                      </button>
+                      </Button>
                     </div>
                   </div>
 

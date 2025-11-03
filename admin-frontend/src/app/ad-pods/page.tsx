@@ -4,6 +4,14 @@ import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { api } from '@/lib/api'
 import Navigation from '@/components/Navigation'
+import { Button } from '@/components/ui/button'
+import { StatusBadge } from '@/components/ui/status-badge'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { CheckCircle2, XCircle } from 'lucide-react'
 
 type AdPod = {
   id: string
@@ -272,19 +280,22 @@ export default function AdPodsPage() {
               <h1 className="text-3xl font-bold text-gray-900">Ad Pods</h1>
               <p className="mt-2 text-gray-600">Manage your pre-transcoded ad assets</p>
             </div>
-            <button
+            <Button
               onClick={openCreateModal}
-              className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              variant="default"
             >
               + New Ad Pod
-            </button>
+            </Button>
           </div>
 
           {/* Message banner */}
           {message && (
-            <div className={`mb-6 p-4 rounded-lg ${message.type === 'success' ? 'bg-green-50 text-green-800 border border-green-200' : 'bg-red-50 text-red-800 border border-red-200'}`}>
-              {message.text}
-            </div>
+            <Alert variant={message.type === 'error' ? 'destructive' : 'default'} className={message.type === 'success' ? 'border-green-500 bg-green-50 mb-6' : 'mb-6'}>
+              {message.type === 'success' ? <CheckCircle2 className="h-4 w-4 text-green-600" /> : <XCircle className="h-4 w-4" />}
+              <AlertDescription className={message.type === 'success' ? 'text-green-600' : ''}>
+                {message.text}
+              </AlertDescription>
+            </Alert>
           )}
 
           {/* Ad Pods List */}
@@ -295,12 +306,12 @@ export default function AdPodsPage() {
           ) : adPods.length === 0 ? (
             <div className="bg-white shadow rounded-lg p-12 text-center">
               <p className="text-gray-600 mb-4">No ad pods yet. Create your first ad pod to get started.</p>
-              <button
+              <Button
                 onClick={openCreateModal}
-                className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
+                variant="default"
               >
                 Create Ad Pod
-              </button>
+              </Button>
             </div>
           ) : (
             <div className="grid gap-6 md:grid-cols-2 lg:grid-cols-3">
@@ -313,13 +324,9 @@ export default function AdPodsPage() {
                         <h3 className="text-lg font-semibold text-gray-900">{pod.name}</h3>
                         <p className="text-sm text-gray-500">{pod.pod_id}</p>
                       </div>
-                      <span className={`px-2 py-1 text-xs font-semibold rounded-full ${
-                        pod.status === 'active' 
-                          ? 'bg-green-100 text-green-800' 
-                          : 'bg-gray-100 text-gray-800'
-                      }`}>
-                        {pod.status}
-                      </span>
+                      <StatusBadge
+                        status={pod.status === 'active' ? 'active' : 'archived'}
+                      />
                     </div>
 
                     <div className="space-y-2 text-sm">
@@ -340,18 +347,21 @@ export default function AdPodsPage() {
                     </div>
 
                     <div className="mt-4 flex gap-2">
-                      <button
+                      <Button
                         onClick={() => openEditModal(pod)}
-                        className="flex-1 px-3 py-2 text-sm border border-blue-600 text-blue-600 rounded-md hover:bg-blue-50"
+                        variant="outline"
+                        size="sm"
+                        className="flex-1"
                       >
                         Edit
-                      </button>
-                      <button
+                      </Button>
+                      <Button
                         onClick={() => handleDelete(pod)}
-                        className="px-3 py-2 text-sm border border-red-600 text-red-600 rounded-md hover:bg-red-50"
+                        variant="destructive"
+                        size="sm"
                       >
                         Delete
-                      </button>
+                      </Button>
                     </div>
                   </div>
                 )
@@ -362,97 +372,94 @@ export default function AdPodsPage() {
       </main>
 
       {/* Modal */}
-      {showModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-lg max-w-4xl w-full max-h-[90vh] overflow-y-auto">
-            <div className="p-6 border-b">
-              <h2 className="text-2xl font-bold">
-                {editingPod ? 'Edit Ad Pod' : 'Create New Ad Pod'}
-              </h2>
-            </div>
+      <Dialog open={showModal} onOpenChange={setShowModal}>
+        <DialogContent className="max-w-4xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>
+              {editingPod ? 'Edit Ad Pod' : 'Create New Ad Pod'}
+            </DialogTitle>
+            <DialogDescription>
+              Configure ad pod bitrate variants and tracking
+            </DialogDescription>
+          </DialogHeader>
 
-            <form onSubmit={handleSubmit} className="p-6 space-y-6">
-              {/* Basic Information */}
-              <div>
-                <h3 className="text-lg font-semibold mb-4">Basic Information</h3>
-                <div className="grid grid-cols-2 gap-6">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Pod Name *
-                    </label>
-                    <input
-                      type="text"
-                      value={formData.name}
-                      onChange={(e) => setFormData({ ...formData, name: e.target.value })}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      required
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Pod ID *
-                    </label>
-                    <input
-                      type="text"
-                      value={formData.pod_id}
-                      onChange={(e) => setFormData({ ...formData, pod_id: e.target.value })}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      placeholder="ad-pod-001"
-                      required
-                      disabled={!!editingPod}
-                    />
-                  </div>
+          <form onSubmit={handleSubmit} className="space-y-6">
+            {/* Basic Information */}
+            <div>
+              <h3 className="text-lg font-semibold mb-4">Basic Information</h3>
+              <div className="grid grid-cols-2 gap-6">
+                <div className="space-y-2">
+                  <Label htmlFor="pod-name">Pod Name *</Label>
+                  <Input
+                    id="pod-name"
+                    type="text"
+                    value={formData.name}
+                    onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                    required
+                  />
                 </div>
-
-                <div className="grid grid-cols-2 gap-6 mt-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Duration (seconds)
-                    </label>
-                    <input
-                      type="number"
-                      value={formData.duration_sec}
-                      onChange={(e) => setFormData({ ...formData, duration_sec: parseInt(e.target.value) })}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      required
-                    />
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">
-                      Status
-                    </label>
-                    <select
-                      value={formData.status}
-                      onChange={(e) => setFormData({ ...formData, status: e.target.value })}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
-                    >
-                      <option value="active">Active</option>
-                      <option value="archived">Archived</option>
-                    </select>
-                  </div>
+                <div className="space-y-2">
+                  <Label htmlFor="pod-id">Pod ID *</Label>
+                  <Input
+                    id="pod-id"
+                    type="text"
+                    value={formData.pod_id}
+                    onChange={(e) => setFormData({ ...formData, pod_id: e.target.value })}
+                    placeholder="ad-pod-001"
+                    required
+                    disabled={!!editingPod}
+                  />
                 </div>
               </div>
+
+              <div className="grid grid-cols-2 gap-6 mt-4">
+                <div className="space-y-2">
+                  <Label htmlFor="duration">Duration (seconds)</Label>
+                  <Input
+                    id="duration"
+                    type="number"
+                    value={formData.duration_sec}
+                    onChange={(e) => setFormData({ ...formData, duration_sec: parseInt(e.target.value) })}
+                    required
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label htmlFor="status">Status</Label>
+                  <Select value={formData.status} onValueChange={(value) => setFormData({ ...formData, status: value })}>
+                    <SelectTrigger id="status">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="active">Active</SelectItem>
+                      <SelectItem value="archived">Archived</SelectItem>
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
+            </div>
 
               {/* Assets (Bitrate Variants) */}
               <div>
                 <div className="flex justify-between items-center mb-4">
                   <h3 className="text-lg font-semibold">Bitrate Variants</h3>
                   <div className="flex gap-2">
-                    <button
+                    <Button
                       type="button"
                       onClick={loadAdsLibrary}
                       disabled={loadingAds}
-                      className="px-3 py-1 text-sm bg-green-600 text-white rounded-md hover:bg-green-700 disabled:opacity-50"
+                      variant="secondary"
+                      size="sm"
                     >
                       🎬 Browse Ads Library
-                    </button>
-                    <button
+                    </Button>
+                    <Button
                       type="button"
                       onClick={addAsset}
-                      className="px-3 py-1 text-sm bg-blue-600 text-white rounded-md hover:bg-blue-700"
+                      variant="default"
+                      size="sm"
                     >
                       + Add Variant
-                    </button>
+                    </Button>
                   </div>
                 </div>
                 
@@ -463,39 +470,37 @@ export default function AdPodsPage() {
                 <div className="space-y-4">
                   {formData.assets.map((asset, index) => (
                     <div key={index} className="flex gap-4 items-start p-4 border border-gray-200 rounded-md">
-                      <div className="flex-1">
-                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                          Bitrate (bps)
-                        </label>
-                        <input
+                      <div className="flex-1 space-y-2">
+                        <Label htmlFor={`bitrate-${index}`}>Bitrate (bps)</Label>
+                        <Input
+                          id={`bitrate-${index}`}
                           type="number"
                           value={asset.bitrate}
                           onChange={(e) => updateAsset(index, 'bitrate', parseInt(e.target.value))}
-                          className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                           required
                         />
                       </div>
-                      <div className="flex-[2]">
-                        <label className="block text-sm font-medium text-gray-700 mb-2">
-                          Playlist URL
-                        </label>
-                        <input
+                      <div className="flex-[2] space-y-2">
+                        <Label htmlFor={`url-${index}`}>Playlist URL</Label>
+                        <Input
+                          id={`url-${index}`}
                           type="text"
                           value={asset.url}
                           onChange={(e) => updateAsset(index, 'url', e.target.value)}
-                          className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500"
                           placeholder="https://ads.example.com/pod/v_800k/playlist.m3u8"
                           required
                         />
                       </div>
                       {formData.assets.length > 1 && (
-                        <button
+                        <Button
                           type="button"
                           onClick={() => removeAsset(index)}
-                          className="mt-8 px-3 py-2 text-red-600 hover:bg-red-50 rounded-md"
+                          variant="ghost"
+                          size="sm"
+                          className="mt-8 text-destructive hover:text-destructive"
                         >
                           Remove
-                        </button>
+                        </Button>
                       )}
                     </div>
                   ))}
@@ -569,45 +574,37 @@ export default function AdPodsPage() {
               </div>
 
               {/* Form Actions */}
-              <div className="flex justify-end gap-4 pt-6 border-t">
-                <button
+              <DialogFooter>
+                <Button
                   type="button"
                   onClick={() => setShowModal(false)}
-                  className="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50"
+                  variant="outline"
                 >
                   Cancel
-                </button>
-                <button
+                </Button>
+                <Button
                   type="submit"
                   disabled={saving}
-                  className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:opacity-50"
+                  variant="default"
                 >
                   {saving ? 'Saving...' : editingPod ? 'Update Ad Pod' : 'Create Ad Pod'}
-                </button>
-              </div>
+                </Button>
+              </DialogFooter>
             </form>
-          </div>
-        </div>
-      )}
+        </DialogContent>
+      </Dialog>
 
       {/* Ads Library Modal */}
-      {showAdsLibrary && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-lg max-w-5xl w-full max-h-[90vh] overflow-y-auto">
-            <div className="p-6 border-b flex justify-between items-center">
-              <div>
-                <h2 className="text-2xl font-bold">Browse Ads Library</h2>
-                <p className="text-sm text-gray-600 mt-1">Select an ad to auto-populate bitrate variants</p>
-              </div>
-              <button
-                onClick={() => setShowAdsLibrary(false)}
-                className="text-2xl text-gray-400 hover:text-gray-600"
-              >
-                &times;
-              </button>
-            </div>
+      <Dialog open={showAdsLibrary} onOpenChange={setShowAdsLibrary}>
+        <DialogContent className="max-w-5xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Browse Ads Library</DialogTitle>
+            <DialogDescription>
+              Select an ad to auto-populate bitrate variants
+            </DialogDescription>
+          </DialogHeader>
 
-            <div className="p-6">
+          <div>
               {loadingAds ? (
                 <div className="text-center py-12">
                   <div className="animate-spin rounded-full h-8 w-8 border-b-2 border-blue-600 mx-auto"></div>
@@ -618,12 +615,12 @@ export default function AdPodsPage() {
                   <div className="text-6xl mb-4">🎬</div>
                   <h3 className="text-lg font-semibold text-gray-900 mb-2">No ready ads yet</h3>
                   <p className="text-gray-600 mb-6">Upload and process ads in the Ads Library first</p>
-                  <a
-                    href="/ads"
-                    className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 inline-block"
+                  <Button
+                    onClick={() => window.location.href = '/ads'}
+                    variant="default"
                   >
                     Go to Ads Library
-                  </a>
+                  </Button>
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -650,10 +647,9 @@ export default function AdPodsPage() {
                   ))}
                 </div>
               )}
-            </div>
           </div>
-        </div>
-      )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }

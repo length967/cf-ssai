@@ -2,6 +2,8 @@
 
 import { useRouter, usePathname } from 'next/navigation'
 import { api } from '@/lib/api'
+import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/utils'
 
 export default function Navigation() {
   const router = useRouter()
@@ -22,89 +24,96 @@ export default function Navigation() {
             >
               SSAI Admin
             </button>
-            <nav className="ml-8 flex space-x-4">
+            <nav className="ml-8 flex space-x-1">
               <a
                 href="/"
-                className={`px-3 py-2 ${
+                className={cn(
+                  "px-3 py-2 rounded-md text-sm font-medium transition-colors",
                   pathname === '/'
-                    ? 'text-blue-600 font-medium'
-                    : 'text-gray-600 hover:text-gray-900'
-                }`}
+                    ? "bg-primary/10 text-primary border-b-2 border-primary"
+                    : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                )}
               >
                 Dashboard
               </a>
               <a
                 href="/channels"
-                className={`px-3 py-2 ${
+                className={cn(
+                  "px-3 py-2 rounded-md text-sm font-medium transition-colors",
                   isActive('/channels')
-                    ? 'text-blue-600 font-medium'
-                    : 'text-gray-600 hover:text-gray-900'
-                }`}
+                    ? "bg-primary/10 text-primary border-b-2 border-primary"
+                    : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                )}
               >
                 Channels
               </a>
               <a
                 href="/ads"
-                className={`px-3 py-2 ${
+                className={cn(
+                  "px-3 py-2 rounded-md text-sm font-medium transition-colors",
                   isActive('/ads')
-                    ? 'text-blue-600 font-medium'
-                    : 'text-gray-600 hover:text-gray-900'
-                }`}
+                    ? "bg-primary/10 text-primary border-b-2 border-primary"
+                    : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                )}
               >
                 Ads Library
               </a>
               <a
                 href="/ad-pods"
-                className={`px-3 py-2 ${
+                className={cn(
+                  "px-3 py-2 rounded-md text-sm font-medium transition-colors",
                   isActive('/ad-pods')
-                    ? 'text-blue-600 font-medium'
-                    : 'text-gray-600 hover:text-gray-900'
-                }`}
+                    ? "bg-primary/10 text-primary border-b-2 border-primary"
+                    : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                )}
               >
                 Ad Pods
               </a>
               <a
                 href="/slates"
-                className={`px-3 py-2 ${
+                className={cn(
+                  "px-3 py-2 rounded-md text-sm font-medium transition-colors",
                   isActive('/slates')
-                    ? 'text-blue-600 font-medium'
-                    : 'text-gray-600 hover:text-gray-900'
-                }`}
+                    ? "bg-primary/10 text-primary border-b-2 border-primary"
+                    : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                )}
               >
                 Slates
               </a>
               <a
                 href="/analytics"
-                className={`px-3 py-2 ${
+                className={cn(
+                  "px-3 py-2 rounded-md text-sm font-medium transition-colors",
                   isActive('/analytics')
-                    ? 'text-blue-600 font-medium'
-                    : 'text-gray-600 hover:text-gray-900'
-                }`}
+                    ? "bg-primary/10 text-primary border-b-2 border-primary"
+                    : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                )}
               >
                 Analytics
               </a>
               <a
                 href="/settings"
-                className={`px-3 py-2 ${
+                className={cn(
+                  "px-3 py-2 rounded-md text-sm font-medium transition-colors",
                   isActive('/settings')
-                    ? 'text-blue-600 font-medium'
-                    : 'text-gray-600 hover:text-gray-900'
-                }`}
+                    ? "bg-primary/10 text-primary border-b-2 border-primary"
+                    : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                )}
               >
                 Settings
               </a>
             </nav>
           </div>
           <div className="flex items-center">
-            <button
+            <Button
+              variant="ghost"
               onClick={() => {
                 api.clearToken()
                 router.push('/login')
               }}
-              className="text-sm text-gray-700 hover:text-gray-900"
             >
               Logout
-            </button>
+            </Button>
           </div>
         </div>
       </div>

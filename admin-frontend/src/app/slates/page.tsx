@@ -4,6 +4,15 @@ import { useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { api } from '@/lib/api'
 import Navigation from '@/components/Navigation'
+import { Button } from '@/components/ui/button'
+import { StatusBadge } from '@/components/ui/status-badge'
+import { Input } from '@/components/ui/input'
+import { Label } from '@/components/ui/label'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
+import { Alert, AlertDescription } from '@/components/ui/alert'
+import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Card, CardContent } from '@/components/ui/card'
+import { CheckCircle2, XCircle } from 'lucide-react'
 
 type Slate = {
   id: string
@@ -141,15 +150,6 @@ export default function SlatesPage() {
     setUploadName('')
   }
 
-  const getStatusBadgeColor = (status: string) => {
-    switch (status) {
-      case 'ready': return 'bg-green-100 text-green-800'
-      case 'pending': return 'bg-yellow-100 text-yellow-800'
-      case 'transcoding': return 'bg-blue-100 text-blue-800'
-      case 'error': return 'bg-red-100 text-red-800'
-      default: return 'bg-gray-100 text-gray-800'
-    }
-  }
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -162,18 +162,21 @@ export default function SlatesPage() {
               <h1 className="text-3xl font-bold text-gray-900">Slate Management</h1>
               <p className="mt-2 text-gray-600">"We'll Be Right Back" videos for ad break padding</p>
             </div>
-            <button
+            <Button
               onClick={() => setShowModal(true)}
-              className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
+              variant="default"
             >
               + Create Slate
-            </button>
+            </Button>
           </div>
 
           {message && (
-            <div className={`mb-6 p-4 rounded-lg ${message.type === 'success' ? 'bg-green-50 text-green-800 border border-green-200' : 'bg-red-50 text-red-800 border border-red-200'}`}>
-              {message.text}
-            </div>
+            <Alert variant={message.type === 'error' ? 'destructive' : 'default'} className={message.type === 'success' ? 'border-green-500 bg-green-50' : ''}>
+              {message.type === 'success' ? <CheckCircle2 className="h-4 w-4 text-green-600" /> : <XCircle className="h-4 w-4" />}
+              <AlertDescription className={message.type === 'success' ? 'text-green-600' : ''}>
+                {message.text}
+              </AlertDescription>
+            </Alert>
           )}
 
           {loading ? (
@@ -183,66 +186,70 @@ export default function SlatesPage() {
           ) : slates.length === 0 ? (
             <div className="bg-white shadow rounded-lg p-12 text-center">
               <p className="text-gray-600 mb-4">No slates yet. Create your first slate!</p>
-              <button
+              <Button
                 onClick={() => setShowModal(true)}
-                className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700"
+                variant="default"
               >
                 Create Slate
-              </button>
+              </Button>
             </div>
           ) : (
             <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
               {slates.map((slate) => (
-                <div key={slate.id} className="bg-white shadow rounded-lg p-6">
-                  <div className="flex justify-between items-start mb-4">
-                    <div>
-                      <h3 className="text-lg font-semibold text-gray-900">{slate.name}</h3>
-                      <p className="text-sm text-gray-500">{slate.duration}s duration</p>
-                    </div>
-                    <span className={`px-2 py-1 text-xs rounded-full ${getStatusBadgeColor(slate.status)}`}>
-                      {slate.status}
-                    </span>
-                  </div>
-                  
-                  <div className="space-y-2 mb-4">
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm text-gray-600">Type:</span>
-                      <span className="text-sm font-medium">{slate.slate_type === 'generated' ? '🎨 Generated' : '📹 Uploaded'}</span>
-                    </div>
-                    
-                    {slate.slate_type === 'generated' && (
-                      <>
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm text-gray-600">Text:</span>
-                          <span className="text-sm font-medium">{slate.text_content}</span>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <span className="text-sm text-gray-600">Colors:</span>
-                          <div className="flex gap-1">
-                            <div className="w-6 h-6 rounded border" style={{ backgroundColor: slate.background_color }}></div>
-                            <div className="w-6 h-6 rounded border" style={{ backgroundColor: slate.text_color }}></div>
-                          </div>
-                        </div>
-                      </>
-                    )}
-                    
-                    {slate.variant_count && (
-                      <div className="flex items-center gap-2">
-                        <span className="text-sm text-gray-600">Variants:</span>
-                        <span className="text-sm font-medium">{slate.variant_count}</span>
+                <Card key={slate.id}>
+                  <CardContent className="p-6">
+                    <div className="flex justify-between items-start mb-4">
+                      <div>
+                        <h3 className="text-lg font-semibold text-gray-900">{slate.name}</h3>
+                        <p className="text-sm text-gray-500">{slate.duration}s duration</p>
                       </div>
-                    )}
-                  </div>
-                  
-                  <div className="flex gap-2">
-                    <button
-                      onClick={() => handleDelete(slate)}
-                      className="flex-1 px-3 py-2 text-sm text-red-600 border border-red-300 rounded hover:bg-red-50"
-                    >
-                      Delete
-                    </button>
-                  </div>
-                </div>
+                      <StatusBadge
+                        status={slate.status as 'ready' | 'pending' | 'transcoding' | 'error'}
+                      />
+                    </div>
+
+                    <div className="space-y-2 mb-4">
+                      <div className="flex items-center gap-2">
+                        <span className="text-sm text-gray-600">Type:</span>
+                        <span className="text-sm font-medium">{slate.slate_type === 'generated' ? '🎨 Generated' : '📹 Uploaded'}</span>
+                      </div>
+
+                      {slate.slate_type === 'generated' && (
+                        <>
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm text-gray-600">Text:</span>
+                            <span className="text-sm font-medium">{slate.text_content}</span>
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="text-sm text-gray-600">Colors:</span>
+                            <div className="flex gap-1">
+                              <div className="w-6 h-6 rounded border" style={{ backgroundColor: slate.background_color }}></div>
+                              <div className="w-6 h-6 rounded border" style={{ backgroundColor: slate.text_color }}></div>
+                            </div>
+                          </div>
+                        </>
+                      )}
+
+                      {slate.variant_count && (
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm text-gray-600">Variants:</span>
+                          <span className="text-sm font-medium">{slate.variant_count}</span>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="flex gap-2">
+                      <Button
+                        onClick={() => handleDelete(slate)}
+                        variant="destructive"
+                        size="sm"
+                        className="flex-1"
+                      >
+                        Delete
+                      </Button>
+                    </div>
+                  </CardContent>
+                </Card>
               ))}
             </div>
           )}
@@ -250,56 +257,59 @@ export default function SlatesPage() {
       </main>
 
       {/* Create Slate Modal */}
-      {showModal && (
-        <div className="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-lg max-w-2xl w-full max-h-[90vh] overflow-y-auto">
-            <div className="p-6 border-b">
-              <h2 className="text-2xl font-bold">Create Slate</h2>
+      <Dialog open={showModal} onOpenChange={setShowModal}>
+        <DialogContent className="max-w-2xl max-h-[90vh] overflow-y-auto">
+          <DialogHeader>
+            <DialogTitle>Create Slate</DialogTitle>
+            <DialogDescription>
               <div className="mt-4 flex gap-4">
-                <button
+                <Button
                   onClick={() => setMode('generate')}
-                  className={`px-4 py-2 rounded-md ${mode === 'generate' ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+                  variant={mode === 'generate' ? 'default' : 'secondary'}
+                  type="button"
                 >
                   🎨 Generate with Text
-                </button>
-                <button
+                </Button>
+                <Button
                   onClick={() => setMode('upload')}
-                  className={`px-4 py-2 rounded-md ${mode === 'upload' ? 'bg-blue-600 text-white' : 'bg-gray-200 text-gray-700'}`}
+                  variant={mode === 'upload' ? 'default' : 'secondary'}
+                  type="button"
                 >
                   📹 Upload Video
-                </button>
+                </Button>
               </div>
-            </div>
+            </DialogDescription>
+          </DialogHeader>
 
             {mode === 'generate' ? (
-              <form onSubmit={handleGenerateSlate} className="p-6 space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">Slate Name *</label>
-                  <input
+              <form onSubmit={handleGenerateSlate} className="space-y-4">
+                <div className="space-y-2">
+                  <Label htmlFor="slate-name">Slate Name *</Label>
+                  <Input
+                    id="slate-name"
                     type="text"
                     value={name}
                     onChange={(e) => setName(e.target.value)}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
                     placeholder="Back Soon Slate"
                     required
                   />
                 </div>
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">Text Content *</label>
-                  <input
+                <div className="space-y-2">
+                  <Label htmlFor="text-content">Text Content *</Label>
+                  <Input
+                    id="text-content"
                     type="text"
                     value={textContent}
                     onChange={(e) => setTextContent(e.target.value)}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
                     placeholder="...back soon!"
                     required
                   />
                 </div>
 
                 <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">Background Color</label>
+                  <div className="space-y-2">
+                    <Label htmlFor="bg-color">Background Color</Label>
                     <div className="flex gap-2">
                       <input
                         type="color"
@@ -307,18 +317,19 @@ export default function SlatesPage() {
                         onChange={(e) => setBackgroundColor(e.target.value)}
                         className="w-12 h-10 border border-gray-300 rounded"
                       />
-                      <input
+                      <Input
+                        id="bg-color"
                         type="text"
                         value={backgroundColor}
                         onChange={(e) => setBackgroundColor(e.target.value)}
-                        className="flex-1 px-3 py-2 border border-gray-300 rounded-md font-mono"
+                        className="flex-1 font-mono"
                         placeholder="#000000"
                       />
                     </div>
                   </div>
 
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">Text Color</label>
+                  <div className="space-y-2">
+                    <Label htmlFor="text-color">Text Color</Label>
                     <div className="flex gap-2">
                       <input
                         type="color"
@@ -326,11 +337,12 @@ export default function SlatesPage() {
                         onChange={(e) => setTextColor(e.target.value)}
                         className="w-12 h-10 border border-gray-300 rounded"
                       />
-                      <input
+                      <Input
+                        id="text-color"
                         type="text"
                         value={textColor}
                         onChange={(e) => setTextColor(e.target.value)}
-                        className="flex-1 px-3 py-2 border border-gray-300 rounded-md font-mono"
+                        className="flex-1 font-mono"
                         placeholder="#FFFFFF"
                       />
                     </div>
@@ -338,83 +350,85 @@ export default function SlatesPage() {
                 </div>
 
                 <div className="grid grid-cols-2 gap-4">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">Font Size (px)</label>
-                    <input
+                  <div className="space-y-2">
+                    <Label htmlFor="font-size">Font Size (px)</Label>
+                    <Input
+                      id="font-size"
                       type="number"
                       value={fontSize}
                       onChange={(e) => setFontSize(parseInt(e.target.value) || 48)}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md"
                       min="12"
                       max="200"
                     />
                   </div>
 
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-2">Duration (seconds)</label>
-                    <input
+                  <div className="space-y-2">
+                    <Label htmlFor="duration">Duration (seconds)</Label>
+                    <Input
+                      id="duration"
                       type="number"
                       value={duration}
                       onChange={(e) => setDuration(parseInt(e.target.value) || 10)}
-                      className="w-full px-3 py-2 border border-gray-300 rounded-md"
                       min="1"
                       max="60"
                     />
                   </div>
                 </div>
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">Channel (optional)</label>
-                  <select
-                    value={channelId}
-                    onChange={(e) => setChannelId(e.target.value)}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                  >
-                    <option value="">Use default bitrates</option>
-                    {channels.map((ch) => (
-                      <option key={ch.id} value={ch.id}>{ch.name}</option>
-                    ))}
-                  </select>
-                  <p className="mt-1 text-sm text-gray-500">Select a channel to match its bitrate ladder</p>
+                <div className="space-y-2">
+                  <Label htmlFor="channel">Channel (optional)</Label>
+                  <Select value={channelId} onValueChange={setChannelId}>
+                    <SelectTrigger id="channel">
+                      <SelectValue placeholder="Use default bitrates" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="">Use default bitrates</SelectItem>
+                      {channels.map((ch) => (
+                        <SelectItem key={ch.id} value={ch.id}>{ch.name}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-sm text-muted-foreground">Select a channel to match its bitrate ladder</p>
                 </div>
 
-                <div className="flex justify-end gap-4 pt-4 border-t">
-                  <button
+                <DialogFooter>
+                  <Button
                     type="button"
                     onClick={() => {
                       setShowModal(false)
                       resetForm()
                     }}
-                    className="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50"
+                    variant="outline"
                   >
                     Cancel
-                  </button>
-                  <button
+                  </Button>
+                  <Button
                     type="submit"
                     disabled={saving}
-                    className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50"
+                    variant="default"
                   >
                     {saving ? 'Generating...' : 'Generate Slate'}
-                  </button>
-                </div>
+                  </Button>
+                </DialogFooter>
               </form>
             ) : (
-              <form onSubmit={handleUploadSlate} className="p-6 space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">Slate Name *</label>
-                  <input
+              <form onSubmit={handleUploadSlate} className="space-y-4">
+                <div className="space-y-2">
+                  <Label htmlFor="upload-name">Slate Name *</Label>
+                  <Input
+                    id="upload-name"
                     type="text"
                     value={uploadName}
                     onChange={(e) => setUploadName(e.target.value)}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
                     placeholder="Branded Slate"
                     required
                   />
                 </div>
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">Video File *</label>
-                  <input
+                <div className="space-y-2">
+                  <Label htmlFor="video-file">Video File *</Label>
+                  <Input
+                    id="video-file"
                     type="file"
                     accept="video/*,image/*"
                     onChange={(e) => {
@@ -426,51 +440,50 @@ export default function SlatesPage() {
                         }
                       }
                     }}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
                     required
                   />
-                  <p className="mt-1 text-sm text-gray-500">Supported: MP4, MOV, AVI, or images (JPG, PNG)</p>
+                  <p className="text-sm text-muted-foreground">Supported: MP4, MOV, AVI, or images (JPG, PNG)</p>
                 </div>
 
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-2">Channel (optional)</label>
-                  <select
-                    value={channelId}
-                    onChange={(e) => setChannelId(e.target.value)}
-                    className="w-full px-3 py-2 border border-gray-300 rounded-md"
-                  >
-                    <option value="">Use default bitrates</option>
-                    {channels.map((ch) => (
-                      <option key={ch.id} value={ch.id}>{ch.name}</option>
-                    ))}
-                  </select>
-                  <p className="mt-1 text-sm text-gray-500">Select a channel to match its bitrate ladder</p>
+                <div className="space-y-2">
+                  <Label htmlFor="upload-channel">Channel (optional)</Label>
+                  <Select value={channelId} onValueChange={setChannelId}>
+                    <SelectTrigger id="upload-channel">
+                      <SelectValue placeholder="Use default bitrates" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="">Use default bitrates</SelectItem>
+                      {channels.map((ch) => (
+                        <SelectItem key={ch.id} value={ch.id}>{ch.name}</SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <p className="text-sm text-muted-foreground">Select a channel to match its bitrate ladder</p>
                 </div>
 
-                <div className="flex justify-end gap-4 pt-4 border-t">
-                  <button
+                <DialogFooter>
+                  <Button
                     type="button"
                     onClick={() => {
                       setShowModal(false)
                       resetForm()
                     }}
-                    className="px-4 py-2 border border-gray-300 rounded-md text-gray-700 hover:bg-gray-50"
+                    variant="outline"
                   >
                     Cancel
-                  </button>
-                  <button
+                  </Button>
+                  <Button
                     type="submit"
                     disabled={saving}
-                    className="px-4 py-2 bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50"
+                    variant="default"
                   >
                     {saving ? 'Uploading...' : 'Upload Slate'}
-                  </button>
-                </div>
+                  </Button>
+                </DialogFooter>
               </form>
             )}
-          </div>
-        </div>
-      )}
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
