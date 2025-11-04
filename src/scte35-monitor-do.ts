@@ -213,6 +213,24 @@ export class SCTE35MonitorDO extends DurableObject<Env> {
           const startTime = new Date().toISOString();
           const eventId = `scte35_${Date.now()}`;
           
+          // Build variants map from decision service items
+          // Decision service returns: [{adId, bitrate, playlistUrl}]
+          // We need to group by adId and create variant map per ad
+          const adItems = adDecision.pod?.items || [];
+          const adsById = new Map<string, {duration: number, variants: Record<string, string>}>();
+          
+          for (const item of adItems) {
+            const adId = item.adId || 'unknown';
+            if (!adsById.has(adId)) {
+              adsById.set(adId, {
+                duration: adDecision.pod?.durationSec || duration,
+                variants: {}
+              });
+            }
+            const ad = adsById.get(adId)!;
+            ad.variants[item.bitrate.toString()] = item.playlistUrl;
+          }
+          
           const adBreakState: AdBreakState = {
             channelId,
             eventId,
@@ -222,11 +240,11 @@ export class SCTE35MonitorDO extends DurableObject<Env> {
             endTime: new Date(Date.now() + duration * 1000).toISOString(),
             decision: {
               podId: adDecision.pod?.podId || 'unknown',
-              items: adDecision.pod?.items?.map((item: any) => ({
-                id: item.adId || item.podId,
-                duration: item.durationSec,
-                variants: {} // Filled by decision service
-              })) || []
+              items: Array.from(adsById.entries()).map(([adId, ad]) => ({
+                id: adId,
+                duration: ad.duration,
+                variants: ad.variants
+              }))
             },
             createdAt: startTime,
             scte35Data: {
