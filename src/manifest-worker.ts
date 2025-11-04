@@ -116,15 +116,34 @@ export default {
         const channel = body?.channel || url.searchParams.get("channel")
         if (!channel) return new Response("channel required", { status: 400 })
 
+        // Phase 1: Look up channel config to get proper channelId for KV keys
+        let channelId = 'unknown'
+        const org = body?.org || 'demo' // Default to demo for backward compatibility
+        if (env.DB) {
+          try {
+            const config = await getChannelConfig(env, org, channel)
+            if (config?.id) {
+              channelId = config.id
+            }
+          } catch (err) {
+            console.warn(`Failed to load channel config for /cue: ${err}`)
+          }
+        }
+
         const id = env.CHANNEL_DO.idFromName(`${channel}`)
         const stub = env.CHANNEL_DO.get(id)
 
-        // Forward the cue to the DO
-        const r = await stub.fetch(new Request("https://do/cue", {
+        // Forward the cue to the DO with proper channelId header
+        const doRequest = new Request("https://do/cue", {
           method: "POST",
           headers: req.headers,
           body: JSON.stringify(body)
-        }))
+        })
+        doRequest.headers.set('X-Channel-Id', channelId)
+        doRequest.headers.set('X-Org-Slug', org)
+        doRequest.headers.set('X-Channel-Slug', channel)
+        
+        const r = await stub.fetch(doRequest)
         return r
       } catch {
         return new Response("bad request", { status: 400 })
