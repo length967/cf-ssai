@@ -209,13 +209,13 @@ export function isAdBreakEnd(signal: SCTE35Signal): boolean {
  * Get break duration from signal (in seconds)
  */
 export function getBreakDuration(signal: SCTE35Signal): number {
-  // Prefer explicit break duration
-  if (signal.breakDuration) {
+  // Prefer explicit break duration (must check !== undefined for falsy 0 value)
+  if (signal.breakDuration !== undefined && signal.breakDuration !== null) {
     return signal.breakDuration
   }
   
   // Fall back to general duration
-  if (signal.duration) {
+  if (signal.duration !== undefined && signal.duration !== null) {
     return signal.duration
   }
   
@@ -310,25 +310,29 @@ export function validateSCTE35Signal(signal: SCTE35Signal, pdt?: string): SCTE35
 
   // 3. Duration validation for ad break starts
   if (isAdBreakStart(signal)) {
-    const duration = getBreakDuration(signal)
-
-    // Duration must exist
-    if (!duration) {
+    // CRITICAL: Check if duration fields exist (before getBreakDuration applies default)
+    const hasDurationField = (signal.breakDuration !== undefined && signal.breakDuration !== null) || 
+                             (signal.duration !== undefined && signal.duration !== null)
+    
+    if (!hasDurationField) {
       errors.push('Ad break start signal missing duration (breakDuration or duration field required)')
-    }
-    // Duration must be positive
-    else if (duration <= 0) {
-      errors.push(`Invalid ad break duration: ${duration}s (must be > 0)`)
-    }
-    // Duration must be reasonable (0.1s to 300s = 5 minutes)
-    else if (duration < 0.1 || duration > 300) {
-      errors.push(`Unrealistic ad break duration: ${duration}s (must be 0.1-300 seconds)`)
-    }
-    // Warn about unusual durations
-    else if (duration < 5) {
-      warnings.push(`Very short ad break: ${duration}s (typical minimum is 5-10s)`)
-    } else if (duration > 180) {
-      warnings.push(`Very long ad break: ${duration}s (typical maximum is 120-180s)`)
+    } else {
+      const duration = getBreakDuration(signal)
+
+      // Duration must be positive
+      if (duration <= 0) {
+        errors.push(`Invalid ad break duration: ${duration}s (must be > 0)`)
+      }
+      // Duration must be reasonable (0.1s to 300s = 5 minutes)
+      else if (duration < 0.1 || duration > 300) {
+        errors.push(`Unrealistic ad break duration: ${duration}s (must be 0.1-300 seconds)`)
+      }
+      // Warn about unusual durations
+      else if (duration < 5) {
+        warnings.push(`Very short ad break: ${duration}s (typical minimum is 5-10s)`)
+      } else if (duration > 180) {
+        warnings.push(`Very long ad break: ${duration}s (typical maximum is 120-180s)`)
+      }
     }
   }
 
@@ -401,7 +405,8 @@ export function validateSCTE35Signal(signal: SCTE35Signal, pdt?: string): SCTE35
   }
 
   // 8. UPID validation (if present)
-  if (signal.upid && typeof signal.upid === 'string') {
+  // BUG FIX: Check !== undefined instead of truthy check, since empty string "" is falsy but valid
+  if (signal.upid !== undefined && signal.upid !== null && typeof signal.upid === 'string') {
     if (signal.upid.trim().length === 0) {
       warnings.push('UPID present but empty')
     } else if (signal.upid.length > 256) {
