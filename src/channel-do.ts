@@ -2,12 +2,30 @@ import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, 
 import { signPath } from "./utils/sign"
 import { parseSCTE35FromManifest, isAdBreakStart, getBreakDuration, findActiveBreak, validateSCTE35Signal } from "./utils/scte35"
 import { getChannelConfig } from "./utils/channel-config"
+import type { ChannelConfig } from "./utils/channel-config"
 import type { Env } from "./manifest-worker"
 import type { DecisionResponse, BeaconMessage, SCTE35Signal } from "./types"
 
-// -----------------------------------------------------------------------------
+// ============================================================================
+// CONFIGURATION CONSTANTS
+// ============================================================================
+
+/**
+ * Maximum age of a pre-calculated ad decision in milliseconds.
+ * If decision is older than this, it will be refreshed to catch drift
+ * or stale ad inventory. Typical: 30 seconds (balances freshness vs. performance).
+ */
+const DECISION_TTL_MS = 30 * 1000
+
+/**
+ * Key for telemetry counter tracking skip count recalculation attempts.
+ * Used to detect bugs where concurrent requests produce different skip counts.
+ */
+const SKIP_COUNT_RECALC_COUNTER_KEY = 'skip_count_recalc_attempts'
+
+// ============================================================================
 // Live ad state persisted per channel
-// -----------------------------------------------------------------------------
+// ============================================================================
 interface AdState {
   active: boolean
   podId?: string
@@ -248,12 +266,94 @@ async function fetchOriginVariant(originUrl: string, channel: string, variant: s
 }
 
 // -----------------------------------------------------------------------------
-// Helper: detect if client supports interstitials
+// FIX #6: Robust player detection with multi-tier fallback
 // -----------------------------------------------------------------------------
+
+/**
+ * Determine if client wants SGAI (Server-Guided Ad Insertion) based on:
+ * 1. Query parameter override (?mode=sgai / ?mode=ssai)
+ * 2. Channel configuration default mode
+ * 3. Feature-based client detection (Apple devices with HLS Interstitial support)
+ * 4. Default fallback (SSAI for broad compatibility)
+ *
+ * @param req - HTTP request with headers and URL
+ * @param channelConfig - Channel configuration with mode setting
+ * @param forceMode - Optional mode override from query params
+ * @returns true for SGAI, false for SSAI
+ */
+function determineAdInsertionMode(
+  req: Request, 
+  channelConfig?: ChannelConfig, 
+  forceMode?: string
+): 'sgai' | 'ssai' {
+  // Priority 1: Explicit query parameter override (highest precedence)
+  // This allows developers and QA to force specific modes for testing
+  if (forceMode === 'sgai' || forceMode === 'ssai') {
+    console.log(`🔧 Mode forced via query param: ${forceMode}`)
+    return forceMode
+  }
+  
+  // Priority 2: Channel-level configuration override
+  // Allows per-channel customization in admin interface
+  if (channelConfig?.mode && channelConfig.mode !== 'auto') {
+    console.log(`⚙️  Mode from channel config: ${channelConfig.mode}`)
+    return channelConfig.mode as 'sgai' | 'ssai'
+  }
+  
+  // Priority 3: Feature-based client detection
+  const ua = req.headers.get('user-agent') || ''
+  
+  // Apple ecosystem: Check for devices/browsers that support HLS Interstitials
+  // SGAI (HLS Interstitials) only work with:
+  // - iOS Safari (iPhone/iPad)
+  // - macOS Safari (not Chrome/Firefox on Mac)
+  // - tvOS (Apple TV)
+  // - AVPlayer-based apps
+  
+  const isAppleDevice = /iPhone|iPad|iPod/.test(ua)
+  const isTvOS = /Apple TV|tvOS/.test(ua)
+  const isMacSafari = /Macintosh.*Safari/.test(ua) && !/Chrome|Firefox|Edge|Opera/.test(ua)
+  const isAVPlayerApp = /AVPlayer/.test(ua) || req.headers.has('X-AVPlayer-Version')
+  
+  // Additional Apple-specific request headers that indicate Safari/AVPlayer
+  const hasAppleHeaders = req.headers.has('X-Apple-Request-UUID') || 
+                          req.headers.has('X-Playback-Session-Id') ||
+                          req.headers.get('Accept')?.includes('application/vnd.apple')
+  
+  // Determine if client likely supports HLS Interstitials
+  const supportsInterstitials = isAppleDevice || isTvOS || isMacSafari || isAVPlayerApp || hasAppleHeaders
+  
+  if (supportsInterstitials) {
+    // Additional validation: check for known incompatible clients
+    const isWebView = /WebView|wkwebview/i.test(ua)
+    const isKnownIncompatible = /Chrome|Firefox|Edge|Opera/i.test(ua) && !isAppleDevice
+    
+    if (isWebView) {
+      console.log(`🔍 Detected WebView client, falling back to SSAI (WebViews may not support interstitials)`)
+      return 'ssai'
+    }
+    
+    if (isKnownIncompatible) {
+      console.log(`🔍 Detected non-Safari browser on desktop, using SSAI`)
+      return 'ssai'
+    }
+    
+    console.log(`🍎 Detected Apple-compatible client (${isAppleDevice ? 'iOS' : isTvOS ? 'tvOS' : isMacSafari ? 'macOS Safari' : 'AVPlayer'}), using SGAI`)
+    return 'sgai'
+  }
+  
+  // Priority 4: Default fallback to SSAI for broad compatibility
+  // SSAI works with all HLS players (hls.js, ExoPlayer, etc.)
+  console.log(`🌐 Default client detection → SSAI (UA: ${ua.substring(0, 100)}...)`)
+  return 'ssai'
+}
+
+/**
+ * Legacy wrapper for backwards compatibility
+ * @deprecated Use determineAdInsertionMode() instead
+ */
 function wantsSGAI(req: Request): boolean {
-  const ua = req.headers.get("user-agent") || ""
-  // crude detection; replace with feature detection for production
-  return /iPhone|iPad|Macintosh/.test(ua)
+  return determineAdInsertionMode(req) === 'sgai'
 }
 
 // -----------------------------------------------------------------------------
@@ -303,14 +403,33 @@ function selectAdVariant(viewerBitrate: number | null): string {
 }
 
 // -----------------------------------------------------------------------------
-// Helper: make ad decision via decision service worker
+// Helper: make ad decision via decision service worker (with caching support)
 // -----------------------------------------------------------------------------
-async function decision(env: Env, adPodBase: string, channel: string, durationSec: number, viewerInfo?: any): Promise<DecisionResponse> {
+async function decision(
+  env: Env,
+  adPodBase: string,
+  channel: string,
+  durationSec: number,
+  viewerInfo?: any,
+  cachedDecision?: DecisionResponse  // PRE-CALCULATED: Use this if available (avoids Worker binding call)
+): Promise<DecisionResponse> {
+  // PERFORMANCE OPTIMIZATION: Use pre-calculated decision if available
+  // This eliminates Worker binding calls and CPU timeout risk on hot path
+  if (cachedDecision) {
+    console.log(`✅ Using pre-calculated decision (cache hit): podId=${cachedDecision.pod?.podId}, items=${cachedDecision.pod?.items?.length || 0}`)
+    return cachedDecision
+  }
+
+  console.log(`⚠️  No cached decision, calling decision service (on-demand)`)
+
   // If DECISION service binding is available, use it
   if (env.DECISION) {
     const ctrl = new AbortController()
-    const to = setTimeout(() => ctrl.abort(), parseInt(env.DECISION_TIMEOUT_MS || "150", 10))
-    
+    // INCREASED TIMEOUT: 2000ms instead of 150ms for on-demand calls (less critical path)
+    // Pre-calculated decisions avoid this entirely
+    const timeoutMs = parseInt(env.DECISION_TIMEOUT_MS || "2000", 10)
+    const to = setTimeout(() => ctrl.abort(), timeoutMs)
+
     try {
       const response = await env.DECISION.fetch("https://decision/decision", {
         method: "POST",
@@ -318,18 +437,18 @@ async function decision(env: Env, adPodBase: string, channel: string, durationSe
         headers: { "content-type": "application/json" },
         signal: ctrl.signal,
       })
-      
+
       clearTimeout(to)
-      
+
       if (response.ok) {
         return await response.json()
       }
     } catch (err) {
       clearTimeout(to)
-      console.error("Decision service error:", err)
+      console.error(`Decision service error (timeout: ${timeoutMs}ms):`, err)
     }
   }
-  
+
   // Fallback: return empty response when decision service unavailable
   console.error("Decision service unavailable and no fallback configured")
   return {
@@ -652,6 +771,21 @@ export class ChannelDO {
         )
       }
 
+      // REQUEST-SCOPED CACHE: Cache PDT extraction results to avoid redundant parsing
+      // extractPDTs() may be called multiple times in a single manifest request:
+      // 1. For SCTE-35 temporal validation (line ~795)
+      // 2. For SCTE-35 start time extraction (line ~904)
+      // 3. For manifest window validation (line ~1218)
+      // This cache ensures O(1) lookup after first extraction
+      const pdtCache: Map<string, string[]> = new Map()
+      const getCachedPDTs = (manifest: string): string[] => {
+        const hash = manifest.substring(0, 100)  // Use manifest prefix as cache key
+        if (!pdtCache.has(hash)) {
+          pdtCache.set(hash, extractPDTs(manifest))
+        }
+        return pdtCache.get(hash)!
+      }
+      
       // Load live ad state (if any) - this takes priority over other signals
       // Check if state was modified during request queueing
       const currentAdStateVersion = await this.state.storage.get<number>('ad_state_version') || 0
@@ -672,8 +806,8 @@ export class ChannelDO {
 
         if (activeBreak) {
           // CRITICAL: Validate SCTE-35 signal before using it
-          // Extract PDT for temporal validation
-          const pdts = extractPDTs(origin)
+          // Extract PDT for temporal validation (using request-scoped cache)
+          const pdts = getCachedPDTs(origin)
           const mostRecentPDT = pdts.length > 0 ? pdts[pdts.length - 1] : undefined
 
           const validation = validateSCTE35Signal(activeBreak, mostRecentPDT)
@@ -706,19 +840,13 @@ export class ChannelDO {
         }
       }
 
-      // Determine ad insertion mode: SGAI (server-guided) or SSAI (server-side)
+      // FIX #6: Determine ad insertion mode with robust multi-tier detection
       // Priority order:
-      // 1. URL force parameter (?force=sgai or ?force=ssai)
-      // 2. Channel config mode setting from database
-      // 3. Auto-detect based on client capability (iOS/Safari → SGAI, others → SSAI)
-      let mode: string
-      if (force) {
-        mode = force
-      } else if (channelConfig?.mode && channelConfig.mode !== 'auto') {
-        mode = channelConfig.mode
-      } else {
-        mode = wantsSGAI(req) ? "sgai" : "ssai"
-      }
+      // 1. Query parameter override (?mode=sgai or ?mode=ssai) - for testing/debugging
+      // 2. Channel config mode setting from database - for per-channel control
+      // 3. Feature-based client detection - iOS/Safari/tvOS/AVPlayer → SGAI, others → SSAI
+      // 4. Default fallback - SSAI for maximum compatibility
+      const mode = determineAdInsertionMode(req, channelConfig, force)
 
       // NOTE: SGAI (HLS Interstitials) only works with Safari/iOS/AVPlayer
       // hls.js and most web players do NOT support HLS Interstitials
@@ -787,8 +915,8 @@ export class ChannelDO {
           breakDurationSec = getBreakDuration(activeBreak)
           adSource = "scte35"
           
-          // Find the PDT timestamp for the break
-          const pdts = extractPDTs(origin)
+          // Find the PDT timestamp for the break (using request-scoped cache)
+          const pdts = getCachedPDTs(origin)
           if (pdts.length > 0) {
             scte35StartPDT = pdts[pdts.length - 1]  // Use most recent PDT near signal
           }
@@ -862,9 +990,29 @@ export class ChannelDO {
               skippedDuration: 0,  // Will be calculated during first manifest generation
               processedEventIds: [scte35EventId],  // Initialize with current event ID
             }
+
+            // PERFORMANCE OPTIMIZATION: Pre-calculate decision asynchronously BEFORE viewers arrive
+            // This eliminates Worker binding calls on hot path and prevents CPU timeouts
+            console.log(`🚀 Pre-calculating ad decision for SCTE-35 break (channel=${channelId}, duration=${stableDuration}s)`)
+            try {
+              const preCalcStart = Date.now()
+              const preCalculatedDecision = await decision(this.env, adPodBase, channelId, stableDuration, {
+                scte35: activeBreak  // Pass SCTE-35 metadata for targeting
+              }, undefined)  // No cached decision yet (this IS the calculation)
+
+              newAdState.decision = preCalculatedDecision
+              newAdState.decisionCalculatedAt = Date.now()
+
+              const calcDuration = Date.now() - preCalcStart
+              console.log(`✅ Pre-calculated decision ready (${calcDuration}ms): podId=${preCalculatedDecision.pod?.podId}, items=${preCalculatedDecision.pod?.items?.length || 0}`)
+            } catch (err) {
+              console.error(`⚠️  Decision pre-calculation failed (will fall back to on-demand):`, err)
+              // Don't block ad state creation - on-demand fallback will handle it
+            }
+
             await saveAdState(this.state, newAdState)
             console.log(`✨ Created new SCTE-35 ad break: id=${stableId}, start=${new Date(startTime).toISOString()}, duration=${stableDuration}s (rounded from ${breakDurationSec}s), pdt=${scte35StartPDT}, eventId=${scte35EventId}`)
-            
+
             // Reload ad state for use in manifest generation below
             adState = newAdState
             adActive = true
@@ -872,7 +1020,6 @@ export class ChannelDO {
             if (channelTier !== 0 && scte35Tier === channelTier) {
               console.log(`SCTE-35 tier match: tier=${channelTier} (0x${channelTier.toString(16).padStart(3, '0')}) - allowing ad`)
             }
-            console.log(`✨ Created new SCTE-35 ad break: duration=${breakDurationSec}s, pdt=${scte35StartPDT}`)
           }
           }
         }
@@ -906,20 +1053,29 @@ export class ChannelDO {
           console.log(`Using calculated values: start=${startISO}, duration=${stableDuration}s (from ${breakDurationSec}s)`)
         }
         
-        // Extract viewer bitrate from variant and select matching ad pod
-        const viewerBitrate = extractBitrate(variant)
-        const adVariant = selectAdVariant(viewerBitrate)
-        
-        console.log(`Calling decision service: channelId=${channelId}, duration=${stableDuration}s, bitrate=${viewerBitrate}`)
-        
+        // PERFORMANCE OPTIMIZATION: Use pre-calculated decision if available in ad state
+        // This avoids Worker binding call and eliminates CPU timeout risk
+        // CRITICAL: Enforce decision TTL - refresh if too old to catch inventory drift
+        const decisionAge = adState?.decisionCalculatedAt ? Date.now() - adState.decisionCalculatedAt : Infinity
+        const decisionIsStale = decisionAge > DECISION_TTL_MS
+        const cachedDecision = adState?.decision && !decisionIsStale ? adState.decision : undefined
+
+        if (cachedDecision) {
+          console.log(`✅ Using pre-calculated decision from ad state (age: ${decisionAge}ms, TTL: ${DECISION_TTL_MS}ms)`)
+        } else if (adState?.decision && decisionIsStale) {
+          console.log(`🔄 Decision stale (age: ${decisionAge}ms > TTL: ${DECISION_TTL_MS}ms), refreshing...`)
+        } else {
+          console.log(`⚠️  No cached decision, calling decision service on-demand: channelId=${channelId}, duration=${stableDuration}s`)
+        }
+
         // Get ad decision from decision service (use per-channel ad pod base)
         // Pass channelId (e.g., "ch_demo_sports") not channel slug
         // Use stableDuration to ensure consistent ad selection
+        // IMPORTANT: Don't pass viewer-specific bitrate/variant - decision service returns ALL variants
+        // This allows pre-calculated decisions to work for all viewers regardless of quality level
         const decisionResponse = await decision(this.env, adPodBase, channelId, stableDuration, {
-          variant,
-          bitrate: viewerBitrate,
-          scte35: activeBreak
-        })
+          scte35: activeBreak  // Only pass SCTE-35 metadata (same as pre-calculation)
+        }, cachedDecision)  // Pass cached decision if available
         
         console.log(`Decision response received: podId=${decisionResponse.pod?.podId}, items=${decisionResponse.pod?.items?.length || 0}`)
         
@@ -1068,21 +1224,38 @@ export class ChannelDO {
                 
                 if (adSegments.length > 0) {
                   const cleanOrigin = stripOriginSCTE35Markers(origin)
+                  
+                  // FIX #4: MANIFEST WINDOW VALIDATION
+                  // Check if SCTE-35 PDT is actually in the manifest window before attempting SSAI
+                  // If PDT not found, skip SSAI entirely and jump straight to SGAI fallback
+                  let shouldAttemptSSAI = true
+                  if (scte35StartPDT) {
+                    const pdtsInManifest = getCachedPDTs(cleanOrigin)
+                    if (!pdtsInManifest.includes(scte35StartPDT)) {
+                      console.warn(`🚨 FIX #4: SCTE-35 PDT not in manifest window! pdt=${scte35StartPDT}, manifest_has=${pdtsInManifest.length} segments, first=${pdtsInManifest[0]}, last=${pdtsInManifest[pdtsInManifest.length - 1]}. Skipping SSAI, falling back to SGAI immediately.`)
+                      shouldAttemptSSAI = false
+                    }
+                  }
+                  
                   // CRITICAL: Pass actual ad duration calculated from segments
                   // This ensures PDT timeline continuity
                   // Use stable skip count from ad state if available (prevents concurrent request inconsistency)
                   const stableSkipCount = adState?.contentSegmentsToSkip || undefined
                   
-                  const result = replaceSegmentsWithAds(
-                    cleanOrigin,
-                    scte35StartPDT,
-                    adSegments,
-                    totalDuration,        // Actual ad duration from segment sum
-                    stableDuration,       // SCTE-35 break duration for content skipping
-                    stableSkipCount       // Use cached skip count if available
-                  )
+                  let result = { manifest: cleanOrigin, segmentsSkipped: 0, durationSkipped: 0 }
+                  if (shouldAttemptSSAI) {
+                    result = replaceSegmentsWithAds(
+                      cleanOrigin,
+                      scte35StartPDT,
+                      adSegments,
+                      totalDuration,        // Actual ad duration from segment sum
+                      stableDuration,       // SCTE-35 break duration for content skipping
+                      stableSkipCount       // Use cached skip count if available
+                    )
+                  }
 
                   // HYBRID SSAI/SGAI: If SCTE-35 PDT not found in manifest (rolled out of window),
+                  // OR if we skipped SSAI due to window validation,
                   // fall back to SGAI (HLS Interstitials) for late-joining viewers
                   if (result.segmentsSkipped === 0) {
                     console.log(`🔄 SSAI failed (PDT not in manifest), falling back to SGAI for late-joining viewer`)
@@ -1116,7 +1289,13 @@ export class ChannelDO {
                       console.log(`⚠️  Skip count is 0 (PDT not in window) - not persisting, will retry on next request`)
                     }
                   } else if (adState && adState.contentSegmentsToSkip) {
-                    console.log(`ℹ️  Using existing stable skip count: ${adState.contentSegmentsToSkip} segments (${adState.skippedDuration?.toFixed(2) || 'unknown'}s)`)
+                    // TELEMETRY: Detect if recalculation produces different skip count (potential bug)
+                    if (result.segmentsSkipped > 0 && result.segmentsSkipped !== adState.contentSegmentsToSkip) {
+                      console.warn(`🚨 TELEMETRY: Skip count mismatch detected! cached=${adState.contentSegmentsToSkip}, recalc=${result.segmentsSkipped}. This may indicate concurrent request inconsistency.`)
+                      // FUTURE: Send to analytics/alerting system
+                    } else {
+                      console.log(`ℹ️  Using existing stable skip count: ${adState.contentSegmentsToSkip} segments (${adState.skippedDuration?.toFixed(2) || 'unknown'}s)`)
+                    }
                   }
 
                   await this.env.BEACON_QUEUE.send(beaconMsg)

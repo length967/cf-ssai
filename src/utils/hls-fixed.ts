@@ -18,6 +18,19 @@
  * - Result: Timeline continuity preserved, no stalls
  */
 
+// ============================================================================
+// CONFIGURATION CONSTANTS
+// ============================================================================
+
+/**
+ * Maximum number of lines to search ahead for resume PDT.
+ * At 4-second segments (typical HLS segment duration), this covers:
+ * - 30 lines ~= 120 seconds of content (reasonable for typical ad breaks)
+ * - Can be increased for longer ad breaks or decreased for performance
+ * - If resume PDT not found within this window, falls back to calculated PDT
+ */
+export const PDT_SEARCH_WINDOW_LINES = 30
+
 interface AdSegment {
   url: string
   duration: number
@@ -209,9 +222,9 @@ export function replaceSegmentsWithAdsFixed(
           break
         }
 
-        // Stop searching after checking ~10 segments worth of lines
-        if (searchIndex - resumeIndex > 30) {
-          console.warn(`[PDT-FIX] ⚠️  Could not find resume PDT within search window`)
+        // Stop searching after checking configured number of lines
+        if (searchIndex - resumeIndex > PDT_SEARCH_WINDOW_LINES) {
+          console.warn(`[PDT-FIX] ⚠️  Could not find resume PDT within search window (${PDT_SEARCH_WINDOW_LINES} lines)`)
           break
         }
 
