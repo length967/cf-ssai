@@ -741,6 +741,10 @@ export class ChannelDO {
 
       if (!channel) return new Response("channel required", { status: 400 })
 
+      // Extract viewer bitrate from variant name for ad selection
+      // Format: scte35-audio_eng=128000-video=1000000.m3u8
+      const viewerBitrate = extractBitrateFromVariant(variant)
+
       // PERFORMANCE FIX: Check if this is a segment request FIRST
       // Segments should bypass all config/database lookups
       if (!variant.endsWith('.m3u8')) {
