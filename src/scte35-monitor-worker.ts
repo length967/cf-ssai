@@ -1,22 +1,20 @@
 /**
- * SCTE-35 Monitor Worker
+ * SCTE-35 Monitor Coordinator Worker
  * 
- * Phase 2: Cron-based SCTE-35 detection for proactive ad break management
+ * Phase 2: DO Alarm-based SCTE-35 detection (5-second polling)
  * 
- * Runs every 1-2 seconds to:
- * 1. Fetch all active channels from D1
- * 2. Poll origin manifests for SCTE-35 signals
- * 3. Pre-calculate ad decisions
- * 4. Write ad break state to KV
+ * Responsibilities:
+ * 1. Cron (every minute): Ensure all active channels have monitor DOs running
+ * 2. HTTP API: Manual control to start/stop channel monitoring
+ * 3. Delegates actual polling to SCTE35MonitorDO instances
  * 
- * This moves SCTE-35 detection OUT of the request path, enabling
- * fully stateless manifest serving with pre-calculated ad decisions.
+ * This enables:
+ * - Sub-minute polling (5 seconds via DO alarms)
+ * - Fully stateless manifest serving
+ * - Per-channel monitoring lifecycle management
  */
 
-import { parseSCTE35FromManifest, findActiveBreak, getBreakDuration } from './utils/scte35'
-import { getAdBreakKey, getAdBreakTTL } from './types/adbreak-state'
-import type { AdBreakState } from './types/adbreak-state'
-import type { SCTE35Signal } from './types'
+import { SCTE35MonitorDO } from './scte35-monitor-do';
 
 export interface Env {
   // Database for channel configuration
@@ -26,218 +24,172 @@ export interface Env {
   ADBREAK_STATE: KVNamespace
   
   // Service binding to decision worker
-  DECISION?: Fetcher
+  DECISION: Fetcher
+  
+  // Durable Object namespace for SCTE-35 monitors
+  SCTE35_MONITOR: DurableObjectNamespace<SCTE35MonitorDO>
   
   // Configuration
-  DECISION_TIMEOUT_MS: string
+  SCTE35_POLL_INTERVAL_MS?: string
+  DECISION_TIMEOUT_MS?: string
 }
 
-interface ChannelInfo {
-  id: string
-  slug: string
-  organizationId: string
-  originUrl: string
-  scte35Enabled: boolean
-  scte35AutoInsert: boolean
-  vastEnabled: boolean
-  vastUrl: string
-  defaultAdDuration: number
+export { SCTE35MonitorDO };
+
+/**
+ * Get or create a monitor DO for a channel
+ */
+function getMonitorDO(env: Env, channelId: string): DurableObjectStub<SCTE35MonitorDO> {
+  const id = env.SCTE35_MONITOR.idFromName(channelId);
+  return env.SCTE35_MONITOR.get(id);
 }
 
 /**
- * Fetch a manifest from the origin with retry logic
+ * Start monitoring for a specific channel
  */
-async function fetchOriginManifest(url: string): Promise<string | null> {
+async function startChannelMonitoring(env: Env, channelId: string): Promise<void> {
+  const stub = getMonitorDO(env, channelId);
+  const response = await stub.fetch('http://do/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ channelId }),
+  });
+  
+  if (!response.ok) {
+    const error = await response.text();
+    throw new Error(`Failed to start monitoring for ${channelId}: ${error}`);
+  }
+  
+  const result = await response.json<any>();
+  console.log(`[Coordinator] Started monitoring for ${channelId}, poll interval ${result.pollInterval}ms`);
+}
+
+/**
+ * Stop monitoring for a specific channel
+ */
+async function stopChannelMonitoring(env: Env, channelId: string): Promise<void> {
+  const stub = getMonitorDO(env, channelId);
+  const response = await stub.fetch('http://do/stop', {
+    method: 'POST',
+  });
+  
+  if (response.ok) {
+    console.log(`[Coordinator] Stopped monitoring for ${channelId}`);
+  }
+}
+
+/**
+ * Get monitoring status for a channel
+ */
+async function getMonitoringStatus(env: Env, channelId: string): Promise<any> {
+  const stub = getMonitorDO(env, channelId);
+  const response = await stub.fetch('http://do/status');
+  return response.json();
+}
+
+/**
+ * Cron handler - ensures all active channels have monitors running
+ */
+async function handleScheduled(env: Env): Promise<void> {
+  const startTime = Date.now();
+  console.log('[Coordinator] 🔄 Starting monitor sync');
+  
   try {
-    const response = await fetch(url, {
-      cf: { cacheTtl: 0 } // Don't cache - we want fresh data
-    })
+    // Fetch all active channels with SCTE-35 enabled
+    const result = await env.DB.prepare(`
+      SELECT channel_id as id
+      FROM channels
+      WHERE scte35_enabled = 1
+    `).all<{ id: string }>();
     
-    if (!response.ok) {
-      console.warn(`Failed to fetch origin manifest: ${url} (${response.status})`)
-      return null
+    if (!result.results || result.results.length === 0) {
+      console.log('[Coordinator] No active channels with SCTE-35 enabled');
+      return;
     }
     
-    return await response.text()
+    console.log(`[Coordinator] 📺 Syncing ${result.results.length} channel(s)`);
+    
+    // Start monitoring for each channel (idempotent)
+    const promises = result.results.map(channel =>
+      startChannelMonitoring(env, channel.id).catch(error => {
+        console.error(`[Coordinator] Error starting monitor for ${channel.id}:`, error);
+      })
+    );
+    
+    await Promise.all(promises);
+    
+    const duration = Date.now() - startTime;
+    console.log(`[Coordinator] ✅ Monitor sync complete (${duration}ms)`);
+    
   } catch (error) {
-    console.error(`Error fetching origin manifest ${url}:`, error)
-    return null
+    console.error('[Coordinator] Fatal error:', error);
   }
 }
 
 /**
- * Pre-calculate ad decision for a detected SCTE-35 break
+ * HTTP handler - manual control endpoints
  */
-async function preCalculateDecision(
-  env: Env,
-  channelId: string,
-  duration: number
-): Promise<any> {
-  if (!env.DECISION) {
-    console.warn('Decision service not available for pre-calculation')
-    return { pod: { podId: 'no-decision', items: [], durationSec: duration } }
-  }
+async function handleRequest(request: Request, env: Env): Promise<Response> {
+  const url = new URL(request.url);
+  const path = url.pathname;
   
-  try {
-    const timeoutMs = parseInt(env.DECISION_TIMEOUT_MS || '2000', 10)
-    const controller = new AbortController()
-    const timeout = setTimeout(() => controller.abort(), timeoutMs)
-    
-    const response = await env.DECISION.fetch('https://decision/decision', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        channel: channelId,
-        durationSec: duration
-      }),
-      signal: controller.signal
-    })
-    
-    clearTimeout(timeout)
-    
-    if (response.ok) {
-      return await response.json()
-    }
-    
-    console.warn(`Decision service returned ${response.status}`)
-    return { pod: { podId: 'decision-error', items: [], durationSec: duration } }
-  } catch (error) {
-    console.error('Decision pre-calculation failed:', error)
-    return { pod: { podId: 'decision-timeout', items: [], durationSec: duration } }
-  }
-}
-
-/**
- * Process a single channel for SCTE-35 signals
- */
-async function processChannel(env: Env, channel: ChannelInfo): Promise<void> {
-  // Skip if SCTE-35 is disabled
-  if (!channel.scte35Enabled || !channel.scte35AutoInsert) {
-    return
-  }
-  
-  // Fetch the master manifest
-  const manifest = await fetchOriginManifest(channel.originUrl)
-  if (!manifest) {
-    return
-  }
-  
-  // Parse SCTE-35 signals
-  const signals = parseSCTE35FromManifest(manifest)
-  if (signals.length === 0) {
-    return
-  }
-  
-  console.log(`📡 Found ${signals.length} SCTE-35 signal(s) in channel ${channel.id}`)
-  
-  // Find active break
-  const activeBreak = findActiveBreak(signals)
-  if (!activeBreak) {
-    return
-  }
-  
-  // Check if we've already processed this event
-  const eventId = activeBreak.binaryData?.spliceEventId?.toString() || activeBreak.id
-  const kvKey = getAdBreakKey(channel.id, `scte35_${channel.id}_${eventId}`)
-  
-  const existing = await env.ADBREAK_STATE.get(kvKey)
-  if (existing) {
-    console.log(`✓ Ad break already exists for event ${eventId}, skipping`)
-    return
-  }
-  
-  // New SCTE-35 signal detected!
-  const duration = getBreakDuration(activeBreak)
-  const startTime = activeBreak.programDateTime || new Date().toISOString()
-  
-  console.log(`🆕 New SCTE-35 ad break detected: channel=${channel.id}, event=${eventId}, duration=${duration}s`)
-  
-  // Pre-calculate ad decision
-  console.log(`⏳ Pre-calculating decision for channel ${channel.id}...`)
-  const decision = await preCalculateDecision(env, channel.id, duration)
-  console.log(`✅ Decision ready: ${decision.pod?.items?.length || 0} ad(s)`)
-  
-  // Build ad break state
-  const adBreakState: AdBreakState = {
-    channelId: channel.id,
-    eventId: `scte35_${channel.id}_${eventId}`,
-    source: 'scte35',
-    startTime: startTime,
-    duration: duration,
-    endTime: new Date(new Date(startTime).getTime() + duration * 1000).toISOString(),
-    decision: {
-      podId: decision.pod?.podId || 'unknown',
-      items: decision.pod?.items?.map((item: any) => ({
-        id: item.adId || item.podId,
-        duration: item.durationSec,
-        variants: {} // Will be filled by decision service
-      })) || []
-    },
-    createdAt: new Date().toISOString(),
-    scte35Data: {
-      pdt: activeBreak.programDateTime || startTime,
-      signalType: activeBreak.signalType || 'unknown',
-      eventId: eventId
+  // POST /start/:channelId - Start monitoring a channel
+  if (path.startsWith('/start/') && request.method === 'POST') {
+    const channelId = path.split('/')[2];
+    try {
+      await startChannelMonitoring(env, channelId);
+      return new Response(JSON.stringify({ success: true, channelId }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: String(error) }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      });
     }
   }
   
-  // Write to KV with TTL
-  const ttl = getAdBreakTTL(duration)
-  await env.ADBREAK_STATE.put(kvKey, JSON.stringify(adBreakState), {
-    expirationTtl: ttl
-  })
+  // POST /stop/:channelId - Stop monitoring a channel
+  if (path.startsWith('/stop/') && request.method === 'POST') {
+    const channelId = path.split('/')[2];
+    try {
+      await stopChannelMonitoring(env, channelId);
+      return new Response(JSON.stringify({ success: true, channelId }), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: String(error) }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+  }
   
-  console.log(`📝 Phase 2: Wrote SCTE-35 ad break to KV: ${kvKey} (TTL: ${ttl}s)`)
+  // GET /status/:channelId - Get monitoring status
+  if (path.startsWith('/status/') && request.method === 'GET') {
+    const channelId = path.split('/')[2];
+    try {
+      const status = await getMonitoringStatus(env, channelId);
+      return new Response(JSON.stringify(status), {
+        headers: { 'Content-Type': 'application/json' },
+      });
+    } catch (error) {
+      return new Response(JSON.stringify({ error: String(error) }), {
+        status: 500,
+        headers: { 'Content-Type': 'application/json' },
+      });
+    }
+  }
+  
+  return new Response('Not Found', { status: 404 });
 }
 
-/**
- * Main cron handler - polls all active channels
- */
 export default {
   async scheduled(event: ScheduledEvent, env: Env, ctx: ExecutionContext): Promise<void> {
-    const startTime = Date.now()
-    console.log('🔄 SCTE-35 Monitor: Starting poll cycle')
-    
-    try {
-      // Fetch all active channels with SCTE-35 enabled
-      const channels = await env.DB.prepare(`
-        SELECT 
-          id,
-          slug,
-          organization_id as organizationId,
-          origin_url as originUrl,
-          scte35_enabled as scte35Enabled,
-          scte35_auto_insert as scte35AutoInsert,
-          vast_enabled as vastEnabled,
-          vast_url as vastUrl,
-          default_ad_duration as defaultAdDuration
-        FROM channels
-        WHERE status = 'active'
-          AND scte35_enabled = 1
-          AND scte35_auto_insert = 1
-      `).all<ChannelInfo>()
-      
-      if (!channels.results || channels.results.length === 0) {
-        console.log('No active channels with SCTE-35 enabled')
-        return
-      }
-      
-      console.log(`📺 Processing ${channels.results.length} channel(s)`)
-      
-      // Process all channels in parallel
-      const promises = channels.results.map(channel => 
-        processChannel(env, channel).catch(error => {
-          console.error(`Error processing channel ${channel.id}:`, error)
-        })
-      )
-      
-      await Promise.all(promises)
-      
-      const duration = Date.now() - startTime
-      console.log(`✅ SCTE-35 Monitor: Poll cycle complete (${duration}ms)`)
-      
-    } catch (error) {
-      console.error('SCTE-35 Monitor: Fatal error:', error)
-    }
-  }
+    await handleScheduled(env);
+  },
+  
+  async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
+    return handleRequest(request, env);
+  },
 }
