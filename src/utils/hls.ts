@@ -362,8 +362,23 @@ export function replaceSegmentsWithAds(
         // DO NOT return - continue processing to append remaining content segments
       }
 
+      // CRITICAL FIX: Resume at the EXTINF tag for the next segment, not the segment URI itself
+      // resumeIndex currently points to the line AFTER the last skipped segment
+      // We need to back up to the EXTINF tag that precedes that segment
+      let resumeAtIndex = resumeIndex
+
+      // Search backwards from resumeIndex to find the EXTINF tag
+      while (resumeAtIndex > 0 && !lines[resumeAtIndex - 1].startsWith('#EXTINF:')) {
+        resumeAtIndex--
+      }
+
+      // If we found an EXTINF tag, back up one more to include it
+      if (resumeAtIndex > 0 && lines[resumeAtIndex - 1].startsWith('#EXTINF:')) {
+        resumeAtIndex--
+      }
+
       // Update loop index to resume point and CONTINUE processing remaining segments
-      i = resumeIndex - 1  // -1 because outer loop will increment
+      i = resumeAtIndex - 1  // -1 because outer loop will increment
       foundMarker = true  // Mark as processed to prevent duplicate insertion
       segmentsReplaced = skippedCount
       actualSkippedDuration = skippedDuration
