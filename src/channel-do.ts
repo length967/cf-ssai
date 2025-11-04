@@ -303,14 +303,33 @@ function selectAdVariant(viewerBitrate: number | null): string {
 }
 
 // -----------------------------------------------------------------------------
-// Helper: make ad decision via decision service worker
+// Helper: make ad decision via decision service worker (with caching support)
 // -----------------------------------------------------------------------------
-async function decision(env: Env, adPodBase: string, channel: string, durationSec: number, viewerInfo?: any): Promise<DecisionResponse> {
+async function decision(
+  env: Env,
+  adPodBase: string,
+  channel: string,
+  durationSec: number,
+  viewerInfo?: any,
+  cachedDecision?: DecisionResponse  // PRE-CALCULATED: Use this if available (avoids Worker binding call)
+): Promise<DecisionResponse> {
+  // PERFORMANCE OPTIMIZATION: Use pre-calculated decision if available
+  // This eliminates Worker binding calls and CPU timeout risk on hot path
+  if (cachedDecision) {
+    console.log(`✅ Using pre-calculated decision (cache hit): podId=${cachedDecision.pod?.podId}, items=${cachedDecision.pod?.items?.length || 0}`)
+    return cachedDecision
+  }
+
+  console.log(`⚠️  No cached decision, calling decision service (on-demand)`)
+
   // If DECISION service binding is available, use it
   if (env.DECISION) {
     const ctrl = new AbortController()
-    const to = setTimeout(() => ctrl.abort(), parseInt(env.DECISION_TIMEOUT_MS || "150", 10))
-    
+    // INCREASED TIMEOUT: 2000ms instead of 150ms for on-demand calls (less critical path)
+    // Pre-calculated decisions avoid this entirely
+    const timeoutMs = parseInt(env.DECISION_TIMEOUT_MS || "2000", 10)
+    const to = setTimeout(() => ctrl.abort(), timeoutMs)
+
     try {
       const response = await env.DECISION.fetch("https://decision/decision", {
         method: "POST",
@@ -318,18 +337,18 @@ async function decision(env: Env, adPodBase: string, channel: string, durationSe
         headers: { "content-type": "application/json" },
         signal: ctrl.signal,
       })
-      
+
       clearTimeout(to)
-      
+
       if (response.ok) {
         return await response.json()
       }
     } catch (err) {
       clearTimeout(to)
-      console.error("Decision service error:", err)
+      console.error(`Decision service error (timeout: ${timeoutMs}ms):`, err)
     }
   }
-  
+
   // Fallback: return empty response when decision service unavailable
   console.error("Decision service unavailable and no fallback configured")
   return {
@@ -862,9 +881,29 @@ export class ChannelDO {
               skippedDuration: 0,  // Will be calculated during first manifest generation
               processedEventIds: [scte35EventId],  // Initialize with current event ID
             }
+
+            // PERFORMANCE OPTIMIZATION: Pre-calculate decision asynchronously BEFORE viewers arrive
+            // This eliminates Worker binding calls on hot path and prevents CPU timeouts
+            console.log(`🚀 Pre-calculating ad decision for SCTE-35 break (channel=${channelId}, duration=${stableDuration}s)`)
+            try {
+              const preCalcStart = Date.now()
+              const preCalculatedDecision = await decision(this.env, adPodBase, channelId, stableDuration, {
+                scte35: activeBreak  // Pass SCTE-35 metadata for targeting
+              }, undefined)  // No cached decision yet (this IS the calculation)
+
+              newAdState.decision = preCalculatedDecision
+              newAdState.decisionCalculatedAt = Date.now()
+
+              const calcDuration = Date.now() - preCalcStart
+              console.log(`✅ Pre-calculated decision ready (${calcDuration}ms): podId=${preCalculatedDecision.pod?.podId}, items=${preCalculatedDecision.pod?.items?.length || 0}`)
+            } catch (err) {
+              console.error(`⚠️  Decision pre-calculation failed (will fall back to on-demand):`, err)
+              // Don't block ad state creation - on-demand fallback will handle it
+            }
+
             await saveAdState(this.state, newAdState)
             console.log(`✨ Created new SCTE-35 ad break: id=${stableId}, start=${new Date(startTime).toISOString()}, duration=${stableDuration}s (rounded from ${breakDurationSec}s), pdt=${scte35StartPDT}, eventId=${scte35EventId}`)
-            
+
             // Reload ad state for use in manifest generation below
             adState = newAdState
             adActive = true
@@ -910,8 +949,16 @@ export class ChannelDO {
         const viewerBitrate = extractBitrate(variant)
         const adVariant = selectAdVariant(viewerBitrate)
         
-        console.log(`Calling decision service: channelId=${channelId}, duration=${stableDuration}s, bitrate=${viewerBitrate}`)
-        
+        // PERFORMANCE OPTIMIZATION: Use pre-calculated decision if available in ad state
+        // This avoids Worker binding call and eliminates CPU timeout risk
+        const cachedDecision = adState?.decision
+
+        if (cachedDecision) {
+          console.log(`Using pre-calculated decision from ad state (age: ${Date.now() - (adState!.decisionCalculatedAt || 0)}ms)`)
+        } else {
+          console.log(`No cached decision, calling decision service: channelId=${channelId}, duration=${stableDuration}s, bitrate=${viewerBitrate}`)
+        }
+
         // Get ad decision from decision service (use per-channel ad pod base)
         // Pass channelId (e.g., "ch_demo_sports") not channel slug
         // Use stableDuration to ensure consistent ad selection
@@ -919,7 +966,7 @@ export class ChannelDO {
           variant,
           bitrate: viewerBitrate,
           scte35: activeBreak
-        })
+        }, cachedDecision)  // Pass cached decision if available
         
         console.log(`Decision response received: podId=${decisionResponse.pod?.podId}, items=${decisionResponse.pod?.items?.length || 0}`)
         
