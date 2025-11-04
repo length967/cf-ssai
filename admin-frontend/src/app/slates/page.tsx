@@ -377,12 +377,12 @@ export default function SlatesPage() {
 
                 <div className="space-y-2">
                   <Label htmlFor="channel">Channel (optional)</Label>
-                  <Select value={channelId} onValueChange={setChannelId}>
+                  <Select value={channelId || "default"} onValueChange={(val) => setChannelId(val === "default" ? "" : val)}>
                     <SelectTrigger id="channel">
                       <SelectValue placeholder="Use default bitrates" />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="">Use default bitrates</SelectItem>
+                      <SelectItem value="default">Use default bitrates</SelectItem>
                       {channels.map((ch) => (
                         <SelectItem key={ch.id} value={ch.id}>{ch.name}</SelectItem>
                       ))}
@@ -447,12 +447,12 @@ export default function SlatesPage() {
 
                 <div className="space-y-2">
                   <Label htmlFor="upload-channel">Channel (optional)</Label>
-                  <Select value={channelId} onValueChange={setChannelId}>
+                  <Select value={channelId || "default"} onValueChange={(val) => setChannelId(val === "default" ? "" : val)}>
                     <SelectTrigger id="upload-channel">
                       <SelectValue placeholder="Use default bitrates" />
                     </SelectTrigger>
                     <SelectContent>
-                      <SelectItem value="">Use default bitrates</SelectItem>
+                      <SelectItem value="default">Use default bitrates</SelectItem>
                       {channels.map((ch) => (
                         <SelectItem key={ch.id} value={ch.id}>{ch.name}</SelectItem>
                       ))}

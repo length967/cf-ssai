@@ -165,10 +165,17 @@ export function replaceSegmentsWithAds(
   const segmentsToReplace = Math.ceil(contentSkipDuration / contentSegmentDuration)
   
   console.log(`Ad duration: ${adDuration}s, SCTE-35 duration: ${contentSkipDuration}s, Content segment duration: ${contentSegmentDuration}s, Segments to skip: ${segmentsToReplace}`)
-  
+
+  // DISABLED: Manifest window awareness was causing inconsistent skip counts across variants
+  // When variants are requested at slightly different times (normal for HLS), they would
+  // see different manifest windows and skip different amounts of content, causing timeline desync
+  // Instead, we always skip the full SCTE-35 duration from wherever we find the marker
+  const effectiveSkipDuration = contentSkipDuration
+
   let foundMarker = false
   let segmentsReplaced = 0
-  
+  let actualSkippedDuration = 0
+
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
     
@@ -182,33 +189,29 @@ export function replaceSegmentsWithAds(
       
       // Add DISCONTINUITY before ad
       output.push("#EXT-X-DISCONTINUITY")
-      
-      // Insert ad segments with actual durations AND PDT tags for timeline continuity
-      let currentPDT = startPDT
-      
+
+      // Insert ad segments WITHOUT PDT tags
+      // CRITICAL: Ad segment PDTs are unnecessary after DISCONTINUITY and can cause timeline issues
+      // The DISCONTINUITY tag tells the player to reset its timeline tracking
+      // Adding PDTs calculated from historical SCTE-35 time creates backwards jumps
+      console.log(`Inserting ${adSegments.length} ad segments WITHOUT PDT tags (DISCONTINUITY resets timeline)`)
+
       for (let j = 0; j < adSegments.length; j++) {
         const segment = adSegments[j]
-        
-        // Add PDT tag for this ad segment (maintains live stream timeline)
-        output.push(`#EXT-X-PROGRAM-DATE-TIME:${currentPDT}`)
-        
+
+        // NO PDT TAG - let player handle timeline after DISCONTINUITY
+
         // Support both object format {url, duration} and legacy string format
-        let segmentDuration: number
-        
         if (typeof segment === 'string') {
           // Legacy: calculate duration (fallback)
-          segmentDuration = adDuration / adSegments.length
+          const segmentDuration = adDuration / adSegments.length
           output.push(`#EXTINF:${segmentDuration.toFixed(3)},`)
           output.push(segment)
         } else {
           // New: use actual duration from ad playlist
-          segmentDuration = segment.duration
           output.push(`#EXTINF:${segment.duration.toFixed(3)},`)
           output.push(segment.url)
         }
-        
-        // Advance PDT for next segment
-        currentPDT = addSecondsToTimestamp(currentPDT, segmentDuration)
       }
       
       // Add DISCONTINUITY after ad
@@ -247,8 +250,9 @@ export function replaceSegmentsWithAds(
         }
         skippedCount = segmentsSeen
       } else {
-        // First request: calculate skip based on duration
-        while (resumeIndex < lines.length && skippedDuration < contentSkipDuration) {
+        // First request: calculate skip based on duration (adjusted for window movement)
+        const targetSkipDuration = effectiveSkipDuration
+        while (resumeIndex < lines.length && skippedDuration < targetSkipDuration) {
           const line = lines[resumeIndex]
           
           // Parse EXTINF duration for this segment
@@ -270,33 +274,105 @@ export function replaceSegmentsWithAds(
       }
       
       console.log(`Skipped ${skippedCount} content segments (${skippedDuration.toFixed(2)}s of ${contentSkipDuration}s target) from index ${skipStartIndex} to ${resumeIndex}`)
-      
-      // CRITICAL FIX: Calculate resume PDT as last ad PDT + total ad duration
-      // This preserves linear timeline consistency and avoids playback jumps
-      // The PDT timeline must be continuous: start -> ad segments -> resume
-      const lastAdPDT = addSecondsToTimestamp(startPDT, adDuration)
-      output.push(`#EXT-X-PROGRAM-DATE-TIME:${lastAdPDT}`)
-      console.log(`Inserted calculated resume PDT for buffer continuity: ${lastAdPDT} (start: ${startPDT} + ${adDuration}s)`)
-      
-      // Update loop index to resume point
-      i = resumeIndex - 1  // -1 because outer loop will increment
-      
-      // Return skip stats for persistence
-      return {
-        manifest: output.join("\n"),
-        segmentsSkipped: skippedCount,
-        durationSkipped: skippedDuration
+
+      // CRITICAL FIX: Validate that we have enough remaining content segments
+      // Count remaining segments after the resume point
+      let remainingSegments = 0
+      for (let j = resumeIndex; j < lines.length; j++) {
+        if (!lines[j].startsWith('#') && lines[j].trim().length > 0) {
+          remainingSegments++
+        }
       }
+
+      console.log(`Remaining content segments after ad break: ${remainingSegments}`)
+
+      // CRITICAL: If no content segments remain, the manifest window has moved past the ad break
+      // Return with segmentsSkipped=0 to trigger SGAI fallback in the caller
+      if (remainingSegments === 0) {
+        console.error(`❌ No content segments remaining after ad insertion - manifest window has rolled past ad break`)
+        console.error(`   Ad started at ${startPDT}, tried to skip ${skippedDuration.toFixed(2)}s, but manifest has no segments left`)
+        return {
+          manifest: variantText,  // Return original manifest unmodified
+          segmentsSkipped: 0,      // Signal failure to trigger SGAI fallback
+          durationSkipped: 0
+        }
+      }
+
+      // CRITICAL FIX: Find and preserve the ACTUAL PDT from the resume segment
+      // DO NOT calculate resume PDT - the origin stream clock kept running during the ad break
+      // We must use the origin's timestamp to avoid timeline discontinuities
+      let resumePDT: string | null = null
+      let searchIndex = resumeIndex
+      let segmentsSearched = 0
+      const MAX_SEGMENTS_TO_SEARCH = 15  // Search up to 15 segments (handles sparse PDT tags)
+
+      // Look ahead to find the next PDT tag from the origin manifest
+      // Count SEGMENTS not lines (sparse PDT manifests have ~1 PDT per 10 segments)
+      while (searchIndex < lines.length && !resumePDT && segmentsSearched < MAX_SEGMENTS_TO_SEARCH) {
+        const searchLine = lines[searchIndex]
+
+        if (searchLine.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+          resumePDT = searchLine.replace('#EXT-X-PROGRAM-DATE-TIME:', '').trim()
+          console.log(`✅ Found origin resume PDT: ${resumePDT} (searched ${segmentsSearched} segments)`)
+          break
+        }
+
+        // Count actual segment URLs (not comment lines)
+        if (!searchLine.startsWith('#') && searchLine.trim().length > 0) {
+          segmentsSearched++
+        }
+
+        searchIndex++
+      }
+
+      if (!resumePDT && segmentsSearched >= MAX_SEGMENTS_TO_SEARCH) {
+        console.warn(`⚠️  Could not find resume PDT after searching ${segmentsSearched} segments`)
+      }
+
+      // Insert the resume PDT before continuing with content segments
+      if (resumePDT) {
+        // Use the ACTUAL PDT from origin - this preserves timeline continuity
+        output.push(`#EXT-X-PROGRAM-DATE-TIME:${resumePDT}`)
+        console.log(`✅ Inserted origin resume PDT: ${resumePDT} (start: ${startPDT}, skipped: ${skippedDuration.toFixed(2)}s, ad: ${adDuration.toFixed(2)}s)`)
+      } else {
+        // CRITICAL: Cannot find origin PDT - this will cause timeline issues
+        // Better to fail gracefully and trigger SGAI fallback than create intermittent stalls
+        console.error(`❌ CRITICAL: Cannot find origin resume PDT within search window`)
+        console.error(`   SCTE-35 start: ${startPDT}, skipped: ${skippedDuration.toFixed(2)}s`)
+        console.error(`   This likely means sparse PDT tags or SCTE-35 signal is too old`)
+        console.error(`   Failing gracefully to trigger SGAI fallback`)
+
+        return {
+          manifest: variantText,  // Return original manifest unmodified
+          segmentsSkipped: 0,     // Signal failure to trigger SGAI fallback
+          durationSkipped: 0
+        }
+      }
+
+      // Update loop index to resume point and CONTINUE processing remaining segments
+      i = resumeIndex - 1  // -1 because outer loop will increment
+      foundMarker = true  // Mark as processed to prevent duplicate insertion
+      segmentsReplaced = skippedCount
+      actualSkippedDuration = skippedDuration
+
+      // CRITICAL: DON'T return here - continue loop to append remaining content segments!
+      continue
     }
-    
+
     output.push(line)
   }
   
-  // No ad insertion occurred, return original manifest
+  // Return final manifest with skip stats (if ad was inserted) or zeros (if PDT not found)
+  if (segmentsReplaced > 0) {
+    console.log(`✅ Ad insertion completed: ${segmentsReplaced} segments replaced`)
+  } else {
+    console.warn(`⚠️  SCTE-35 PDT not found in manifest: ${scte35StartPDT} - ad break has rolled out of live window`)
+  }
+
   return {
     manifest: output.join("\n"),
-    segmentsSkipped: 0,
-    durationSkipped: 0
+    segmentsSkipped: segmentsReplaced,
+    durationSkipped: actualSkippedDuration
   }
 }
 

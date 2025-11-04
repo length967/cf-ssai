@@ -273,21 +273,166 @@ export function extractSCTE35Metadata(signal: SCTE35Signal): Record<string, any>
 }
 
 /**
- * Validate SCTE-35 signal completeness
+ * Validation result with detailed error information
+ */
+export interface SCTE35ValidationResult {
+  valid: boolean
+  errors: string[]
+  warnings: string[]
+}
+
+/**
+ * Comprehensive SCTE-35 signal validation
+ * Prevents crashes from malformed signals and provides detailed diagnostics
+ *
+ * @param signal - SCTE-35 signal to validate
+ * @param pdt - Optional PDT timestamp for temporal validation
+ * @returns Validation result with errors and warnings
+ */
+export function validateSCTE35Signal(signal: SCTE35Signal, pdt?: string): SCTE35ValidationResult {
+  const errors: string[] = []
+  const warnings: string[] = []
+
+  // ========================================
+  // CRITICAL VALIDATIONS (will reject signal)
+  // ========================================
+
+  // 1. ID validation
+  if (!signal.id || typeof signal.id !== 'string' || signal.id.trim().length === 0) {
+    errors.push('Missing or invalid signal ID')
+  }
+
+  // 2. Type validation
+  const validTypes: SCTE35SignalType[] = ['splice_insert', 'time_signal', 'return_signal']
+  if (!signal.type || !validTypes.includes(signal.type)) {
+    errors.push(`Invalid signal type: ${signal.type}. Must be one of: ${validTypes.join(', ')}`)
+  }
+
+  // 3. Duration validation for ad break starts
+  if (isAdBreakStart(signal)) {
+    const duration = getBreakDuration(signal)
+
+    // Duration must exist
+    if (!duration) {
+      errors.push('Ad break start signal missing duration (breakDuration or duration field required)')
+    }
+    // Duration must be positive
+    else if (duration <= 0) {
+      errors.push(`Invalid ad break duration: ${duration}s (must be > 0)`)
+    }
+    // Duration must be reasonable (0.1s to 300s = 5 minutes)
+    else if (duration < 0.1 || duration > 300) {
+      errors.push(`Unrealistic ad break duration: ${duration}s (must be 0.1-300 seconds)`)
+    }
+    // Warn about unusual durations
+    else if (duration < 5) {
+      warnings.push(`Very short ad break: ${duration}s (typical minimum is 5-10s)`)
+    } else if (duration > 180) {
+      warnings.push(`Very long ad break: ${duration}s (typical maximum is 120-180s)`)
+    }
+  }
+
+  // 4. PDT temporal validation (if provided)
+  if (pdt) {
+    try {
+      const pdtDate = new Date(pdt)
+
+      // PDT must be valid ISO 8601 timestamp
+      if (isNaN(pdtDate.getTime())) {
+        errors.push(`Invalid PDT timestamp format: ${pdt} (must be ISO 8601)`)
+      } else {
+        const now = Date.now()
+        const pdtTime = pdtDate.getTime()
+        const deltaMs = Math.abs(now - pdtTime)
+        const deltaMinutes = deltaMs / 60000
+
+        // PDT must be within reasonable time range
+        // Allow up to 10 minutes in past (for buffering/delays) and 5 minutes in future (for pre-roll)
+        if (deltaMinutes > 10 && pdtTime < now) {
+          errors.push(`PDT timestamp too far in past: ${pdt} (${deltaMinutes.toFixed(1)} minutes ago)`)
+        } else if (deltaMinutes > 5 && pdtTime > now) {
+          errors.push(`PDT timestamp too far in future: ${pdt} (${deltaMinutes.toFixed(1)} minutes ahead)`)
+        }
+        // Warn about old signals (but not reject)
+        else if (deltaMinutes > 2 && pdtTime < now) {
+          warnings.push(`PDT timestamp is ${deltaMinutes.toFixed(1)} minutes old (signal may be stale)`)
+        }
+      }
+    } catch (e) {
+      errors.push(`PDT timestamp parse error: ${e instanceof Error ? e.message : 'Unknown error'}`)
+    }
+  }
+
+  // 5. PTS validation (if present)
+  if (signal.pts !== undefined) {
+    // PTS must be non-negative integer
+    if (!Number.isInteger(signal.pts) || signal.pts < 0) {
+      errors.push(`Invalid PTS value: ${signal.pts} (must be non-negative integer)`)
+    }
+    // PTS must be reasonable (< 2^32 for 90kHz clock = ~13 hours)
+    else if (signal.pts > 4294967295) {
+      warnings.push(`Unusually large PTS value: ${signal.pts} (may indicate wrap-around)`)
+    }
+  }
+
+  // 6. Segment numbering validation (for multi-segment pods)
+  if (signal.segmentNum !== undefined || signal.segmentsExpected !== undefined) {
+    if (signal.segmentNum === undefined) {
+      warnings.push('segmentsExpected specified without segmentNum')
+    } else if (signal.segmentsExpected === undefined) {
+      warnings.push('segmentNum specified without segmentsExpected')
+    } else {
+      // Both present - validate consistency
+      if (signal.segmentNum < 0 || signal.segmentsExpected < 1) {
+        errors.push(`Invalid segment numbering: ${signal.segmentNum}/${signal.segmentsExpected}`)
+      } else if (signal.segmentNum >= signal.segmentsExpected) {
+        errors.push(`Segment number ${signal.segmentNum} >= expected count ${signal.segmentsExpected}`)
+      }
+    }
+  }
+
+  // ========================================
+  // WARNINGS (informational, won't reject)
+  // ========================================
+
+  // 7. Auto-return validation
+  if (signal.autoReturn === false && signal.type === 'splice_insert') {
+    warnings.push('Ad break without auto-return requires manual return signal (may cause timing issues)')
+  }
+
+  // 8. UPID validation (if present)
+  if (signal.upid && typeof signal.upid === 'string') {
+    if (signal.upid.trim().length === 0) {
+      warnings.push('UPID present but empty')
+    } else if (signal.upid.length > 256) {
+      warnings.push(`Unusually long UPID: ${signal.upid.length} characters`)
+    }
+  }
+
+  // 9. Binary data validation (if present)
+  if (signal.binaryData) {
+    if (signal.binaryData.crcValid === false) {
+      warnings.push('SCTE-35 binary data failed CRC validation (data may be corrupted)')
+    }
+    if (signal.binaryData.encrypted) {
+      warnings.push('SCTE-35 binary data is encrypted (limited metadata available)')
+    }
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    warnings
+  }
+}
+
+/**
+ * Legacy validation function (for backward compatibility)
+ * @deprecated Use validateSCTE35Signal() for detailed validation
  */
 export function isValidSCTE35Signal(signal: SCTE35Signal): boolean {
-  // Must have an ID
-  if (!signal.id) return false
-  
-  // Must have a type
-  if (!signal.type) return false
-  
-  // Break starts should have duration
-  if (isAdBreakStart(signal) && !getBreakDuration(signal)) {
-    return false
-  }
-  
-  return true
+  const result = validateSCTE35Signal(signal)
+  return result.valid
 }
 
 // ============================================================================

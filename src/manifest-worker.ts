@@ -295,10 +295,11 @@ export default {
     const hit = await cache.match(cacheKey)
     if (hit) return hit
 
-    // Coalesce identical misses per (channel, variant, bucket)
-    const doName = orgSlug 
-      ? `${orgSlug}:${channelSlug}:${variant}:wb${wb}`
-      : `${channelSlug}:${variant}:wb${wb}` // legacy format
+    // CRITICAL FIX: Route by channel ONLY (not variant) to share ad state across all renditions
+    // Per SCTE-35 Section 8.7: All renditions must splice at the same segmentation_event_id
+    const doName = orgSlug
+      ? `${orgSlug}:${channelSlug}`
+      : channelSlug // legacy format
     const id = env.CHANNEL_DO.idFromName(doName)
     const stub = env.CHANNEL_DO.get(id)
     

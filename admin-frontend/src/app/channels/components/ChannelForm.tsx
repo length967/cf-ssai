@@ -275,12 +275,12 @@ export function ChannelForm({ data, onChange, slates, isEditing }: ChannelFormPr
 
           <div className="space-y-2">
             <Label htmlFor="slate-video">Slate Video</Label>
-            <Select value={data.slate_id} onValueChange={(value) => updateField('slate_id', value)}>
+            <Select value={data.slate_id || "none"} onValueChange={(value) => updateField('slate_id', value === "none" ? "" : value)}>
               <SelectTrigger id="slate-video">
                 <SelectValue placeholder="No slate (use ad pod fallback)" />
               </SelectTrigger>
               <SelectContent>
-                <SelectItem value="">No slate (use ad pod fallback)</SelectItem>
+                <SelectItem value="none">No slate (use ad pod fallback)</SelectItem>
                 {slates.filter(s => s.status === 'ready').map(slate => (
                   <SelectItem key={slate.id} value={slate.id}>
                     {slate.name} ({slate.slate_type} - {slate.duration}s)

@@ -318,26 +318,62 @@ export function parseSCTE35Binary(base64Cmd: string): SCTE35BinaryData | null {
     let offset = 0
     
     // CRITICAL FIX: Handle wrapped/offset SCTE-35 data
-    // Some encoders wrap SCTE-35 in extra bytes - scan for 0xFC table_id
+    // Some encoders wrap SCTE-35 in extra bytes - detect and remove common wrapping patterns
     if (tableId !== 0xFC) {
       console.warn(`Invalid table_id at offset 0: ${tableId} (0x${tableId.toString(16)}), scanning for 0xFC...`)
-      
-      // Scan up to first 16 bytes for the 0xFC marker
+
+      // Log first 20 bytes as hex for debugging
+      const hexDump = Array.from(rawBuffer.slice(0, Math.min(20, rawBuffer.length)))
+        .map(b => b.toString(16).padStart(2, '0'))
+        .join(' ')
+      console.log(`First 20 bytes (hex): ${hexDump}`)
+
+      // Common wrapping patterns to detect:
+      // Pattern 1: 2-byte length prefix (0x00 0xNN 0xFC ...)
+      // Pattern 2: 4-byte header (0xNN 0xNN 0xNN 0xNN 0xFC ...)
+      // Pattern 3: Single padding byte (0xNN 0xFC ...)
+
       let found = false
-      for (let i = 1; i < Math.min(16, buffer.length - 14); i++) {
-        if (buffer.readUInt8(i) === 0xFC) {
-          console.log(`Found 0xFC table_id at offset ${i}, using adjusted buffer`)
-          offset = i
-          buffer = new BufferReader(rawBuffer.slice(i))
-          tableId = 0xFC
-          found = true
-          break
+      let detectedPattern: string | null = null
+
+      // Check for 2-byte length prefix
+      if (buffer.length >= 3 && buffer.readUInt8(0) === 0x00 && buffer.readUInt8(2) === 0xFC) {
+        console.log('Detected 2-byte length prefix wrapper pattern')
+        offset = 2
+        buffer = new BufferReader(rawBuffer.slice(2))
+        tableId = 0xFC
+        detectedPattern = '2-byte-length-prefix'
+        found = true
+      }
+      // Check for 4-byte header wrapper
+      else if (buffer.length >= 5 && buffer.readUInt8(4) === 0xFC) {
+        console.log('Detected 4-byte header wrapper pattern')
+        offset = 4
+        buffer = new BufferReader(rawBuffer.slice(4))
+        tableId = 0xFC
+        detectedPattern = '4-byte-header'
+        found = true
+      }
+      // Generic scan: extended range to 32 bytes for robustness
+      else {
+        for (let i = 1; i < Math.min(32, buffer.length - 14); i++) {
+          if (buffer.readUInt8(i) === 0xFC) {
+            console.log(`Found 0xFC table_id at offset ${i} (generic scan)`)
+            offset = i
+            buffer = new BufferReader(rawBuffer.slice(i))
+            tableId = 0xFC
+            detectedPattern = `generic-offset-${i}`
+            found = true
+            break
+          }
         }
       }
-      
+
       if (!found) {
-        console.error(`No valid SCTE-35 table_id (0xFC) found in first 16 bytes, falling back to attribute parsing`)
+        console.error(`No valid SCTE-35 table_id (0xFC) found in first 32 bytes, falling back to attribute parsing`)
         return null
+      } else if (detectedPattern) {
+        console.log(`Successfully unwrapped SCTE-35 using pattern: ${detectedPattern}`)
       }
     }
     

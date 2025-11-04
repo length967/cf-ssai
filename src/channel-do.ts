@@ -1,6 +1,6 @@
 import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, extractPDTs, extractBitrates } from "./utils/hls"
 import { signPath } from "./utils/sign"
-import { parseSCTE35FromManifest, isAdBreakStart, getBreakDuration, findActiveBreak } from "./utils/scte35"
+import { parseSCTE35FromManifest, isAdBreakStart, getBreakDuration, findActiveBreak, validateSCTE35Signal } from "./utils/scte35"
 import { getChannelConfig } from "./utils/channel-config"
 import type { Env } from "./manifest-worker"
 import type { DecisionResponse, BeaconMessage, SCTE35Signal } from "./types"
@@ -19,6 +19,11 @@ interface AdState {
   scte35StartPDT?: string  // PDT where ad break starts
   contentSegmentsToSkip?: number  // Number of content segments to skip
   skippedDuration?: number  // Duration of skipped content in seconds
+  // DEDUPLICATION: Track processed SCTE-35 event IDs to prevent duplicate ad breaks from rolling signals
+  processedEventIds?: string[]  // Array of SCTE-35 IDs that triggered this break
+  // PRE-CALCULATED DECISION: Store decision once to avoid repeated Worker binding calls and CPU timeouts
+  decision?: DecisionResponse  // Pre-calculated ad pod decision
+  decisionCalculatedAt?: number  // Timestamp when decision was calculated (for debugging)
 }
 
 const AD_STATE_KEY = "ad_state"
@@ -660,20 +665,43 @@ export class ChannelDO {
 
       // Parse SCTE-35 signals from origin manifest (with enhanced binary parsing)
       const scte35Signals = parseSCTE35FromManifest(origin)
-      const activeBreak = findActiveBreak(scte35Signals)
-      
+      let activeBreak = findActiveBreak(scte35Signals)
+
       if (scte35Signals.length > 0) {
         console.log(`Found ${scte35Signals.length} SCTE-35 signals`)
-        
+
         if (activeBreak) {
-          // Log enhanced binary data if available
-          if (activeBreak.binaryData) {
-            console.log(`SCTE-35 Binary Parsing: Event ID=${activeBreak.binaryData.spliceEventId}, ` +
-              `PTS=${activeBreak.pts ? `${activeBreak.pts} (${(activeBreak.pts / 90000).toFixed(3)}s)` : 'N/A'}, ` +
-              `CRC Valid=${activeBreak.binaryData.crcValid}, ` +
-              `Duration=${activeBreak.duration}s`)
+          // CRITICAL: Validate SCTE-35 signal before using it
+          // Extract PDT for temporal validation
+          const pdts = extractPDTs(origin)
+          const mostRecentPDT = pdts.length > 0 ? pdts[pdts.length - 1] : undefined
+
+          const validation = validateSCTE35Signal(activeBreak, mostRecentPDT)
+
+          // Log validation results
+          if (!validation.valid) {
+            console.error(`❌ SCTE-35 Validation FAILED for signal ${activeBreak.id}:`)
+            validation.errors.forEach(err => console.error(`   - ${err}`))
+
+            // Reject invalid signal - do not attempt ad insertion
+            activeBreak = null
+            console.log(`⚠️  Rejecting invalid SCTE-35 signal to prevent playback issues`)
           } else {
-            console.log(`SCTE-35 Attribute Parsing: ${activeBreak.id} (${activeBreak.duration}s)`)
+            // Log warnings but allow signal through
+            if (validation.warnings.length > 0) {
+              console.warn(`⚠️  SCTE-35 Validation warnings for signal ${activeBreak.id}:`)
+              validation.warnings.forEach(warn => console.warn(`   - ${warn}`))
+            }
+
+            // Log enhanced binary data if available
+            if (activeBreak.binaryData) {
+              console.log(`✅ SCTE-35 Binary Parsing: Event ID=${activeBreak.binaryData.spliceEventId}, ` +
+                `PTS=${activeBreak.pts ? `${activeBreak.pts} (${(activeBreak.pts / 90000).toFixed(3)}s)` : 'N/A'}, ` +
+                `CRC Valid=${activeBreak.binaryData.crcValid}, ` +
+                `Duration=${activeBreak.duration}s`)
+            } else {
+              console.log(`✅ SCTE-35 Attribute Parsing: ${activeBreak.id} (${activeBreak.duration}s)`)
+            }
           }
         }
       }
@@ -692,6 +720,11 @@ export class ChannelDO {
         mode = wantsSGAI(req) ? "sgai" : "ssai"
       }
 
+      // NOTE: SGAI (HLS Interstitials) only works with Safari/iOS/AVPlayer
+      // hls.js and most web players do NOT support HLS Interstitials
+      // Users can force SGAI with ?mode=sgai query param for Apple devices
+      // Default behavior: respect channel config or query param
+
       // Determine if we should inject ads (priority order):
       // 1. Live ad state from /cue API (highest priority)
       // 2. SCTE-35 signal detected (preferred for live streams)
@@ -704,6 +737,31 @@ export class ChannelDO {
       let breakDurationSec = 30
       let scte35StartPDT: string | null = null
       let adSource: "api" | "scte35" | "time" = "time"
+
+      // CRITICAL: Check if persisted ad state has expired
+      // Check both wall-clock expiration AND manifest-window expiration for SCTE-35 breaks
+      if (adActive && adState) {
+        // Wall-clock expiration (use <= to include boundary)
+        if (adState.endsAt <= now) {
+          console.log(`⏱️  Ad break expired (wall-clock): ended at ${new Date(adState.endsAt).toISOString()}, now is ${new Date(now).toISOString()} - clearing stale state`)
+          await this.state.storage.delete('adState')
+          adActive = false
+          adState = null
+        }
+        // CRITICAL: For SCTE-35 breaks, also check if PDT has rolled out of manifest window
+        // Live HLS windows are typically 2-3 minutes. If ad PDT is > 90 seconds old, it's stale
+        else if (adState.scte35StartPDT) {
+          const adStartTime = new Date(adState.scte35StartPDT).getTime()
+          const ageSeconds = (now - adStartTime) / 1000
+
+          if (ageSeconds > 90) {  // 90 second window (conservative for 2-minute manifest windows)
+            console.log(`⏱️  SCTE-35 ad break expired (manifest window): PDT ${adState.scte35StartPDT} is ${ageSeconds.toFixed(1)}s old - clearing stale state`)
+            await this.state.storage.delete('adState')
+            adActive = false
+            adState = null
+          }
+        }
+      }
 
       if (adActive) {
         // Live ad triggered via /cue API - highest priority
@@ -734,21 +792,53 @@ export class ChannelDO {
           if (pdts.length > 0) {
             scte35StartPDT = pdts[pdts.length - 1]  // Use most recent PDT near signal
           }
-          
-          // CRITICAL FIX: Check if existing ad state is still active and overlaps with this SCTE-35 signal
-          // This prevents creating duplicate ad breaks for rolling SCTE-35 signals in live manifests
+
+          // DEDUPLICATION: Check if we've already processed this SCTE-35 signal
+          // Rolling signals in live manifests can cause the same event to appear 5+ times
+          const scte35EventId = activeBreak.binaryData?.spliceEventId?.toString() || activeBreak.id
           const existingAdState = await loadAdState(this.state)
-          const hasActiveAdBreak = existingAdState && existingAdState.active && Date.now() < existingAdState.endsAt
-          
-          if (hasActiveAdBreak) {
-            // Reuse existing ad state - don't create a new one!
-            // This prevents "ad played twice" when SCTE-35 signals roll in the manifest window
-            const remainingMs = existingAdState!.endsAt - Date.now()
-            console.log(`🔄 Reusing active ad break: id=${existingAdState!.podId}, remaining=${(remainingMs / 1000).toFixed(1)}s`)
-            adState = existingAdState
-            adActive = true
-          } else if (!adActive) {
-            // Only create new ad state if no active break exists
+
+          // Check if this specific SCTE-35 event has been processed
+          if (existingAdState?.processedEventIds?.includes(scte35EventId)) {
+            console.log(`⏭️  Skipping duplicate SCTE-35 signal: ${scte35EventId} (already processed)`)
+            shouldInsertAd = false
+            adActive = false
+          } else {
+            // CRITICAL FIX: Check if existing ad state should be reused
+            // For SCTE-35 breaks with historical PDTs, we can't use wall clock expiration
+            // Instead, check if the SCTE-35 PDT falls within the existing break's time range
+            let hasActiveAdBreak = false
+
+            if (existingAdState && existingAdState.active && existingAdState.scte35StartPDT) {
+              const scte35Time = new Date(scte35StartPDT).getTime()
+              const existingStartTime = existingAdState.startedAt
+              const existingEndTime = existingAdState.endsAt
+
+              // Check if this SCTE-35 signal refers to the same time window (within 60s tolerance)
+              const timeDiff = Math.abs(scte35Time - existingStartTime)
+              hasActiveAdBreak = timeDiff < 60000  // 60 second window for deduplication
+
+              if (hasActiveAdBreak) {
+                console.log(`🔄 Reusing ad break for nearby SCTE-35 signal: existing_start=${new Date(existingStartTime).toISOString()}, new_pdt=${scte35StartPDT}, diff=${(timeDiff/1000).toFixed(1)}s`)
+              }
+            }
+
+            if (hasActiveAdBreak) {
+              // Add this event ID to the processed set to prevent reprocessing
+              if (!existingAdState!.processedEventIds) {
+                existingAdState!.processedEventIds = []
+              }
+              if (!existingAdState!.processedEventIds.includes(scte35EventId)) {
+                existingAdState!.processedEventIds.push(scte35EventId)
+                await saveAdState(this.state, existingAdState!)
+                console.log(`🔄 Reusing active ad break: id=${existingAdState!.podId}, added event ${scte35EventId} to dedup set, remaining=${((existingAdState!.endsAt - Date.now()) / 1000).toFixed(1)}s`)
+              } else {
+                console.log(`🔄 Reusing active ad break: id=${existingAdState!.podId}, event ${scte35EventId} already in dedup set`)
+              }
+              adState = existingAdState
+              adActive = true
+            } else if (!adActive) {
+              // Only create new ad state if no active break exists
             const startTime = scte35StartPDT ? new Date(scte35StartPDT).getTime() : now
           // CRITICAL FIX: Use integer milliseconds to avoid floating-point drift
             // This prevents HLS.js from detecting schedule changes mid-playback
@@ -770,19 +860,21 @@ export class ChannelDO {
               scte35StartPDT: scte35StartPDT || undefined,  // Stable PDT reference
               contentSegmentsToSkip: 0,  // Will be calculated during first manifest generation
               skippedDuration: 0,  // Will be calculated during first manifest generation
+              processedEventIds: [scte35EventId],  // Initialize with current event ID
             }
             await saveAdState(this.state, newAdState)
-            console.log(`✨ Created new SCTE-35 ad break: id=${stableId}, start=${new Date(startTime).toISOString()}, duration=${stableDuration}s (rounded from ${breakDurationSec}s), pdt=${scte35StartPDT}`)
+            console.log(`✨ Created new SCTE-35 ad break: id=${stableId}, start=${new Date(startTime).toISOString()}, duration=${stableDuration}s (rounded from ${breakDurationSec}s), pdt=${scte35StartPDT}, eventId=${scte35EventId}`)
             
             // Reload ad state for use in manifest generation below
             adState = newAdState
             adActive = true
+
+            if (channelTier !== 0 && scte35Tier === channelTier) {
+              console.log(`SCTE-35 tier match: tier=${channelTier} (0x${channelTier.toString(16).padStart(3, '0')}) - allowing ad`)
+            }
+            console.log(`✨ Created new SCTE-35 ad break: duration=${breakDurationSec}s, pdt=${scte35StartPDT}`)
           }
-          
-          if (channelTier !== 0 && scte35Tier === channelTier) {
-            console.log(`SCTE-35 tier match: tier=${channelTier} (0x${channelTier.toString(16).padStart(3, '0')}) - allowing ad`)
           }
-          console.log(`SCTE-35 break detected (auto-insert enabled): duration=${breakDurationSec}s, pdt=${scte35StartPDT}`)
         }
       } else if (isBreakMinute && channelConfig?.timeBasedAutoInsert) {
         // Fallback to time-based schedule (only if auto-insert enabled)
@@ -958,7 +1050,7 @@ export class ChannelDO {
                 if (totalDuration < stableDuration && Math.abs(totalDuration - stableDuration) > 1.0) {
                   const gapDuration = stableDuration - totalDuration
                   console.log(`⚠️  Ad duration mismatch: ad=${totalDuration.toFixed(2)}s, break=${stableDuration.toFixed(2)}s, gap=${gapDuration.toFixed(2)}s, padding with slate`)
-                  
+
                   // Fetch channel's slate configuration
                   try {
                     const slateSegments = await this.fetchSlateSegments(channelId, viewerBitrate, gapDuration)
@@ -989,15 +1081,44 @@ export class ChannelDO {
                     stableDuration,       // SCTE-35 break duration for content skipping
                     stableSkipCount       // Use cached skip count if available
                   )
-                  
-                  // CRITICAL: Persist skip stats on first request for subsequent use
-                  if (adState && (!adState.contentSegmentsToSkip || adState.contentSegmentsToSkip === 0)) {
-                    adState.contentSegmentsToSkip = result.segmentsSkipped
-                    adState.skippedDuration = result.durationSkipped
-                    await saveAdState(this.state, adState)
-                    console.log(`Persisted stable skip count: ${result.segmentsSkipped} segments (${result.durationSkipped.toFixed(2)}s)`)
+
+                  // HYBRID SSAI/SGAI: If SCTE-35 PDT not found in manifest (rolled out of window),
+                  // fall back to SGAI (HLS Interstitials) for late-joining viewers
+                  if (result.segmentsSkipped === 0) {
+                    console.log(`🔄 SSAI failed (PDT not in manifest), falling back to SGAI for late-joining viewer`)
+
+                    // Use SGAI interstitial insertion instead
+                    const adItem = pod.items.find(item => item.bitrate === viewerBitrate) || pod.items[0]
+                    const interstitialURI = await signAdPlaylist(signHost, this.env.SEGMENT_SECRET, adItem.playlistUrl)
+
+                    const sgai = addDaterangeInterstitial(
+                      cleanOrigin,
+                      adActive ? (adState!.podId || "ad") : pod.podId,
+                      startISO,
+                      stableDuration,
+                      interstitialURI
+                    )
+
+                    await this.env.BEACON_QUEUE.send(beaconMsg)
+                    return new Response(sgai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
                   }
-                  
+
+                  // SSAI succeeded - persist skip stats ONLY on first request (when skip count is unset/zero)
+                  // CRITICAL: Once set, never overwrite to ensure timeline consistency across all variants
+                  if (adState && (!adState.contentSegmentsToSkip || adState.contentSegmentsToSkip === 0)) {
+                    // Only persist if we actually skipped content (PDT was found in manifest)
+                    if (result.segmentsSkipped > 0) {
+                      adState.contentSegmentsToSkip = result.segmentsSkipped
+                      adState.skippedDuration = result.durationSkipped
+                      await saveAdState(this.state, adState)
+                      console.log(`✅ Persisted stable skip count (FIRST REQUEST): ${result.segmentsSkipped} segments (${result.durationSkipped.toFixed(2)}s)`)
+                    } else {
+                      console.log(`⚠️  Skip count is 0 (PDT not in window) - not persisting, will retry on next request`)
+                    }
+                  } else if (adState && adState.contentSegmentsToSkip) {
+                    console.log(`ℹ️  Using existing stable skip count: ${adState.contentSegmentsToSkip} segments (${adState.skippedDuration?.toFixed(2) || 'unknown'}s)`)
+                  }
+
                   await this.env.BEACON_QUEUE.send(beaconMsg)
                   return new Response(result.manifest, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
                 }
