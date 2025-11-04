@@ -911,7 +911,6 @@ export class ChannelDO {
             if (channelTier !== 0 && scte35Tier === channelTier) {
               console.log(`SCTE-35 tier match: tier=${channelTier} (0x${channelTier.toString(16).padStart(3, '0')}) - allowing ad`)
             }
-            console.log(`✨ Created new SCTE-35 ad break: duration=${breakDurationSec}s, pdt=${scte35StartPDT}`)
           }
           }
         }
@@ -945,27 +944,23 @@ export class ChannelDO {
           console.log(`Using calculated values: start=${startISO}, duration=${stableDuration}s (from ${breakDurationSec}s)`)
         }
         
-        // Extract viewer bitrate from variant and select matching ad pod
-        const viewerBitrate = extractBitrate(variant)
-        const adVariant = selectAdVariant(viewerBitrate)
-        
         // PERFORMANCE OPTIMIZATION: Use pre-calculated decision if available in ad state
         // This avoids Worker binding call and eliminates CPU timeout risk
         const cachedDecision = adState?.decision
 
         if (cachedDecision) {
-          console.log(`Using pre-calculated decision from ad state (age: ${Date.now() - (adState!.decisionCalculatedAt || 0)}ms)`)
+          console.log(`✅ Using pre-calculated decision from ad state (age: ${Date.now() - (adState!.decisionCalculatedAt || 0)}ms)`)
         } else {
-          console.log(`No cached decision, calling decision service: channelId=${channelId}, duration=${stableDuration}s, bitrate=${viewerBitrate}`)
+          console.log(`⚠️  No cached decision, calling decision service on-demand: channelId=${channelId}, duration=${stableDuration}s`)
         }
 
         // Get ad decision from decision service (use per-channel ad pod base)
         // Pass channelId (e.g., "ch_demo_sports") not channel slug
         // Use stableDuration to ensure consistent ad selection
+        // IMPORTANT: Don't pass viewer-specific bitrate/variant - decision service returns ALL variants
+        // This allows pre-calculated decisions to work for all viewers regardless of quality level
         const decisionResponse = await decision(this.env, adPodBase, channelId, stableDuration, {
-          variant,
-          bitrate: viewerBitrate,
-          scte35: activeBreak
+          scte35: activeBreak  // Only pass SCTE-35 metadata (same as pre-calculation)
         }, cachedDecision)  // Pass cached decision if available
         
         console.log(`Decision response received: podId=${decisionResponse.pod?.podId}, items=${decisionResponse.pod?.items?.length || 0}`)
