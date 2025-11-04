@@ -5,6 +5,8 @@ import { getChannelConfig } from "./utils/channel-config"
 import type { ChannelConfig } from "./utils/channel-config"
 import type { Env } from "./manifest-worker"
 import type { DecisionResponse, BeaconMessage, SCTE35Signal } from "./types"
+import type { AdBreakState } from "./types/adbreak-state"
+import { getAdBreakKey, getAdBreakTTL } from "./types/adbreak-state"
 
 // ============================================================================
 // CONFIGURATION CONSTANTS
@@ -67,6 +69,60 @@ async function clearAdState(state: DurableObjectState): Promise<void> {
   const currentVersion = await state.storage.get<number>('ad_state_version') || 0
   await state.storage.put('ad_state_version', currentVersion + 1)
   await state.storage.delete(AD_STATE_KEY)
+}
+
+/**
+ * Phase 1: Write ad break state to KV for stateless manifest serving
+ * This allows the manifest worker to read from KV instead of calling the DO
+ */
+async function writeAdBreakToKV(
+  env: Env,
+  channelId: string,
+  eventId: string,
+  adState: AdState,
+  source: 'scte35' | 'manual' | 'scheduled',
+  scte35Signal?: SCTE35Signal
+): Promise<void> {
+  try {
+    const kvState: AdBreakState = {
+      channelId,
+      eventId,
+      source,
+      startTime: new Date(adState.startedAt).toISOString(),
+      duration: adState.durationSec,
+      endTime: new Date(adState.endsAt).toISOString(),
+      decision: {
+        podId: adState.podId || 'unknown',
+        items: adState.decision?.pod?.items?.map(item => ({
+          id: item.adId || item.podId,
+          duration: item.durationSec,
+          variants: {} // Will be filled by decision service
+        })) || []
+      },
+      createdAt: new Date().toISOString()
+    }
+    
+    // Add SCTE-35 data if available
+    if (scte35Signal && adState.scte35StartPDT) {
+      kvState.scte35Data = {
+        pdt: adState.scte35StartPDT,
+        signalType: scte35Signal.signalType || 'unknown',
+        eventId: scte35Signal.binaryData?.spliceEventId?.toString() || eventId
+      }
+    }
+    
+    const key = getAdBreakKey(channelId, eventId)
+    const ttl = getAdBreakTTL(adState.durationSec)
+    
+    await env.ADBREAK_STATE.put(key, JSON.stringify(kvState), {
+      expirationTtl: ttl
+    })
+    
+    console.log(`📝 Phase 1: Wrote ad break to KV: ${key} (TTL: ${ttl}s)`)
+  } catch (error) {
+    console.error(`Failed to write ad break to KV:`, error)
+    // Don't throw - KV write is best-effort in Phase 1
+  }
 }
 
 /**
@@ -720,6 +776,16 @@ export class ChannelDO {
           }
           await saveAdState(this.state, s)
 
+          // Phase 1: Write manual ad break to KV for stateless manifest serving
+          const eventId = `manual_${channelId}_${Math.floor(now / 1000)}`
+          await writeAdBreakToKV(
+            this.env,
+            channelId,
+            eventId,
+            s,
+            'manual'
+          )
+
           // Best-effort beacon for ad-start
           await this.env.BEACON_QUEUE.send({
             event: "ad_start",
@@ -1028,6 +1094,16 @@ export class ChannelDO {
 
             await saveAdState(this.state, newAdState)
             console.log(`✨ Created new SCTE-35 ad break: id=${stableId}, start=${new Date(startTime).toISOString()}, duration=${stableDuration}s (rounded from ${breakDurationSec}s), pdt=${scte35StartPDT}, eventId=${scte35EventId}`)
+
+            // Phase 1: Write ad break to KV for stateless manifest serving
+            await writeAdBreakToKV(
+              this.env,
+              channelId,
+              stableId,
+              newAdState,
+              'scte35',
+              activeBreak
+            )
 
             // Reload ad state for use in manifest generation below
             adState = newAdState
