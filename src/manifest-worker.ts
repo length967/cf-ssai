@@ -3,7 +3,7 @@ import { nowSec, windowBucket } from "./utils/time"
 import { verifyJWT, parseJWTUnsafe } from "./utils/jwt"
 import { getChannelConfig, getConfigWithDefaults } from "./utils/channel-config"
 import { getActiveAdBreak } from "./utils/kv-adbreak"
-import { replaceSegmentsWithAds, addDaterangeInterstitial } from "./utils/hls"
+import { replaceSegmentsWithAds, addDaterangeInterstitial, extractMostRecentPDT } from "./utils/hls"
 import type { ViewerJWT, BeaconMessage } from "./types"
 
 // Bindings available to this Worker
@@ -367,9 +367,24 @@ export default {
             duration: item.duration
           }))
           
+          // For manual ad breaks, use the LIVE EDGE (most recent PDT) instead of historical PDT
+          // For SCTE-35 breaks, use the exact PDT from the signal
+          let insertionPDT: string
+          if (kvAdBreak.source === 'manual') {
+            const liveEdgePDT = extractMostRecentPDT(originText)
+            if (!liveEdgePDT) {
+              throw new Error('No PDT found in manifest - cannot insert ads')
+            }
+            insertionPDT = liveEdgePDT
+            console.log(`Manual ad break: inserting at live edge PDT: ${insertionPDT}`)
+          } else {
+            insertionPDT = kvAdBreak.scte35Data?.pdt || kvAdBreak.startTime
+            console.log(`SCTE-35 ad break: inserting at signal PDT: ${insertionPDT}`)
+          }
+          
           const result = replaceSegmentsWithAds(
             originText,
-            kvAdBreak.scte35Data?.pdt || kvAdBreak.startTime,
+            insertionPDT,
             adSegments,
             kvAdBreak.duration
           )

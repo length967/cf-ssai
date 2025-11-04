@@ -108,6 +108,23 @@ function addSecondsToTimestamp(isoTimestamp: string, seconds: number): string {
 }
 
 /**
+ * Extract the most recent (last) PDT from a manifest
+ * Used for inserting ads at the live edge
+ */
+export function extractMostRecentPDT(manifestText: string): string | null {
+  const lines = manifestText.split('\n')
+  let lastPDT: string | null = null
+  
+  for (const line of lines) {
+    if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+      lastPDT = line.replace('#EXT-X-PROGRAM-DATE-TIME:', '').trim()
+    }
+  }
+  
+  return lastPDT
+}
+
+/**
  * Parse average segment duration from manifest
  */
 function getAverageSegmentDuration(lines: string[]): number {
