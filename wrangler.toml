@@ -30,6 +30,12 @@ database_id = "0302f8ab-e592-4fa6-8bbf-7371759da6ed"
 binding = "CHANNEL_CONFIG_CACHE"
 id = "f03509ea56964ca3ad062b116a683dc4"
 
+# KV for ad break state (Phase 1: Hybrid architecture)
+[[kv_namespaces]]
+binding = "ADBREAK_STATE"
+id = "610235dd3e264254a59a72851a05d217"
+preview_id = "3b89bcc0ea0e412dbb06c5c507239575"
+
 # Queues for server-side beacons
 # Producer only - consumer is in separate beacon-consumer-worker
 [[queues.producers]]
