@@ -83,13 +83,12 @@ async function writeAdBreakToKV(
   source: 'scte35' | 'manual' | 'scheduled',
   scte35Signal?: SCTE35Signal
 ): Promise<void> {
-  try {
-    // Safety check: Ensure KV binding exists
-    if (!env.ADBREAK_STATE) {
-      console.error('❌ ADBREAK_STATE KV binding is undefined - cannot write to KV')
-      console.error('   Available bindings:', Object.keys(env))
-      return
-    }
+  // Safety check: Ensure KV binding exists
+  if (!env.ADBREAK_STATE) {
+    console.error('❌ ADBREAK_STATE KV binding is undefined - cannot write to KV')
+    console.error('   Available bindings:', Object.keys(env))
+    return
+  }
     const kvState: AdBreakState = {
       channelId,
       eventId,
@@ -120,15 +119,11 @@ async function writeAdBreakToKV(
     const key = getAdBreakKey(channelId, eventId)
     const ttl = getAdBreakTTL(adState.durationSec)
     
-    await env.ADBREAK_STATE.put(key, JSON.stringify(kvState), {
-      expirationTtl: ttl
-    })
-    
-    console.log(`📝 Phase 1: Wrote ad break to KV: ${key} (TTL: ${ttl}s)`)
-  } catch (error) {
-    console.error(`Failed to write ad break to KV:`, error)
-    // Don't throw - KV write is best-effort in Phase 1
-  }
+  await env.ADBREAK_STATE.put(key, JSON.stringify(kvState), {
+    expirationTtl: ttl
+  })
+  
+  console.log(`📝 Phase 1: Wrote ad break to KV: ${key} (TTL: ${ttl}s)`)
 }
 
 /**
