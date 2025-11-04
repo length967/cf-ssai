@@ -40,7 +40,7 @@ Client → Manifest Worker (stateless) → Origin
 
 ## Migration Phases
 
-### Phase 1: Hybrid Architecture ✅ (Current Target)
+### Phase 1: Hybrid Architecture ✅ COMPLETE
 
 **Goal:** Keep DO but add KV caching layer
 
@@ -51,11 +51,19 @@ Client → Manifest Worker (stateless) → Origin
 4. Test with existing channels
 
 **Implementation:**
-- [ ] Add KV binding to wrangler.toml
-- [ ] Create KV store: `wrangler kv:namespace create ADBREAK_STATE`
-- [ ] Add KV write logic to Channel DO
-- [ ] Add KV read logic to Manifest Worker
-- [ ] Update tests
+- [x] Add KV binding to wrangler.toml
+- [x] Create KV store: `wrangler kv namespace create ADBREAK_STATE`
+- [x] Add KV write logic to Channel DO
+- [x] Add KV read logic to Manifest Worker
+- [x] Fix channelId consistency between /cue and manifest paths
+- [x] Test end-to-end (writes + reads working!)
+
+**Results:**
+- ✅ KV writes working from DO (both /cue and SCTE-35 paths)
+- ✅ KV reads working from Manifest Worker
+- ✅ Proper TTL-based expiration (duration + 60s)
+- ✅ Complete AdBreakState data structure
+- ✅ ChannelId consistency resolved
 
 **Rollback:** Remove KV reads, keep DO logic
 
