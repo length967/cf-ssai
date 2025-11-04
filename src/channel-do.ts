@@ -84,6 +84,12 @@ async function writeAdBreakToKV(
   scte35Signal?: SCTE35Signal
 ): Promise<void> {
   try {
+    // Safety check: Ensure KV binding exists
+    if (!env.ADBREAK_STATE) {
+      console.error('❌ ADBREAK_STATE KV binding is undefined - cannot write to KV')
+      console.error('   Available bindings:', Object.keys(env))
+      return
+    }
     const kvState: AdBreakState = {
       channelId,
       eventId,
