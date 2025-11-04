@@ -779,13 +779,19 @@ export class ChannelDO {
 
           // Phase 1: Write manual ad break to KV for stateless manifest serving
           const eventId = `manual_${channelId}_${Math.floor(now / 1000)}`
-          await writeAdBreakToKV(
-            this.env,
-            channelId,
-            eventId,
-            s,
-            'manual'
-          )
+          let kvWriteStatus = 'not_attempted'
+          try {
+            await writeAdBreakToKV(
+              this.env,
+              channelId,
+              eventId,
+              s,
+              'manual'
+            )
+            kvWriteStatus = 'success'
+          } catch (error) {
+            kvWriteStatus = `error: ${error}`
+          }
 
           // Best-effort beacon for ad-start
           await this.env.BEACON_QUEUE.send({
@@ -795,7 +801,12 @@ export class ChannelDO {
             trackerUrls: [],
           })
 
-          return new Response(JSON.stringify({ ok: true, state: s }), {
+          return new Response(JSON.stringify({ 
+            ok: true, 
+            state: s,
+            kvWriteStatus,
+            hasKVBinding: !!this.env.ADBREAK_STATE
+          }), {
             headers: { "content-type": "application/json" },
           })
         } catch {
