@@ -3,6 +3,7 @@ import { nowSec, windowBucket } from "./utils/time"
 import { verifyJWT, parseJWTUnsafe } from "./utils/jwt"
 import { getChannelConfig, getConfigWithDefaults } from "./utils/channel-config"
 import { getActiveAdBreak } from "./utils/kv-adbreak"
+import { replaceSegmentsWithAds, addDaterangeInterstitial } from "./utils/hls"
 import type { ViewerJWT, BeaconMessage } from "./types"
 
 // Bindings available to this Worker
@@ -326,6 +327,75 @@ export default {
     if (kvAdBreak) {
       console.log(`🚀 Phase 1: KV HIT - Active ad break found for channel ${effectiveConfig.channelId}`)
       console.log(`   Source: ${kvAdBreak.source}, Duration: ${kvAdBreak.duration}s, Items: ${kvAdBreak.decision.items.length}`)
+      
+      // STATELESS SERVING: Serve manifest directly from KV without calling DO
+      try {
+        // Fetch origin manifest
+        const originResponse = await fetch(`${effectiveConfig.originUrl}/${channelSlug}/${variant}`)
+        if (!originResponse.ok) {
+          throw new Error(`Origin fetch failed: ${originResponse.status}`)
+        }
+        const originText = await originResponse.text()
+        
+        // Determine SSAI vs SGAI based on user agent
+        const ua = req.headers.get('user-agent') || ''
+        const isSafari = ua.includes('Safari') && !ua.includes('Chrome')
+        const forceMode = force === 'sgai' || force === 'ssai' ? force : null
+        const useSGAI = forceMode === 'sgai' || (!forceMode && isSafari)
+        
+        let modifiedManifest: string
+        
+        if (useSGAI) {
+          // SGAI: Add interstitial tag
+          console.log('Using SGAI (interstitial) for Safari/iOS')
+          const adPodUrl = kvAdBreak.decision.items[0]?.variants?.['1600000'] || 
+                          `${effectiveConfig.adPodBaseUrl}/${kvAdBreak.decision.podId}/1600k/playlist.m3u8`
+          modifiedManifest = addDaterangeInterstitial(
+            originText,
+            kvAdBreak.eventId,
+            kvAdBreak.startTime,
+            kvAdBreak.duration,
+            adPodUrl
+          )
+        } else {
+          // SSAI: Replace content segments with ads
+          console.log('Using SSAI (segment replacement)')
+          
+          // Build ad segments from decision
+          const adSegments = kvAdBreak.decision.items.map(item => ({
+            url: item.variants['1600000'] || `${effectiveConfig.adPodBaseUrl}/${item.id}/seg.ts`,
+            duration: item.duration
+          }))
+          
+          const result = replaceSegmentsWithAds(
+            originText,
+            kvAdBreak.scte35Data?.pdt || kvAdBreak.startTime,
+            adSegments,
+            kvAdBreak.duration
+          )
+          modifiedManifest = result.manifest
+          console.log(`SSAI: Skipped ${result.segmentsSkipped} segments (${result.durationSkipped.toFixed(2)}s)`)
+        }
+        
+        // Return modified manifest
+        const manifestResponse = new Response(modifiedManifest, {
+          headers: {
+            'Content-Type': 'application/vnd.apple.mpegurl',
+            'Cache-Control': `private, max-age=${channelConfig?.manifestCacheMaxAge || 2}`,
+            ...corsHeaders()
+          }
+        })
+        
+        // Cache the response
+        ctx.waitUntil(cache.put(cacheKey, manifestResponse.clone()))
+        
+        console.log(`✅ Served manifest from KV (stateless), no DO call`)
+        return manifestResponse
+        
+      } catch (error) {
+        console.error('Failed to serve from KV, falling back to DO:', error)
+        // Fall through to DO call below
+      }
     } else {
       console.log(`🔍 Phase 1: KV MISS - No active ad break in KV for channel ${effectiveConfig.channelId}, using DO`)
     }
