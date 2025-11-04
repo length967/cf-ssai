@@ -1,7 +1,7 @@
 // src/manifest-worker.ts
 import { nowSec, windowBucket } from "./utils/time"
 import { verifyJWT, parseJWTUnsafe } from "./utils/jwt"
-import { getChannelConfig, getConfigWithDefaults } from "./utils/channel-config"
+import { getChannelConfig, getChannelConfigById, getConfigWithDefaults } from "./utils/channel-config"
 import { getActiveAdBreak } from "./utils/kv-adbreak"
 import { replaceSegmentsWithAds, addDaterangeInterstitial, extractMostRecentPDT } from "./utils/hls"
 import type { ViewerJWT, BeaconMessage } from "./types"
@@ -122,7 +122,10 @@ export default {
         const org = body?.org || 'demo' // Default to demo for backward compatibility
         if (env.DB) {
           try {
-            const config = await getChannelConfig(env, org, channel)
+            // Check if channel parameter is an ID (starts with ch_) or a slug
+            const config = channel.startsWith('ch_')
+              ? await getChannelConfigById(env, channel)
+              : await getChannelConfig(env, org, channel)
             if (config?.id) {
               channelId = config.id
             }
@@ -337,11 +340,31 @@ export default {
         }
         const originText = await originResponse.text()
         
-        // Determine SSAI vs SGAI based on user agent
+        // Determine SSAI vs SGAI based on user agent and client capabilities
         const ua = req.headers.get('user-agent') || ''
-        const isSafari = ua.includes('Safari') && !ua.includes('Chrome')
+
+        // Detect genuine Apple devices and players that support HLS Interstitials
+        const isAppleDevice = /iPhone|iPad|iPod/.test(ua)
+        const isTvOS = /Apple TV|tvOS/.test(ua)
+        const isMacSafari = /Macintosh.*Safari/.test(ua) && !/Chrome|Firefox|Edge|Opera/.test(ua)
+        const isAVPlayerApp = /AVPlayer/.test(ua) || req.headers.has('X-AVPlayer-Version')
+
+        // Detect known incompatible players that don't support HLS Interstitials
+        const isIncompatiblePlayer = /Bitmovin|hls\.js|video\.js|ExoPlayer|dash\.js|WebView|wkwebview/i.test(ua)
+
+        // Check for Apple-specific headers
+        const hasAppleHeaders = req.headers.has('X-Apple-Request-UUID') ||
+                                req.headers.has('X-Playback-Session-Id')
+
+        // Determine if client supports HLS Interstitials (SGAI)
+        const supportsInterstitials = (isAppleDevice || isTvOS || isMacSafari || isAVPlayerApp || hasAppleHeaders)
+                                       && !isIncompatiblePlayer
+
         const forceMode = force === 'sgai' || force === 'ssai' ? force : null
-        const useSGAI = forceMode === 'sgai' || (!forceMode && isSafari)
+        const useSGAI = forceMode === 'sgai' || (!forceMode && supportsInterstitials)
+
+        // Log the decision for debugging
+        console.log(`Mode selection: ${useSGAI ? 'SGAI' : 'SSAI'} (UA: ${ua.substring(0, 50)}...)`)
         
         let modifiedManifest: string
         
