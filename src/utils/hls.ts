@@ -335,18 +335,14 @@ export function replaceSegmentsWithAds(
         output.push(`#EXT-X-PROGRAM-DATE-TIME:${resumePDT}`)
         console.log(`✅ Inserted origin resume PDT: ${resumePDT} (start: ${startPDT}, skipped: ${skippedDuration.toFixed(2)}s, ad: ${adDuration.toFixed(2)}s)`)
       } else {
-        // CRITICAL: Cannot find origin PDT - this will cause timeline issues
-        // Better to fail gracefully and trigger SGAI fallback than create intermittent stalls
-        console.error(`❌ CRITICAL: Cannot find origin resume PDT within search window`)
-        console.error(`   SCTE-35 start: ${startPDT}, skipped: ${skippedDuration.toFixed(2)}s`)
-        console.error(`   This likely means sparse PDT tags or SCTE-35 signal is too old`)
-        console.error(`   Failing gracefully to trigger SGAI fallback`)
-
-        return {
-          manifest: variantText,  // Return original manifest unmodified
-          segmentsSkipped: 0,     // Signal failure to trigger SGAI fallback
-          durationSkipped: 0
-        }
+        // WARNING: Cannot find origin PDT - continue anyway without PDT
+        // The DISCONTINUITY already reset the timeline, so player can handle missing PDT
+        // This is better than failing and stopping the stream
+        console.warn(`⚠️  Cannot find origin resume PDT within search window - continuing without PDT`)
+        console.warn(`   SCTE-35 start: ${startPDT}, skipped: ${skippedDuration.toFixed(2)}s`)
+        console.warn(`   This likely means sparse PDT tags or SCTE-35 signal is too old`)
+        console.warn(`   Stream will continue without PDT tags for a brief period`)
+        // DO NOT return - continue processing to append remaining content segments
       }
 
       // Update loop index to resume point and CONTINUE processing remaining segments

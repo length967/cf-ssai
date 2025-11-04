@@ -670,7 +670,8 @@ export class ChannelDO {
     const initialAdStateVersion = await this.state.storage.get<number>('ad_state_version') || 0
     
     return await this.state.blockConcurrencyWhile(async () => {
-      const u = new URL(req.url)
+      try {
+        const u = new URL(req.url)
 
       // Extract per-channel configuration from headers (set by manifest worker)
       const channelId = req.headers.get('X-Channel-Id') || 'unknown'
@@ -743,7 +744,9 @@ export class ChannelDO {
 
       // Extract viewer bitrate from variant name for ad selection
       // Format: scte35-audio_eng=128000-video=1000000.m3u8
-      const viewerBitrate = extractBitrateFromVariant(variant)
+      const extractedBitrate = extractBitrate(variant)
+      // Default to 1600k if extraction fails (fallback for unrecognized formats)
+      const viewerBitrate = extractedBitrate || 1600000
 
       // PERFORMANCE FIX: Check if this is a segment request FIRST
       // Segments should bypass all config/database lookups
@@ -756,7 +759,16 @@ export class ChannelDO {
       // This is a manifest - fetch channel configuration
       const orgSlug = req.headers.get('X-Org-Slug') || null
       const channelSlug = req.headers.get('X-Channel-Slug') || channel
-      const channelConfig = orgSlug ? await getChannelConfig(this.env, orgSlug, channelSlug) : null
+      let channelConfig = null
+      
+      if (orgSlug) {
+        try {
+          channelConfig = await getChannelConfig(this.env, orgSlug, channelSlug)
+        } catch (err) {
+          console.warn(`Failed to load channel config, using defaults: ${err}`)
+          // Continue with null config, will use defaults from headers
+        }
+      }
       
       console.log(`Channel config loaded: orgSlug=${orgSlug}, channelSlug=${channelSlug}, config=`, JSON.stringify(channelConfig))
 
@@ -1085,6 +1097,7 @@ export class ChannelDO {
         
         const pod = decisionResponse.pod
         const tracking = decisionResponse.tracking || { impressions: [], quartiles: {} }
+        const adVariant = selectAdVariant(viewerBitrate)  // Select best ad variant for viewer bitrate
         
         // Build beacon message with tracking URLs
         const beaconMsg: BeaconMessage = {
@@ -1325,9 +1338,21 @@ export class ChannelDO {
         this.state.storage.delete(AD_STATE_KEY).catch(() => {})
       }
 
-      // No ad break: return origin manifest, but strip origin SCTE-35 markers for Safari compatibility
-      const cleaned = stripOriginSCTE35Markers(origin)
-      return new Response(cleaned, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
+        // No ad break: return origin manifest, but strip origin SCTE-35 markers for Safari compatibility
+        const cleaned = stripOriginSCTE35Markers(origin)
+        return new Response(cleaned, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
+      } catch (error) {
+        console.error('🚨 CRITICAL ERROR in DO fetch handler:', error)
+        // Return 500 with error details for debugging
+        return new Response(JSON.stringify({
+          error: 'Internal server error',
+          message: error instanceof Error ? error.message : String(error),
+          timestamp: new Date().toISOString()
+        }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        })
+      }
     })
   }
 }

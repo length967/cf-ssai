@@ -421,7 +421,14 @@ async function runAdWaterfall(
       console.log(`Selected ad pod from DB: ${selectedPod.id} (${selectedPod.name})`)
       
       // Parse ad IDs from the pod
-      const adIds = JSON.parse(selectedPod.ads) as string[]
+      let adIds: string[] = []
+      try {
+        const parsed = JSON.parse(selectedPod.ads || '[]')
+        adIds = Array.isArray(parsed) ? parsed : []
+      } catch (e) {
+        console.warn(`Failed to parse ad IDs from pod ${selectedPod.id}:`, e)
+        adIds = []
+      }
       
       // Get the actual ad details
       const ads = await getAdsById(env, adIds)
