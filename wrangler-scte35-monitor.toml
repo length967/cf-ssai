@@ -1,0 +1,39 @@
+name = "cf-ssai-scte35-monitor"
+main = "src/scte35-monitor-worker.ts"
+compatibility_date = "2025-10-01"
+workers_dev = true
+
+# Cron trigger - runs every 2 seconds
+# Note: Minimum cron interval is 1 minute in production
+# For sub-minute polling, we'll need to use a different approach
+[triggers]
+crons = ["* * * * *"]  # Every minute (will optimize later)
+
+# D1 Database for channel configuration
+[[d1_databases]]
+binding = "DB"
+database_name = "ssai-admin"
+database_id = "0302f8ab-e592-4fa6-8bbf-7371759da6ed"
+
+# KV for ad break state
+[[kv_namespaces]]
+binding = "ADBREAK_STATE"
+id = "610235dd3e264254a59a72851a05d217"
+preview_id = "3b89bcc0ea0e412dbb06c5c507239575"
+
+# Service binding to decision worker
+[[services]]
+binding = "DECISION"
+service = "cf-ssai-decision"
+
+# Configuration
+[vars]
+DECISION_TIMEOUT_MS = "2000"
+
+# Observability
+[observability]
+enabled = true
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1.0
