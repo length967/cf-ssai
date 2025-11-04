@@ -12,6 +12,7 @@ const CONFIG_CACHE_TTL_MS = 60000 // 1 minute
 export interface Env {
   CHANNEL_DO: DurableObjectNamespace
   BEACON_QUEUE: Queue
+  TRANSCODE_QUEUE: Queue
   
   // Service bindings
   DECISION?: Fetcher  // Decision service worker
@@ -19,6 +20,10 @@ export interface Env {
   // Multi-tenant configuration database
   DB?: D1Database
   CHANNEL_CONFIG_CACHE?: KVNamespace
+  ADBREAK_STATE: KVNamespace  // Phase 1: Ad break state for stateless serving
+
+  // R2 Storage
+  R2?: R2Bucket
 
   // Global defaults (fallback if channel config not set)
   ORIGIN_VARIANT_BASE: string
