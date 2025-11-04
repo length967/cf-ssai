@@ -83,6 +83,7 @@ export type ViewerJWT = {
   export type SCTE35Signal = {
     id: string
     type: SCTE35SignalType
+    pdt?: string  // Program Date-Time from START-DATE (ISO 8601)
     pts?: number  // Presentation timestamp (from binary or X-PTS)
     duration?: number  // In seconds
     segmentationType?: SCTE35SegmentationType

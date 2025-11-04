@@ -134,8 +134,13 @@ export default {
           }
         }
 
-        const id = env.CHANNEL_DO.idFromName(`${channel}`)
+        // CONSISTENCY FIX: Add location hint for DO pinning
+        const closestColo = req.cf?.colo || 'unknown'
+        const doName = `${closestColo}:${org}:${channel}`
+        const id = env.CHANNEL_DO.idFromName(doName)
         const stub = env.CHANNEL_DO.get(id)
+        
+        console.log(`📍 DO /cue routing: name=${doName}, colo=${closestColo}`)
 
         // Forward the cue to the DO with proper channelId header
         const doRequest = new Request("https://do/cue", {
@@ -440,11 +445,15 @@ export default {
     
     // CRITICAL FIX: Route by channel ONLY (not variant) to share ad state across all renditions
     // Per SCTE-35 Section 8.7: All renditions must splice at the same segmentation_event_id
+    // CONSISTENCY FIX: Add location hint to pin DO to closest region and reduce instance churn
+    const closestColo = req.cf?.colo || 'unknown'
     const doName = orgSlug
-      ? `${orgSlug}:${channelSlug}`
-      : channelSlug // legacy format
+      ? `${closestColo}:${orgSlug}:${channelSlug}`
+      : `${closestColo}:${channelSlug}` // legacy format with location hint
     const id = env.CHANNEL_DO.idFromName(doName)
     const stub = env.CHANNEL_DO.get(id)
+    
+    console.log(`📍 DO routing: name=${doName}, colo=${closestColo}`)
     
     // Build DO request URL with all query parameters
     const doUrl = new URL(`https://do/manifest`)

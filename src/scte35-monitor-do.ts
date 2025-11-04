@@ -170,20 +170,34 @@ export class SCTE35MonitorDO extends DurableObject<Env> {
         return;
       }
 
-      // Fetch origin master manifest
-      const originUrl = `${channelRow.origin_url}/master.m3u8`;
-      const manifestRes = await fetch(originUrl, {
+      // Fetch origin variant manifest (SCTE-35 signals are in variant playlists, not master)
+      // Use a mid-bitrate variant for reliable SCTE-35 detection
+      let baseUrl = channelRow.origin_url;
+      // Remove trailing .m3u8 if present to construct variant URL
+      if (baseUrl.endsWith('.m3u8')) {
+        baseUrl = baseUrl.substring(0, baseUrl.lastIndexOf('/'));
+      }
+      
+      // Use the 1000k variant (common across streams)
+      const variantUrl = `${baseUrl}/scte35-audio_eng=128000-video=1000000.m3u8`;
+      
+      console.log(`[SCTE35Monitor] Fetching variant: ${variantUrl}`);
+      
+      const manifestRes = await fetch(variantUrl, {
         headers: { 'User-Agent': 'cf-ssai-scte35-monitor/1.0' },
       });
 
       if (!manifestRes.ok) {
-        throw new Error(`Origin fetch failed: ${manifestRes.status}`);
+        throw new Error(`Origin fetch failed: ${manifestRes.status} for ${variantUrl}`);
       }
 
       const manifestText = await manifestRes.text();
 
       // Detect SCTE-35 signals
-      const signal = detectSCTE35Signal(manifestText);
+      const signals = parseSCTE35FromManifest(manifestText);
+      console.log(`Total SCTE-35 signals found: ${signals.length}`);
+      
+      const signal = findActiveBreak(signals);
 
       if (signal) {
         console.log(`[SCTE35Monitor] 🎯 SCTE-35 signal detected for channel ${channelId}:`, signal);
@@ -207,10 +221,12 @@ export class SCTE35MonitorDO extends DurableObject<Env> {
 
         if (decisionRes.ok) {
           const adDecision = await decisionRes.json<any>();
+          console.log(`[SCTE35Monitor] Decision response:`, JSON.stringify(adDecision));
           
-          // Build ad break state
+          // Build variants map from decision service items
           const duration = getBreakDuration(signal) || channelRow.default_ad_duration || 30;
-          const startTime = new Date().toISOString();
+          // CRITICAL: Use the signal's PDT (from START-DATE) as the ad break start time
+          const startTime = signal.pdt || new Date().toISOString();
           const eventId = `scte35_${Date.now()}`;
           
           // Build variants map from decision service items

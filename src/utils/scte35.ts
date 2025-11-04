@@ -96,9 +96,13 @@ function parseDateRangeSCTE35(line: string): SCTE35Signal | null {
   // UPID (Unique Program Identifier)
   const upid = attrs["X-UPID"] || attrs["UPID"]
   
+  // PDT (Program Date-Time) from START-DATE
+  const pdt = attrs["START-DATE"]
+  
   return {
     id,
     type,
+    pdt,
     pts,
     duration,
     segmentationType,

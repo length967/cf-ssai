@@ -46,7 +46,10 @@ interface ChannelConfigEnv {
   CHANNEL_CONFIG_CACHE?: KVNamespace;
 }
 
-const CACHE_TTL_SECONDS = 0; // DISABLED FOR DEBUGGING - Set to 300 (5 min) for production
+// CONSISTENCY FIX: Reduced from 300s (5 min) to 60s (1 min) for faster config propagation
+// This ensures live config changes (via Admin API) are visible within 60 seconds
+// Trade-off: Slightly more D1 reads, but much better consistency
+const CACHE_TTL_SECONDS = 60; // 1 minute (was 300s)
 
 /**
  * Fetch channel configuration by organization slug and channel slug
@@ -118,6 +121,90 @@ export async function getChannelConfig(
     vastTimeoutMs: result.vastTimeoutMs || 2000,
     defaultAdDuration: result.defaultAdDuration || 30,
     // slatePodId removed - use slateId instead
+    timeBasedAutoInsert: Boolean(result.timeBasedAutoInsert),
+    segmentCacheMaxAge: result.segmentCacheMaxAge || 60,
+    manifestCacheMaxAge: result.manifestCacheMaxAge || 4,
+  };
+  
+  // Cache in KV for next time (if available and TTL > 0)
+  if (env.CHANNEL_CONFIG_CACHE && CACHE_TTL_SECONDS > 0) {
+    await env.CHANNEL_CONFIG_CACHE.put(
+      cacheKey,
+      JSON.stringify(config),
+      { expirationTtl: CACHE_TTL_SECONDS }
+    );
+  }
+  
+  return config;
+}
+
+/**
+ * Fetch channel configuration by channel ID (for /cue API)
+ * Uses KV cache if available, falls back to D1 query
+ */
+export async function getChannelConfigById(
+  env: ChannelConfigEnv,
+  channelId: string
+): Promise<ChannelConfig | null> {
+  const cacheKey = `channel:id:${channelId}`;
+  
+  // Try KV cache first (if available)
+  if (env.CHANNEL_CONFIG_CACHE) {
+    const cached = await env.CHANNEL_CONFIG_CACHE.get(cacheKey, 'json');
+    if (cached) {
+      return cached as ChannelConfig;
+    }
+  }
+  
+  // Query D1 database by channel ID
+  if (!env.DB) {
+    throw new Error('D1 database binding not configured');
+  }
+  
+  const result = await env.DB
+    .prepare(`
+      SELECT 
+        c.id,
+        c.organization_id as organizationId,
+        c.name,
+        c.slug,
+        c.origin_url as originUrl,
+        c.ad_pod_base_url as adPodBaseUrl,
+        c.sign_host as signHost,
+        c.scte35_enabled as scte35Enabled,
+        c.scte35_fallback_schedule as scte35FallbackSchedule,
+        c.scte35_auto_insert as scte35AutoInsert,
+        c.vast_enabled as vastEnabled,
+        c.vast_url as vastUrl,
+        c.vast_timeout_ms as vastTimeoutMs,
+        c.default_ad_duration as defaultAdDuration,
+        c.slate_pod_id as slatePodId,
+        c.time_based_auto_insert as timeBasedAutoInsert,
+        c.segment_cache_max_age as segmentCacheMaxAge,
+        c.manifest_cache_max_age as manifestCacheMaxAge,
+        c.status,
+        c.mode
+      FROM channels c
+      WHERE c.id = ?
+    `)
+    .bind(channelId)
+    .first<any>();
+  
+  if (!result) {
+    return null;
+  }
+  
+  // Parse JSON fields
+  const config: ChannelConfig = {
+    ...result,
+    scte35Enabled: Boolean(result.scte35Enabled),
+    scte35FallbackSchedule: result.scte35FallbackSchedule 
+      ? JSON.parse(result.scte35FallbackSchedule)
+      : undefined,
+    scte35AutoInsert: Boolean(result.scte35AutoInsert),
+    vastEnabled: Boolean(result.vastEnabled),
+    vastTimeoutMs: result.vastTimeoutMs || 2000,
+    defaultAdDuration: result.defaultAdDuration || 30,
     timeBasedAutoInsert: Boolean(result.timeBasedAutoInsert),
     segmentCacheMaxAge: result.segmentCacheMaxAge || 60,
     manifestCacheMaxAge: result.manifestCacheMaxAge || 4,

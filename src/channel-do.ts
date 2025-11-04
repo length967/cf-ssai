@@ -56,12 +56,18 @@ async function loadAdState(state: DurableObjectState): Promise<AdState | null> {
 }
 
 async function saveAdState(state: DurableObjectState, s: AdState): Promise<void> {
-  // Increment version to detect concurrent modifications
+  // CRITICAL: Write to durable storage FIRST before any in-memory caching
+  // This ensures state survives DO evictions and provides strong consistency
   const currentVersion = await state.storage.get<number>('ad_state_version') || 0
+  
+  // Atomic batch write to ensure consistency
   await state.storage.put({
     [AD_STATE_KEY]: s,
-    'ad_state_version': currentVersion + 1
+    'ad_state_version': currentVersion + 1,
+    'ad_state_updated_at': Date.now()
   })
+  
+  console.log(`💾 Persisted ad state to durable storage: version=${currentVersion + 1}, podId=${s.podId}, duration=${s.durationSec}s`)
 }
 
 async function clearAdState(state: DurableObjectState): Promise<void> {
@@ -556,10 +562,35 @@ async function signAdPlaylist(signHost: string, segmentSecret: string, playlistP
 export class ChannelDO {
   state: DurableObjectState
   env: Env
+  private instanceId: string
+  private instanceCreatedAt: number
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state
     this.env = env
+    
+    // MONITORING: Track DO instance lifecycle for churn detection
+    this.instanceId = Math.random().toString(36).substring(7)
+    this.instanceCreatedAt = Date.now()
+    
+    console.log(`🆕 DO Instance Created: id=${this.instanceId}, name=${state.id.name}`)
+    
+    // Load previous instance metadata from durable storage
+    this.state.blockConcurrencyWhile(async () => {
+      const prevInstanceId = await this.state.storage.get<string>('instance_id')
+      const prevCreatedAt = await this.state.storage.get<number>('instance_created_at')
+      
+      if (prevInstanceId && prevInstanceId !== this.instanceId) {
+        const lifetimeSeconds = prevCreatedAt ? (Date.now() - prevCreatedAt) / 1000 : 'unknown'
+        console.warn(`⚠️  DO Instance Churn Detected: prev=${prevInstanceId}, lifetime=${lifetimeSeconds}s, new=${this.instanceId}`)
+      }
+      
+      // Store current instance metadata
+      await this.state.storage.put({
+        'instance_id': this.instanceId,
+        'instance_created_at': this.instanceCreatedAt
+      })
+    })
   }
   
   /**
@@ -723,6 +754,15 @@ export class ChannelDO {
   }
 
   async fetch(req: Request): Promise<Response> {
+    // MONITORING: Log instance age and request count for churn analysis
+    const instanceAgeSeconds = (Date.now() - this.instanceCreatedAt) / 1000
+    const requestCount = await this.state.storage.get<number>('request_count') || 0
+    await this.state.storage.put('request_count', requestCount + 1)
+    
+    if (instanceAgeSeconds < 10) {
+      console.log(`🔵 Young DO instance serving request: age=${instanceAgeSeconds.toFixed(1)}s, requests=${requestCount + 1}`)
+    }
+    
     // CRITICAL FIX: Load ad state version before blocking to detect mid-request changes
     const initialAdStateVersion = await this.state.storage.get<number>('ad_state_version') || 0
     
@@ -775,6 +815,24 @@ export class ChannelDO {
             endsAt: now + durationSec * 1000,
             durationSec,
           }
+          
+          // CRITICAL FIX: Call decision service to populate variants for KV stateless serving
+          // This ensures the manifest worker can read variants from KV without calling the DO
+          console.log(`🚀 Calling decision service for manual cue (channel=${channelId}, duration=${durationSec}s)`)
+          try {
+            const preCalcStart = Date.now()
+            const preCalculatedDecision = await decision(this.env, adPodBase, channelId, durationSec, {}, undefined)
+            
+            s.decision = preCalculatedDecision
+            s.decisionCalculatedAt = Date.now()
+            
+            const calcDuration = Date.now() - preCalcStart
+            console.log(`✅ Decision ready (${calcDuration}ms): podId=${preCalculatedDecision.pod?.podId}, items=${preCalculatedDecision.pod?.items?.length || 0}`)
+          } catch (err) {
+            console.error(`⚠️  Decision service call failed for manual cue:`, err)
+            // Continue without decision - will use fallback in manifest worker
+          }
+          
           await saveAdState(this.state, s)
 
           // Phase 1: Write manual ad break to KV for stateless manifest serving
