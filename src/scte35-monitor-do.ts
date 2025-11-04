@@ -155,7 +155,7 @@ export class SCTE35MonitorDO extends DurableObject<Env> {
     try {
       // Fetch channel config from D1
       const channelRow = await this.env.DB.prepare(
-        'SELECT origin_url, vast_url, default_ad_duration, scte35_enabled FROM channels WHERE channel_id = ?'
+        'SELECT origin_url, vast_url, default_ad_duration, scte35_enabled FROM channels WHERE id = ?'
       ).bind(channelId).first<{
         origin_url: string;
         vast_url: string;

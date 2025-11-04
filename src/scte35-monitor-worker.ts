@@ -97,7 +97,7 @@ async function handleScheduled(env: Env): Promise<void> {
   try {
     // Fetch all active channels with SCTE-35 enabled
     const result = await env.DB.prepare(`
-      SELECT channel_id as id
+      SELECT id
       FROM channels
       WHERE scte35_enabled = 1
     `).all<{ id: string }>();
