@@ -2,6 +2,7 @@
 import { nowSec, windowBucket } from "./utils/time"
 import { verifyJWT, parseJWTUnsafe } from "./utils/jwt"
 import { getChannelConfig, getConfigWithDefaults } from "./utils/channel-config"
+import { getActiveAdBreak } from "./utils/kv-adbreak"
 import type { ViewerJWT, BeaconMessage } from "./types"
 
 // Bindings available to this Worker
@@ -300,6 +301,16 @@ export default {
     const hit = await cache.match(cacheKey)
     if (hit) return hit
 
+    // Phase 1: Check KV for active ad break (hybrid architecture)
+    // Try KV first for better performance, fallback to DO if not found
+    const kvAdBreak = await getActiveAdBreak(env, effectiveConfig.channelId)
+    if (kvAdBreak) {
+      console.log(`🚀 Phase 1: KV HIT - Active ad break found for channel ${effectiveConfig.channelId}`)
+      console.log(`   Source: ${kvAdBreak.source}, Duration: ${kvAdBreak.duration}s, Items: ${kvAdBreak.decision.items.length}`)
+    } else {
+      console.log(`🔍 Phase 1: KV MISS - No active ad break in KV for channel ${effectiveConfig.channelId}, using DO`)
+    }
+    
     // CRITICAL FIX: Route by channel ONLY (not variant) to share ad state across all renditions
     // Per SCTE-35 Section 8.7: All renditions must splice at the same segmentation_event_id
     const doName = orgSlug
