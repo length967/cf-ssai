@@ -11,6 +11,70 @@ import type { ViewerJWT, BeaconMessage } from "./types"
 const configCache = new Map<string, {config: any, expires: number}>()
 const CONFIG_CACHE_TTL_MS = 60000 // 1 minute
 
+/**
+ * Extract bitrate (in bps) from variant filename
+ * Supports multiple formats:
+ * - Simple: v_1600k.m3u8 → 1600000
+ * - Unified Streaming: video=800000 → 800000
+ * - Legacy: 1600k.m3u8 → 1600000
+ */
+function extractBitrateFromVariant(variant: string): number | null {
+  // Match Unified Streaming format: video=1000000
+  const unifiedMatch = variant.match(/video=(\d+)/i)
+  if (unifiedMatch) {
+    return parseInt(unifiedMatch[1], 10)
+  }
+
+  // Match simple format: v_1600k, v_800k, 1600k, etc.
+  const simpleMatch = variant.match(/(\d+)k/i)
+  if (simpleMatch) {
+    return parseInt(simpleMatch[1], 10) * 1000
+  }
+
+  return null
+}
+
+/**
+ * Select best matching ad variant based on viewer's current bitrate
+ * Uses fallback chain: exact match → closest lower → lowest available
+ */
+function selectBestAdVariant(
+  adVariants: Record<string, string>,
+  requestedBitrate: number | null
+): string | null {
+  const available = Object.keys(adVariants)
+
+  if (available.length === 0) {
+    return null
+  }
+
+  // If no bitrate detected, return mid-tier or first available
+  if (!requestedBitrate) {
+    const bitrates = available.map(k => parseInt(k)).sort((a, b) => a - b)
+    const midIndex = Math.floor(bitrates.length / 2)
+    return adVariants[bitrates[midIndex].toString()]
+  }
+
+  // Try exact match first
+  if (adVariants[requestedBitrate.toString()]) {
+    return adVariants[requestedBitrate.toString()]
+  }
+
+  // Find closest lower bitrate (prevents buffering)
+  const bitrates = available
+    .map(k => parseInt(k))
+    .sort((a, b) => b - a) // Descending order
+
+  for (const bitrate of bitrates) {
+    if (bitrate <= requestedBitrate) {
+      return adVariants[bitrate.toString()]
+    }
+  }
+
+  // Fallback to lowest available (most conservative)
+  return adVariants[bitrates[bitrates.length - 1].toString()]
+}
+
 export interface Env {
   CHANNEL_DO: DurableObjectNamespace
   BEACON_QUEUE: Queue
@@ -376,8 +440,31 @@ export default {
         if (useSGAI) {
           // SGAI: Add interstitial tag
           console.log('Using SGAI (interstitial) for Safari/iOS')
-          const adPodUrl = kvAdBreak.decision.items[0]?.variants?.['1600000'] || 
-                          `${effectiveConfig.adPodBaseUrl}/${kvAdBreak.decision.podId}/1600k/playlist.m3u8`
+
+          // Extract viewer's current bitrate from the requested variant
+          const requestedBitrate = extractBitrateFromVariant(variant)
+          console.log(`Viewer requested variant: ${variant} (bitrate: ${requestedBitrate})`)
+
+          // Select best matching ad variant
+          const firstAd = kvAdBreak.decision.items[0]
+          let adPodUrl: string
+
+          if (firstAd?.variants && Object.keys(firstAd.variants).length > 0) {
+            const selectedVariant = selectBestAdVariant(firstAd.variants, requestedBitrate)
+            if (selectedVariant) {
+              adPodUrl = selectedVariant
+              console.log(`Selected ad variant: ${adPodUrl} (matched to viewer bitrate: ${requestedBitrate})`)
+            } else {
+              // Fallback to first available variant
+              adPodUrl = Object.values(firstAd.variants)[0]
+              console.log(`Using first available ad variant: ${adPodUrl}`)
+            }
+          } else {
+            // Legacy fallback: construct URL
+            adPodUrl = `${effectiveConfig.adPodBaseUrl}/${kvAdBreak.decision.podId}/1600k/playlist.m3u8`
+            console.log(`No variants available, using legacy URL: ${adPodUrl}`)
+          }
+
           modifiedManifest = addDaterangeInterstitial(
             originText,
             kvAdBreak.eventId,
@@ -388,12 +475,36 @@ export default {
         } else {
           // SSAI: Replace content segments with ads
           console.log('Using SSAI (segment replacement)')
-          
-          // Build ad segments from decision
-          const adSegments = kvAdBreak.decision.items.map(item => ({
-            url: item.variants['1600000'] || `${effectiveConfig.adPodBaseUrl}/${item.id}/seg.ts`,
-            duration: item.duration
-          }))
+
+          // Extract viewer's current bitrate from the requested variant
+          const requestedBitrate = extractBitrateFromVariant(variant)
+          console.log(`Viewer requested variant: ${variant} (bitrate: ${requestedBitrate})`)
+
+          // Build ad segments from decision with bitrate-matched variants
+          const adSegments = kvAdBreak.decision.items.map(item => {
+            let adUrl: string
+
+            if (item.variants && Object.keys(item.variants).length > 0) {
+              const selectedVariant = selectBestAdVariant(item.variants, requestedBitrate)
+              if (selectedVariant) {
+                adUrl = selectedVariant
+                console.log(`Ad item ${item.id}: selected variant for bitrate ${requestedBitrate}`)
+              } else {
+                // Fallback to first available variant
+                adUrl = Object.values(item.variants)[0]
+                console.log(`Ad item ${item.id}: using first available variant`)
+              }
+            } else {
+              // Legacy fallback: construct segment URL
+              adUrl = `${effectiveConfig.adPodBaseUrl}/${item.id}/seg.ts`
+              console.log(`Ad item ${item.id}: using legacy segment URL`)
+            }
+
+            return {
+              url: adUrl,
+              duration: item.duration
+            }
+          })
           
           // For manual ad breaks, use the LIVE EDGE (most recent PDT) instead of historical PDT
           // For SCTE-35 breaks, use the exact PDT from the signal

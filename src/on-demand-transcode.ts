@@ -238,6 +238,12 @@ export async function releaseTranscodeLock(
   adId: string,
   bitrates: number[]
 ): Promise<void> {
+  // CRITICAL FIX: Check if KV is available before deleting
+  if (!env.KV) {
+    console.warn('KV namespace not available, skipping lock release');
+    return;
+  }
+  
   const lockKey = `transcode_lock:${adId}:${bitrates.sort().join(',')}`;
   await env.KV.delete(lockKey);
   console.log(`Released transcode lock: ${lockKey}`);
