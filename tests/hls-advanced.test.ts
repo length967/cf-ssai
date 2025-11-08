@@ -3,15 +3,15 @@
 
 import { strict as assert } from "node:assert"
 import { test, describe } from "node:test"
-import { 
-  insertDiscontinuity, 
-  addDaterangeInterstitial,
+import {
+  insertDiscontinuity,
+  injectInterstitialCues,
   replaceSegmentsWithAds,
   extractPDTs,
   findSegmentAtPDT,
   calculateManifestDuration,
   parseVariant
-} from "../src/utils/hls"
+} from "../src/utils/hls.ts"
 
 const SAMPLE_MANIFEST = `#EXTM3U
 #EXT-X-VERSION:7
@@ -158,93 +158,111 @@ describe("HLS DISCONTINUITY Insertion", () => {
   })
 })
 
-describe("HLS Interstitial DATERANGE", () => {
-  test("addDaterangeInterstitial() adds valid SGAI tag", () => {
-    const result = addDaterangeInterstitial(
-      SAMPLE_MANIFEST,
-      "ad-123",
-      "2025-10-31T12:00:08.000Z",
-      30,
-      "https://ads.example.com/ad.m3u8"
-    )
-    
-    assert.ok(result.includes('#EXT-X-DATERANGE:'))
-    assert.ok(result.includes('ID="ad-123"'))
-    assert.ok(result.includes('CLASS="com.apple.hls.interstitial"'))
-    assert.ok(result.includes('START-DATE="2025-10-31T12:00:08.000Z"'))
-    assert.ok(result.includes('DURATION=30.000'))
-    assert.ok(result.includes('X-ASSET-URI="https://ads.example.com/ad.m3u8"'))
+describe("HLS Interstitial Markers", () => {
+  const SAMPLE_PAYLOAD = "/////w=="
+
+  test("injectInterstitialCues() adds cue-out and cue-in records with hex SCTE-35", () => {
+    const result = injectInterstitialCues(SAMPLE_MANIFEST, {
+      id: "ad-123",
+      startDateISO: "2025-10-31T12:00:08.000Z",
+      durationSec: 30,
+      assetURI: "https://ads.example.com/ad.m3u8",
+      scte35Payload: SAMPLE_PAYLOAD
+    })
+
+    const lines = result.split("\n")
+    const dateranges = lines.filter(l => l.startsWith("#EXT-X-DATERANGE:"))
+    assert.equal(dateranges.length, 2)
+    assert.ok(dateranges.some(l => l.includes('SCTE35-OUT=0x')))
+    assert.ok(dateranges.some(l => l.includes('SCTE35-IN=0x')))
+
+    const cueOut = lines.find(l => l.startsWith('#EXT-X-CUE-OUT'))
+    assert.ok(cueOut?.includes('DURATION=30.000'))
+    assert.ok(cueOut?.includes('SCTE35=0x'))
+    assert.ok(lines.some(l => l.trim() === '#EXT-X-CUE-IN'))
   })
 
-  test("addDaterangeInterstitial() includes playout controls", () => {
-    const result = addDaterangeInterstitial(
-      SAMPLE_MANIFEST,
-      "ad-123",
-      "2025-10-31T12:00:08.000Z",
-      30,
-      "https://ads.example.com/ad.m3u8",
-      "skip-restrictions=10"
-    )
-    
+  test("injectInterstitialCues() includes playout controls", () => {
+    const result = injectInterstitialCues(SAMPLE_MANIFEST, {
+      id: "ad-123",
+      startDateISO: "2025-10-31T12:00:08.000Z",
+      durationSec: 30,
+      assetURI: "https://ads.example.com/ad.m3u8",
+      controls: "skip-restrictions=10"
+    })
+
     assert.ok(result.includes('X-PLAYOUT-CONTROLS="skip-restrictions=10"'))
   })
 
-  test("addDaterangeInterstitial() uses default controls if not specified", () => {
-    const result = addDaterangeInterstitial(
-      SAMPLE_MANIFEST,
-      "ad-123",
-      "2025-10-31T12:00:08.000Z",
-      30,
-      "https://ads.example.com/ad.m3u8"
-    )
-    
+  test("injectInterstitialCues() uses default controls when not specified", () => {
+    const result = injectInterstitialCues(SAMPLE_MANIFEST, {
+      id: "ad-123",
+      startDateISO: "2025-10-31T12:00:08.000Z",
+      durationSec: 30,
+      assetURI: "https://ads.example.com/ad.m3u8"
+    })
+
     assert.ok(result.includes('X-PLAYOUT-CONTROLS="skip-restrictions=6"'))
   })
 
-  test("addDaterangeInterstitial() handles special characters in URLs", () => {
+  test("injectInterstitialCues() handles special characters in URLs", () => {
     const urlWithQuery = "https://ads.example.com/ad.m3u8?token=abc123&exp=9999"
-    const result = addDaterangeInterstitial(
-      SAMPLE_MANIFEST,
-      "ad-123",
-      "2025-10-31T12:00:08.000Z",
-      30,
-      urlWithQuery
-    )
-    
+    const result = injectInterstitialCues(SAMPLE_MANIFEST, {
+      id: "ad-123",
+      startDateISO: "2025-10-31T12:00:08.000Z",
+      durationSec: 30,
+      assetURI: urlWithQuery
+    })
+
     assert.ok(result.includes(urlWithQuery))
   })
 
-  test("addDaterangeInterstitial() preserves line endings", () => {
+  test("injectInterstitialCues() preserves line endings", () => {
     const withNewline = SAMPLE_MANIFEST + "\n"
-    const result = addDaterangeInterstitial(
-      withNewline,
-      "ad-123",
-      "2025-10-31T12:00:08.000Z",
-      30,
-      "https://ads.example.com/ad.m3u8"
-    )
-    
-    // Should not add extra newline
+    const result = injectInterstitialCues(withNewline, {
+      id: "ad-123",
+      startDateISO: "2025-10-31T12:00:08.000Z",
+      durationSec: 30,
+      assetURI: "https://ads.example.com/ad.m3u8"
+    })
+
     assert.ok(!result.endsWith("\n\n"))
   })
 })
 
 describe("SSAI Segment Replacement", () => {
-  test("replaceSegmentsWithAds() inserts DISCONTINUITY tags around ad pod", () => {
+  test("replaceSegmentsWithAds() omits DISCONTINUITY when containers match", () => {
     const adSegments = [
       "https://ads.example.com/ad_seg_1.m4s",
       "https://ads.example.com/ad_seg_2.m4s"
     ]
-    
-    const result = replaceSegmentsWithAds(
+
+    const { manifest } = replaceSegmentsWithAds(
       SAMPLE_MANIFEST,
       "2025-10-31T12:00:08.000Z",
       adSegments,
       30
     )
-    
-    const discontinuityCount = (result.match(/#EXT-X-DISCONTINUITY/g) || []).length
-    assert.equal(discontinuityCount, 2, "Should have 2 DISCONTINUITY tags")
+
+    const discontinuityCount = (manifest.match(/#EXT-X-DISCONTINUITY/g) || []).length
+    assert.equal(discontinuityCount, 0, "Should omit DISCONTINUITY when codecs/timebases match")
+  })
+
+  test("replaceSegmentsWithAds() inserts DISCONTINUITY when container changes", () => {
+    const adSegments = [
+      "https://ads.example.com/ad_seg_1.ts",
+      "https://ads.example.com/ad_seg_2.ts"
+    ]
+
+    const { manifest } = replaceSegmentsWithAds(
+      SAMPLE_MANIFEST,
+      "2025-10-31T12:00:08.000Z",
+      adSegments,
+      30
+    )
+
+    const discontinuityCount = (manifest.match(/#EXT-X-DISCONTINUITY/g) || []).length
+    assert.equal(discontinuityCount, 2, "Should have DISCONTINUITY markers when containers differ")
   })
 
   test("replaceSegmentsWithAds() includes ad segments in output", () => {
@@ -252,16 +270,16 @@ describe("SSAI Segment Replacement", () => {
       "https://ads.example.com/ad_seg_1.m4s",
       "https://ads.example.com/ad_seg_2.m4s"
     ]
-    
-    const result = replaceSegmentsWithAds(
+
+    const { manifest } = replaceSegmentsWithAds(
       SAMPLE_MANIFEST,
       "2025-10-31T12:00:08.000Z",
       adSegments,
       30
     )
-    
-    assert.ok(result.includes("ad_seg_1.m4s"))
-    assert.ok(result.includes("ad_seg_2.m4s"))
+
+    assert.ok(manifest.includes("ad_seg_1.m4s"))
+    assert.ok(manifest.includes("ad_seg_2.m4s"))
   })
 
   test("replaceSegmentsWithAds() removes appropriate number of content segments", () => {
@@ -269,45 +287,44 @@ describe("SSAI Segment Replacement", () => {
       "https://ads.example.com/ad_seg_1.m4s",
       "https://ads.example.com/ad_seg_2.m4s"
     ]
-    
-    const result = replaceSegmentsWithAds(
+
+    const { manifest, segmentsSkipped } = replaceSegmentsWithAds(
       SAMPLE_MANIFEST,
       "2025-10-31T12:00:08.000Z",
       adSegments,
       30  // 30 seconds = ~7.5 segments at 4s each
     )
-    
-    // Should have fewer content segments than original
+
     const originalSegments = (SAMPLE_MANIFEST.match(/seg_\d+\.m4s/g) || []).length
-    const resultSegments = (result.match(/seg_\d+\.m4s/g) || []).length
-    
+    const resultSegments = (manifest.match(/seg_\d+\.m4s/g) || []).length
+
     assert.ok(resultSegments < originalSegments, "Should have fewer content segments")
+    assert.ok(segmentsSkipped >= 2)
   })
 
   test("replaceSegmentsWithAds() handles empty ad segment list", () => {
-    const result = replaceSegmentsWithAds(
+    const { manifest, segmentsSkipped } = replaceSegmentsWithAds(
       SAMPLE_MANIFEST,
       "2025-10-31T12:00:08.000Z",
       [],
       30
     )
-    
-    // Should return manifest unchanged (or with minimal changes)
-    assert.ok(result.includes("seg_1000.m4s"))
+
+    assert.ok(manifest.includes("seg_1000.m4s"))
+    assert.equal(segmentsSkipped, 0)
   })
 
   test("replaceSegmentsWithAds() preserves PDT timestamps", () => {
     const adSegments = ["https://ads.example.com/ad_seg_1.m4s"]
-    
-    const result = replaceSegmentsWithAds(
+
+    const { manifest } = replaceSegmentsWithAds(
       SAMPLE_MANIFEST,
       "2025-10-31T12:00:08.000Z",
       adSegments,
       30
     )
-    
-    // Should still have PDT tags
-    assert.ok(result.includes("#EXT-X-PROGRAM-DATE-TIME:"))
+
+    assert.ok(manifest.includes("#EXT-X-PROGRAM-DATE-TIME:"))
   })
 
   test("replaceSegmentsWithAds() calculates correct segment durations", () => {
@@ -316,16 +333,15 @@ describe("SSAI Segment Replacement", () => {
       "https://ads.example.com/ad_seg_2.m4s",
       "https://ads.example.com/ad_seg_3.m4s"
     ]
-    
-    const result = replaceSegmentsWithAds(
+
+    const { manifest } = replaceSegmentsWithAds(
       SAMPLE_MANIFEST,
       "2025-10-31T12:00:08.000Z",
       adSegments,
       30
     )
-    
-    // Each ad segment should have duration ~30/3 = 10 seconds
-    assert.ok(result.includes("10.000"))
+
+    assert.ok(manifest.includes("10.000"))
   })
 })
 
@@ -335,7 +351,12 @@ describe("HLS Edge Cases", () => {
     
     // Should not throw
     const result1 = insertDiscontinuity(noSegments)
-    const result2 = addDaterangeInterstitial(noSegments, "ad", "2025-10-31T12:00:00Z", 30, "http://ad.com/ad.m3u8")
+    const result2 = injectInterstitialCues(noSegments, {
+      id: "ad",
+      startDateISO: "2025-10-31T12:00:00Z",
+      durationSec: 30,
+      assetURI: "http://ad.com/ad.m3u8"
+    })
     
     assert.ok(result1)
     assert.ok(result2)
@@ -415,25 +436,23 @@ describe("HLS Validation", () => {
     }
   })
 
-  test("addDaterangeInterstitial() produces valid DATERANGE syntax", () => {
-    const result = addDaterangeInterstitial(
-      SAMPLE_MANIFEST,
-      "ad-123",
-      "2025-10-31T12:00:08.000Z",
-      30,
-      "https://ads.example.com/ad.m3u8"
-    )
-    
-    // Find DATERANGE tag
+  test("injectInterstitialCues() produces valid DATERANGE syntax", () => {
+    const result = injectInterstitialCues(SAMPLE_MANIFEST, {
+      id: "ad-123",
+      startDateISO: "2025-10-31T12:00:08.000Z",
+      durationSec: 30,
+      assetURI: "https://ads.example.com/ad.m3u8"
+    })
+
     const lines = result.split("\n")
-    const daterangeLine = lines.find(l => l.includes("#EXT-X-DATERANGE:"))
-    
-    assert.ok(daterangeLine)
-    
-    // Validate required attributes
-    assert.ok(daterangeLine.includes('ID='))
-    assert.ok(daterangeLine.includes('START-DATE='))
-    assert.ok(daterangeLine.includes('CLASS="com.apple.hls.interstitial"'))
+    const daterangeLines = lines.filter(l => l.includes("#EXT-X-DATERANGE:"))
+
+    assert.ok(daterangeLines.length >= 2)
+
+    const cueOutLine = daterangeLines[0]
+    assert.ok(cueOutLine.includes('ID='))
+    assert.ok(cueOutLine.includes('START-DATE='))
+    assert.ok(cueOutLine.includes('CLASS="com.apple.hls.interstitial"'))
   })
 
   test("replaceSegmentsWithAds() maintains segment continuity", () => {
