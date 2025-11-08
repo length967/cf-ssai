@@ -149,35 +149,53 @@ async function getVideoDuration(filePath) {
 
 // Transcode to a specific bitrate variant
 async function transcodeVariant(sourceFile, outputDir, bitrateKbps, sourceResolution) {
-  const resolution = calculateOutputResolution(sourceResolution, bitrateKbps);
   const playlistPath = path.join(outputDir, 'playlist.m3u8');
   const segmentPattern = path.join(outputDir, 'segment_%03d.ts');
-  
-  console.log(`[FFmpeg] Transcoding ${bitrateKbps}k variant (${resolution.width}x${resolution.height})`);
-  
+
+  // Detect if this should be audio-only based on bitrate
+  // Audio-only threshold: < 300kbps
+  const isAudioOnly = bitrateKbps < 300;
+
   // Ensure output directory exists
   fs.mkdirSync(outputDir, { recursive: true });
-  
-  // FFmpeg command for HLS transcoding
-  const cmd = `ffmpeg -i "${sourceFile}" \
-    -vf "scale=w=${resolution.width}:h=${resolution.height}:force_original_aspect_ratio=decrease,pad=${resolution.width}:${resolution.height}:(ow-iw)/2:(oh-ih)/2" \
-    -c:v libx264 -profile:v main -level 4.0 \
-    -b:v ${bitrateKbps}k -maxrate ${bitrateKbps}k -bufsize ${bitrateKbps * 2}k \
-    -preset medium -g 60 -keyint_min 60 -sc_threshold 0 \
-    -c:a aac -b:a 128k -ac 2 -ar 48000 \
-    -f hls -hls_time 6 -hls_list_size 0 -hls_segment_type mpegts \
-    -hls_segment_filename "${segmentPattern}" \
-    "${playlistPath}"`;
-  
+
+  let cmd;
+
+  if (isAudioOnly) {
+    // Audio-only transcoding (no video)
+    console.log(`[FFmpeg] Transcoding ${bitrateKbps}k variant (AUDIO-ONLY)`);
+
+    cmd = `ffmpeg -i "${sourceFile}" \
+      -vn \
+      -c:a aac -b:a ${bitrateKbps}k -ac 2 -ar 48000 \
+      -f hls -hls_time 6 -hls_list_size 0 -hls_segment_type mpegts \
+      -hls_segment_filename "${segmentPattern}" \
+      "${playlistPath}"`;
+  } else {
+    // Video + audio transcoding
+    const resolution = calculateOutputResolution(sourceResolution, bitrateKbps);
+    console.log(`[FFmpeg] Transcoding ${bitrateKbps}k variant (${resolution.width}x${resolution.height})`);
+
+    cmd = `ffmpeg -i "${sourceFile}" \
+      -vf "scale=w=${resolution.width}:h=${resolution.height}:force_original_aspect_ratio=decrease,pad=${resolution.width}:${resolution.height}:(ow-iw)/2:(oh-ih)/2" \
+      -c:v libx264 -profile:v main -level 4.0 \
+      -b:v ${bitrateKbps}k -maxrate ${bitrateKbps}k -bufsize ${bitrateKbps * 2}k \
+      -preset medium -g 60 -keyint_min 60 -sc_threshold 0 \
+      -c:a aac -b:a 128k -ac 2 -ar 48000 \
+      -f hls -hls_time 6 -hls_list_size 0 -hls_segment_type mpegts \
+      -hls_segment_filename "${segmentPattern}" \
+      "${playlistPath}"`;
+  }
+
   try {
     const { stdout, stderr } = await execAsync(cmd, { maxBuffer: 10 * 1024 * 1024 });
     console.log(`[FFmpeg] ${bitrateKbps}k variant completed`);
-    
+
     // Verify output
     if (!fs.existsSync(playlistPath)) {
       throw new Error('Playlist file not created');
     }
-    
+
     return {
       playlistPath,
       segmentDir: outputDir,
@@ -212,15 +230,21 @@ async function uploadDirectory(r2Client, bucket, localDir, remotePrefix) {
 // Create master playlist with actual variant resolutions
 function createMasterPlaylist(variants) {
   let playlist = '#EXTM3U\n#EXT-X-VERSION:3\n';
-  
+
   for (const variant of variants) {
     const bandwidth = variant.bitrate;
-    const resolution = variant.resolution;
-    
-    playlist += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${resolution.width}x${resolution.height}\n`;
+
+    // Audio-only variants should include CODECS attribute without RESOLUTION
+    if (variant.isAudioOnly) {
+      playlist += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},CODECS="mp4a.40.2"\n`;
+    } else {
+      const resolution = variant.resolution;
+      playlist += `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${resolution.width}x${resolution.height},CODECS="avc1.42C01F,mp4a.40.2"\n`;
+    }
+
     playlist += `${variant.bitrate / 1000}k/playlist.m3u8\n`;
   }
-  
+
   return playlist;
 }
 
@@ -313,19 +337,25 @@ async function transcodeVideo({ adId, sourceKey, bitrates, r2Config, isSlate, is
     const variants = [];
     for (const bitrateKbps of bitrates) {
       const variantDir = path.join(outputBaseDir, `${bitrateKbps}k`);
-      const resolution = await transcodeVariant(sourceFile, variantDir, bitrateKbps, sourceResolution);
-      
+      await transcodeVariant(sourceFile, variantDir, bitrateKbps, sourceResolution);
+
       // Upload variant to R2
       const remotePrefix = `transcoded-ads/${adId}/${bitrateKbps}k`;
       await uploadDirectory(r2Client, bucket, variantDir, remotePrefix);
-      
-      // Calculate actual resolution used for this variant
-      const variantResolution = calculateOutputResolution(sourceResolution, bitrateKbps);
-      
+
+      // Detect if audio-only based on bitrate
+      const isAudioOnly = bitrateKbps < 300;
+
+      // Calculate actual resolution used for this variant (video+audio only)
+      const variantResolution = isAudioOnly
+        ? null  // Audio-only has no resolution
+        : calculateOutputResolution(sourceResolution, bitrateKbps);
+
       variants.push({
         bitrate: bitrateKbps * 1000,
         url: `${r2Config.publicUrl || 'https://pub-XXXXX.r2.dev'}/${remotePrefix}/playlist.m3u8`,
-        resolution: variantResolution  // Include actual resolution
+        resolution: variantResolution,
+        isAudioOnly: isAudioOnly
       });
     }
     

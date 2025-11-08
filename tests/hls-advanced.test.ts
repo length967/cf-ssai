@@ -12,6 +12,7 @@ import {
   calculateManifestDuration,
   parseVariant
 } from "../src/utils/hls.ts"
+import { FAKE_AD_URL } from "./test-config.ts"
 
 const SAMPLE_MANIFEST = `#EXTM3U
 #EXT-X-VERSION:7
@@ -399,7 +400,7 @@ describe("HLS Edge Cases", () => {
       id: "ad",
       startDateISO: "2025-10-31T12:00:00Z",
       durationSec: 30,
-      assetURI: "http://ad.com/ad.m3u8"
+      assetURI: FAKE_AD_URL
     })
     
     assert.ok(result1)

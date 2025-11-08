@@ -223,8 +223,16 @@ class AdminAPI {
             const ladder = JSON.parse(channel.bitrate_ladder)
             if (Array.isArray(ladder) && ladder.length > 0) {
               const source = channel.bitrate_ladder_source || 'unknown'
+
+              // Ensure audio-only variants are included
+              const hasAudioOnly = ladder.some(br => br < 300)
+              if (!hasAudioOnly) {
+                console.log(`ℹ️  Channel ladder missing audio-only variants, adding them`)
+                ladder.unshift(64, 128, 256) // Add audio-only at the beginning
+              }
+
               console.log(`✅ Using channel bitrate ladder (${source}): ${ladder.join(', ')} kbps`)
-              return ladder
+              return ladder.sort((a, b) => a - b) // Ensure sorted order
             }
           } catch (e) {
             console.warn('Failed to parse bitrate_ladder, falling back')
@@ -260,8 +268,16 @@ class AdminAPI {
         const ladder = JSON.parse(orgChannel.bitrate_ladder)
         if (Array.isArray(ladder) && ladder.length > 0) {
           const source = orgChannel.bitrate_ladder_source || 'unknown'
+
+          // Ensure audio-only variants are included
+          const hasAudioOnly = ladder.some(br => br < 300)
+          if (!hasAudioOnly) {
+            console.log(`ℹ️  Org channel ladder missing audio-only variants, adding them`)
+            ladder.unshift(64, 128, 256) // Add audio-only at the beginning
+          }
+
           console.log(`ℹ️  Using org channel bitrate ladder (${source}): ${ladder.join(', ')} kbps`)
-          return ladder
+          return ladder.sort((a, b) => a - b) // Ensure sorted order
         }
       } catch (e) {
         console.warn('Failed to parse org channel bitrate_ladder')
@@ -270,7 +286,9 @@ class AdminAPI {
     
     // Priority 3: Fallback to sensible defaults for common streaming
     console.log('⚠️  Using default bitrate ladder (no channel-specific configuration found)')
-    return [800, 1600, 2400, 3600] // Balanced ladder covering mobile to 4K
+    // IMPORTANT: Include audio-only variants (64k, 128k, 256k) for audio-only stream support
+    // These low bitrates will be automatically transcoded as audio-only by the FFmpeg container
+    return [64, 128, 256, 800, 1600, 2400, 3600] // Audio-only + video variants
   }
   
   private corsHeaders(): Record<string, string> {

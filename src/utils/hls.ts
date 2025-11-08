@@ -414,11 +414,12 @@ function calculateSkipPlanFromLines(
     }
   }
 
-  // Find resume PDT within a limited window
-  const MAX_SEGMENTS_TO_SEARCH = 15
+  // Find resume PDT - search through ALL remaining manifest lines
+  // PDT tags can be sparse (40-90 segments apart in some streams)
+  // CRITICAL: Must search entire manifest, not just a limited window
   let searchIndex = resumeIndex
   let segmentsSearched = 0
-  while (searchIndex < lines.length && segmentsSearched < MAX_SEGMENTS_TO_SEARCH) {
+  while (searchIndex < lines.length) {
     const searchLine = lines[searchIndex]
     if (searchLine.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
       plan.resumePDT = searchLine.replace('#EXT-X-PROGRAM-DATE-TIME:', '').trim()
@@ -434,6 +435,25 @@ function calculateSkipPlanFromLines(
   }
 
   plan.segmentsSearchedForPDT = segmentsSearched
+
+  // If no PDT found in manifest, calculate expected resume PDT
+  // This is CRITICAL for SSAI to work when PDT tags are sparse or manifest window is short
+  if (!plan.resumePDT && lines[markerIndex]) {
+    const markerLine = lines[markerIndex]
+    if (markerLine.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+      const startPDT = markerLine.replace('#EXT-X-PROGRAM-DATE-TIME:', '').trim()
+      try {
+        const startTime = new Date(startPDT).getTime()
+        // Calculate expected resume time based on actual duration skipped
+        const expectedResumeTime = startTime + (plan.durationSkipped * 1000)
+        const calculatedPDT = new Date(expectedResumeTime).toISOString()
+        plan.resumePDT = calculatedPDT
+        console.log(`✅ Calculated resume PDT: ${calculatedPDT} (start=${startPDT}, skipped=${plan.durationSkipped}s)`)
+      } catch (e) {
+        console.warn(`Failed to calculate resume PDT:`, e)
+      }
+    }
+  }
 
   return plan
 }
