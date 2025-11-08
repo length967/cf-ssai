@@ -1,10 +1,23 @@
-import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, extractPDTs, extractBitrates } from "./utils/hls"
+import {
+  addDaterangeInterstitial,
+  insertDiscontinuity,
+  replaceSegmentsWithAds,
+  extractPDTs,
+  extractBitrates,
+  ReplaceSegmentsWithAdsOptions
+} from "./utils/hls"
 import { signPath } from "./utils/sign"
 import { parseSCTE35FromManifest, isAdBreakStart, getBreakDuration, findActiveBreak, validateSCTE35Signal } from "./utils/scte35"
 import { getChannelConfig } from "./utils/channel-config"
 import type { ChannelConfig } from "./utils/channel-config"
 import type { Env } from "./manifest-worker"
 import type { DecisionResponse, BeaconMessage, SCTE35Signal } from "./types"
+import {
+  collectIdrTimestamps,
+  EncoderIDRMetadata,
+  IDRTimeline,
+  SegmenterIDRCallback
+} from "./utils/idr"
 
 // ============================================================================
 // CONFIGURATION CONSTANTS
@@ -67,6 +80,142 @@ async function clearAdState(state: DurableObjectState): Promise<void> {
   const currentVersion = await state.storage.get<number>('ad_state_version') || 0
   await state.storage.put('ad_state_version', currentVersion + 1)
   await state.storage.delete(AD_STATE_KEY)
+}
+
+type ParsedIdrPoint = { pts?: number; seconds?: number; raw?: unknown }
+
+const ENCODER_IDR_HEADERS = [
+  'x-encoder-idr',
+  'x-encoder-idrs',
+  'x-encoder-metadata',
+  'x-origin-idr',
+  'x-idr',
+  'x-idr-pts'
+]
+
+const SEGMENTER_IDR_HEADERS = [
+  'x-segmenter-idr',
+  'x-segmenter-idrs',
+  'x-segmenter-metadata',
+  'x-segmenter-callback',
+  'x-ssai-segmenter-idr'
+]
+
+function buildHeaderLookup(headers: Headers): Map<string, string> {
+  const lookup = new Map<string, string>()
+  for (const [key, value] of headers.entries()) {
+    lookup.set(key.toLowerCase(), value)
+  }
+  return lookup
+}
+
+function findHeaderValue(headers: Headers, candidates: string[]): string | null {
+  const lookup = buildHeaderLookup(headers)
+  for (const candidate of candidates) {
+    const value = lookup.get(candidate.toLowerCase())
+    if (value !== undefined) {
+      return value
+    }
+  }
+  return null
+}
+
+function parseIdrHeaderValue(value: string | null): ParsedIdrPoint[] {
+  if (!value) return []
+
+  const trimmed = value.trim()
+  if (!trimmed) return []
+
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    parsed = trimmed
+  }
+
+  const queue: unknown[] = Array.isArray(parsed) ? [...parsed] : [parsed]
+  const points: ParsedIdrPoint[] = []
+
+  while (queue.length) {
+    const item = queue.shift()
+    if (item === null || item === undefined) continue
+
+    if (Array.isArray(item)) {
+      queue.push(...item)
+      continue
+    }
+
+    if (typeof item === 'number') {
+      if (Number.isFinite(item)) points.push({ pts: item, raw: item })
+      continue
+    }
+
+    if (typeof item === 'string') {
+      const num = Number(item)
+      if (Number.isFinite(num)) {
+        points.push({ pts: num, raw: item })
+      }
+      continue
+    }
+
+    if (typeof item === 'object') {
+      const obj = item as Record<string, unknown>
+
+      if (Array.isArray(obj.idrs)) {
+        queue.push(...obj.idrs)
+        continue
+      }
+
+      if (Array.isArray(obj.points)) {
+        queue.push(...obj.points)
+        continue
+      }
+
+      if (Array.isArray(obj.cues)) {
+        queue.push(...obj.cues)
+        continue
+      }
+
+      const entry: ParsedIdrPoint = { raw: obj }
+      const ptsCandidate =
+        obj.pts ??
+        obj.pts90k ??
+        obj.timecode ??
+        obj.timecode90k ??
+        obj.timestamp90k ??
+        obj.position ??
+        obj.idrPts
+
+      if (ptsCandidate !== undefined) {
+        const num = Number(ptsCandidate)
+        if (Number.isFinite(num)) {
+          entry.pts = num
+        }
+      }
+
+      if (entry.pts === undefined) {
+        const secondsCandidate =
+          obj.seconds ??
+          obj.time ??
+          obj.timeSeconds ??
+          obj.timestampSeconds ??
+          obj.idrTime
+
+        if (secondsCandidate !== undefined) {
+          const seconds = Number(secondsCandidate)
+          if (Number.isFinite(seconds)) {
+            entry.seconds = seconds
+          }
+        }
+      }
+
+      if (entry.pts !== undefined || entry.seconds !== undefined) {
+        points.push(entry)
+      }
+    }
+  }
+
+  return points
 }
 
 /**
@@ -499,10 +648,66 @@ async function signAdPlaylist(signHost: string, segmentSecret: string, playlistP
 export class ChannelDO {
   state: DurableObjectState
   env: Env
+  private idrTimelines: Map<string, IDRTimeline>
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state
     this.env = env
+    this.idrTimelines = new Map()
+  }
+
+  private updateIdrTimeline(variant: string, headers: Headers): void {
+    const encoderHeader = findHeaderValue(headers, ENCODER_IDR_HEADERS)
+    const segmenterHeader = findHeaderValue(headers, SEGMENTER_IDR_HEADERS)
+
+    const encoderPoints = parseIdrHeaderValue(encoderHeader)
+    const segmenterPoints = parseIdrHeaderValue(segmenterHeader)
+
+    if (!encoderPoints.length && !segmenterPoints.length) {
+      return
+    }
+
+    const encoderMetadata: EncoderIDRMetadata | undefined = encoderPoints.length
+      ? {
+          variant,
+          cues: encoderPoints.map(point => {
+            if (point.pts !== undefined && point.seconds !== undefined) {
+              return { pts: point.pts, seconds: point.seconds }
+            }
+            if (point.pts !== undefined) {
+              return { pts: point.pts }
+            }
+            return { seconds: point.seconds }
+          })
+        }
+      : undefined
+
+    const segmenterCallbacks: SegmenterIDRCallback[] = segmenterPoints.map(point => {
+      const callback: SegmenterIDRCallback = {}
+      if (point.pts !== undefined) callback.pts = point.pts
+      if (point.seconds !== undefined) callback.timeSeconds = point.seconds
+      return callback
+    })
+
+    const existing = this.idrTimelines.get(variant) ?? null
+    const updated = collectIdrTimestamps({
+      existing,
+      variant,
+      encoder: encoderMetadata,
+      segmenter: segmenterCallbacks,
+      maxEntries: 1024
+    })
+
+    this.idrTimelines.set(variant, updated)
+
+    console.log(
+      `[IDR] Timeline updated for ${variant}: total=${updated.values.length}, ` +
+      `encoder=${updated.sourceCounts.encoder}, segmenter=${updated.sourceCounts.segmenter}`
+    )
+  }
+
+  private getIdrTimeline(variant: string): IDRTimeline | undefined {
+    return this.idrTimelines.get(variant)
   }
   
   /**
@@ -740,6 +945,13 @@ export class ChannelDO {
       const force = u.searchParams.get("force") // "sgai" | "ssai" | null
 
       if (!channel) return new Response("channel required", { status: 400 })
+
+      // Collect IDR metadata from request headers (if present)
+      try {
+        this.updateIdrTimeline(variant, req.headers)
+      } catch (err) {
+        console.warn(`Failed to update IDR timeline for variant ${variant}:`, err)
+      }
 
       // Extract viewer bitrate from variant name for ad selection
       // Format: scte35-audio_eng=128000-video=1000000.m3u8
@@ -1248,13 +1460,30 @@ export class ChannelDO {
                   
                   let result = { manifest: cleanOrigin, segmentsSkipped: 0, durationSkipped: 0 }
                   if (shouldAttemptSSAI) {
+                    const replaceOptions: ReplaceSegmentsWithAdsOptions = {}
+                    if (typeof activeBreak?.pts === "number") {
+                      replaceOptions.cuePts90k = activeBreak.pts
+                    }
+
+                    const idrTimeline = this.getIdrTimeline(variant)
+                    if (idrTimeline) {
+                      replaceOptions.idrTimeline = idrTimeline
+                      replaceOptions.recordBoundaryDecision = (decision, validation) => {
+                        console.log(
+                          `[IDR Boundary] cuePts=${decision.cuePts} snapped=${decision.snappedPts} ` +
+                          `deltaPts=${decision.deltaPts} withinTolerance=${validation.withinTolerance}`
+                        )
+                      }
+                    }
+
                     result = replaceSegmentsWithAds(
                       cleanOrigin,
                       scte35StartPDT,
                       adSegments,
                       totalDuration,        // Actual ad duration from segment sum
                       stableDuration,       // SCTE-35 break duration for content skipping
-                      stableSkipCount       // Use cached skip count if available
+                      stableSkipCount,      // Use cached skip count if available
+                      replaceOptions
                     )
                   }
 

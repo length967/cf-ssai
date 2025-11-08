@@ -1,5 +1,14 @@
 // Minimal HLS helpers suitable for Workers
 
+import {
+  BoundaryValidation,
+  IDRTimeline,
+  IDRTimestamp,
+  SnapDecision,
+  snapCueToIdr,
+  validateBoundaryError
+} from "./idr"
+
 export type VariantInfo = { bandwidth?: number; resolution?: string; uri: string; isVideo?: boolean }
 
 /**
@@ -147,18 +156,49 @@ function getAverageSegmentDuration(lines: string[]): number {
  * @param stableSkipCount - Optional: Pre-calculated stable segment skip count from ad state
  * @returns Object with manifest and skip statistics
  */
+export interface ReplaceSegmentsWithAdsOptions {
+  cuePts90k?: number
+  idrTimeline?: IDRTimeline | IDRTimestamp[]
+  recordBoundaryDecision?: (decision: SnapDecision, validation: BoundaryValidation) => void
+  snapLookAheadPts?: number
+  boundaryTolerancePts?: number
+}
+
+export interface ReplaceSegmentsBoundary {
+  decision: SnapDecision
+  validation: BoundaryValidation
+}
+
+export interface ReplaceSegmentsResult {
+  manifest: string
+  segmentsSkipped: number
+  durationSkipped: number
+  boundary?: ReplaceSegmentsBoundary
+  requestedCut?: {
+    cuePts90k: number
+    snappedPts90k: number
+    deltaPts: number
+    deltaSeconds: number
+    source: string
+  }
+}
+
 export function replaceSegmentsWithAds(
   variantText: string,
   scte35StartPDT: string,
   adSegments: Array<{url: string, duration: number}> | string[],
   adDuration: number,
   scte35Duration?: number,  // Optional: SCTE-35 duration if different from ad duration
-  stableSkipCount?: number  // Optional: Use pre-calculated skip count for stability
-): { manifest: string, segmentsSkipped: number, durationSkipped: number } {
+  stableSkipCount?: number,  // Optional: Use pre-calculated skip count for stability
+  options: ReplaceSegmentsWithAdsOptions = {}
+): ReplaceSegmentsResult {
   // Use SCTE-35 duration for content skipping, or fall back to ad duration
   const contentSkipDuration = scte35Duration || adDuration
   const lines = variantText.split("\n")
   const output: string[] = []
+
+  let boundaryInfo: ReplaceSegmentsBoundary | undefined
+  let requestedCut: ReplaceSegmentsResult["requestedCut"]
   
   // Detect actual segment duration from content manifest
   const contentSegmentDuration = getAverageSegmentDuration(lines)
@@ -217,6 +257,43 @@ export function replaceSegmentsWithAds(
       // Add DISCONTINUITY after ad
       output.push("#EXT-X-DISCONTINUITY")
       
+      // IDR snapping support (optional)
+      if (typeof options.cuePts90k === "number" && options.idrTimeline) {
+        const decision = snapCueToIdr(options.idrTimeline, options.cuePts90k, {
+          lookAheadPts: options.snapLookAheadPts
+        })
+        const validation = validateBoundaryError(decision, {
+          tolerancePts: options.boundaryTolerancePts
+        })
+        boundaryInfo = { decision, validation }
+        requestedCut = {
+          cuePts90k: options.cuePts90k,
+          snappedPts90k: decision.snappedPts,
+          deltaPts: decision.deltaPts,
+          deltaSeconds: decision.deltaSeconds,
+          source: decision.source
+        }
+
+        try {
+          options.recordBoundaryDecision?.(decision, validation)
+        } catch (err) {
+          console.warn("Failed to record boundary decision", err)
+        }
+
+        const deltaSecondsFormatted = decision.deltaSeconds.toFixed(3)
+        console.log(
+          `[IDR Snap] cuePts=${options.cuePts90k} snapped=${decision.snappedPts} ` +
+          `delta=${decision.deltaPts} (${deltaSecondsFormatted}s) reason=${decision.reason} source=${decision.source}`
+        )
+
+        if (!validation.withinTolerance) {
+          console.warn(
+            `[IDR Snap] Boundary error ${validation.absoluteErrorSeconds.toFixed(3)}s ` +
+            `exceeds tolerance ${validation.toleranceSeconds.toFixed(3)}s`
+          )
+        }
+      }
+
       // CRITICAL FIX: Use stable skip count if provided, otherwise calculate
       // This ensures all concurrent requests skip the same segments
       let skippedDuration = 0
@@ -372,7 +449,9 @@ export function replaceSegmentsWithAds(
   return {
     manifest: output.join("\n"),
     segmentsSkipped: segmentsReplaced,
-    durationSkipped: actualSkippedDuration
+    durationSkipped: actualSkippedDuration,
+    boundary: boundaryInfo,
+    requestedCut
   }
 }
 
