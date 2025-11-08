@@ -540,11 +540,66 @@ async function signAdPlaylist(signHost: string, segmentSecret: string, playlistP
 export class ChannelDO {
   state: DurableObjectState
   env: Env
-  private ptsPdtMaps = new Map<string, PtsPdtMap>()
+  private idrTimelines: Map<string, IDRTimeline>
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state
     this.env = env
+    this.idrTimelines = new Map()
+  }
+
+  private updateIdrTimeline(variant: string, headers: Headers): void {
+    const encoderHeader = findHeaderValue(headers, ENCODER_IDR_HEADERS)
+    const segmenterHeader = findHeaderValue(headers, SEGMENTER_IDR_HEADERS)
+
+    const encoderPoints = parseIdrHeaderValue(encoderHeader)
+    const segmenterPoints = parseIdrHeaderValue(segmenterHeader)
+
+    if (!encoderPoints.length && !segmenterPoints.length) {
+      return
+    }
+
+    const encoderMetadata: EncoderIDRMetadata | undefined = encoderPoints.length
+      ? {
+          variant,
+          cues: encoderPoints.map(point => {
+            if (point.pts !== undefined && point.seconds !== undefined) {
+              return { pts: point.pts, seconds: point.seconds }
+            }
+            if (point.pts !== undefined) {
+              return { pts: point.pts }
+            }
+            return { seconds: point.seconds }
+          })
+        }
+      : undefined
+
+    const segmenterCallbacks: SegmenterIDRCallback[] = segmenterPoints.map(point => {
+      const callback: SegmenterIDRCallback = {}
+      if (point.pts !== undefined) callback.pts = point.pts
+      if (point.seconds !== undefined) callback.timeSeconds = point.seconds
+      return callback
+    })
+
+    const existing = this.idrTimelines.get(variant) ?? null
+    const updated = collectIdrTimestamps({
+      existing,
+      variant,
+      encoder: encoderMetadata,
+      segmenter: segmenterCallbacks,
+      maxEntries: 1024
+    })
+
+    this.idrTimelines.set(variant, updated)
+
+    console.log(
+      `[IDR] Timeline updated for ${variant}: total=${updated.values.length}, ` +
+      `encoder=${updated.sourceCounts.encoder}, segmenter=${updated.sourceCounts.segmenter}`
+    )
+  }
+
+  private getIdrTimeline(variant: string): IDRTimeline | undefined {
+    return this.idrTimelines.get(variant)
   }
 
   private getPtsPdtMap(channel: string, variant: string): PtsPdtMap {
@@ -819,6 +874,13 @@ export class ChannelDO {
       const force = u.searchParams.get("force") // "sgai" | "ssai" | null
 
       if (!channel) return new Response("channel required", { status: 400 })
+
+      // Collect IDR metadata from request headers (if present)
+      try {
+        this.updateIdrTimeline(variant, req.headers)
+      } catch (err) {
+        console.warn(`Failed to update IDR timeline for variant ${variant}:`, err)
+      }
 
       // Extract viewer bitrate from variant name for ad selection
       // Format: scte35-audio_eng=128000-video=1000000.m3u8
@@ -1388,13 +1450,30 @@ export class ChannelDO {
                   
                   let result = { manifest: cleanOrigin, segmentsSkipped: 0, durationSkipped: 0 }
                   if (shouldAttemptSSAI) {
+                    const replaceOptions: ReplaceSegmentsWithAdsOptions = {}
+                    if (typeof activeBreak?.pts === "number") {
+                      replaceOptions.cuePts90k = activeBreak.pts
+                    }
+
+                    const idrTimeline = this.getIdrTimeline(variant)
+                    if (idrTimeline) {
+                      replaceOptions.idrTimeline = idrTimeline
+                      replaceOptions.recordBoundaryDecision = (decision, validation) => {
+                        console.log(
+                          `[IDR Boundary] cuePts=${decision.cuePts} snapped=${decision.snappedPts} ` +
+                          `deltaPts=${decision.deltaPts} withinTolerance=${validation.withinTolerance}`
+                        )
+                      }
+                    }
+
                     result = replaceSegmentsWithAds(
                       cleanOrigin,
                       scte35StartPDT,
                       adSegments,
                       totalDuration,        // Actual ad duration from segment sum
                       stableDuration,       // SCTE-35 break duration for content skipping
-                      stableSkipCount       // Use cached skip count if available
+                      stableSkipCount,      // Use cached skip count if available
+                      replaceOptions
                     )
                   }
 
