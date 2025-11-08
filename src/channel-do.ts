@@ -1,23 +1,10 @@
-import {
-  addDaterangeInterstitial,
-  insertDiscontinuity,
-  replaceSegmentsWithAds,
-  extractPDTs,
-  extractBitrates,
-  ReplaceSegmentsWithAdsOptions
-} from "./utils/hls"
+import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, extractPDTs, extractBitrates, reconcileCueStartDates } from "./utils/hls"
 import { signPath } from "./utils/sign"
-import { parseSCTE35FromManifest, isAdBreakStart, getBreakDuration, findActiveBreak, validateSCTE35Signal } from "./utils/scte35"
+import { parseScte35FromTransportStream, eventToSignal, getBreakDuration, findActiveBreak, validateSCTE35Signal } from "./utils/scte35"
 import { getChannelConfig } from "./utils/channel-config"
 import type { ChannelConfig } from "./utils/channel-config"
 import type { Env } from "./manifest-worker"
-import type { DecisionResponse, BeaconMessage, SCTE35Signal } from "./types"
-import {
-  collectIdrTimestamps,
-  EncoderIDRMetadata,
-  IDRTimeline,
-  SegmenterIDRCallback
-} from "./utils/idr"
+import type { DecisionResponse, BeaconMessage, SCTE35Signal, Scte35Event } from "./types"
 
 // ============================================================================
 // CONFIGURATION CONSTANTS
@@ -82,140 +69,45 @@ async function clearAdState(state: DurableObjectState): Promise<void> {
   await state.storage.delete(AD_STATE_KEY)
 }
 
-type ParsedIdrPoint = { pts?: number; seconds?: number; raw?: unknown }
+const SCTE35_EVENT_STORE_KEY = "scte35_events"
+const SCTE35_EVENT_TTL_MS = 5 * 60 * 1000
+const SCTE35_EVENT_MAX = 96
 
-const ENCODER_IDR_HEADERS = [
-  'x-encoder-idr',
-  'x-encoder-idrs',
-  'x-encoder-metadata',
-  'x-origin-idr',
-  'x-idr',
-  'x-idr-pts'
-]
+async function appendScte35Events(state: DurableObjectState, events: Scte35Event[]): Promise<void> {
+  if (events.length === 0) return
 
-const SEGMENTER_IDR_HEADERS = [
-  'x-segmenter-idr',
-  'x-segmenter-idrs',
-  'x-segmenter-metadata',
-  'x-segmenter-callback',
-  'x-ssai-segmenter-idr'
-]
+  const now = Date.now()
+  const existing = (await state.storage.get<Scte35Event[]>(SCTE35_EVENT_STORE_KEY)) || []
+  const filtered = existing.filter(event => now - event.ingestTimestamp <= SCTE35_EVENT_TTL_MS)
+  const combined = filtered.concat(events)
 
-function buildHeaderLookup(headers: Headers): Map<string, string> {
-  const lookup = new Map<string, string>()
-  for (const [key, value] of headers.entries()) {
-    lookup.set(key.toLowerCase(), value)
+  const deduped: Scte35Event[] = []
+  const seen = new Set<string>()
+  for (const event of combined) {
+    if (seen.has(event.eventId)) continue
+    seen.add(event.eventId)
+    deduped.push(event)
   }
-  return lookup
+
+  while (deduped.length > SCTE35_EVENT_MAX) {
+    deduped.shift()
+  }
+
+  await state.storage.put(SCTE35_EVENT_STORE_KEY, deduped)
+  console.log(`[SCTE35] Stored ${events.length} new transport cues (buffer=${deduped.length})`)
 }
 
-function findHeaderValue(headers: Headers, candidates: string[]): string | null {
-  const lookup = buildHeaderLookup(headers)
-  for (const candidate of candidates) {
-    const value = lookup.get(candidate.toLowerCase())
-    if (value !== undefined) {
-      return value
-    }
-  }
-  return null
-}
+async function getRecentScte35Events(state: DurableObjectState): Promise<Scte35Event[]> {
+  const now = Date.now()
+  const stored = (await state.storage.get<Scte35Event[]>(SCTE35_EVENT_STORE_KEY)) || []
+  const filtered = stored.filter(event => now - event.ingestTimestamp <= SCTE35_EVENT_TTL_MS)
 
-function parseIdrHeaderValue(value: string | null): ParsedIdrPoint[] {
-  if (!value) return []
-
-  const trimmed = value.trim()
-  if (!trimmed) return []
-
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(trimmed)
-  } catch {
-    parsed = trimmed
+  if (filtered.length !== stored.length) {
+    await state.storage.put(SCTE35_EVENT_STORE_KEY, filtered)
+    console.log(`[SCTE35] Pruned ${stored.length - filtered.length} expired transport cues (remaining=${filtered.length})`)
   }
 
-  const queue: unknown[] = Array.isArray(parsed) ? [...parsed] : [parsed]
-  const points: ParsedIdrPoint[] = []
-
-  while (queue.length) {
-    const item = queue.shift()
-    if (item === null || item === undefined) continue
-
-    if (Array.isArray(item)) {
-      queue.push(...item)
-      continue
-    }
-
-    if (typeof item === 'number') {
-      if (Number.isFinite(item)) points.push({ pts: item, raw: item })
-      continue
-    }
-
-    if (typeof item === 'string') {
-      const num = Number(item)
-      if (Number.isFinite(num)) {
-        points.push({ pts: num, raw: item })
-      }
-      continue
-    }
-
-    if (typeof item === 'object') {
-      const obj = item as Record<string, unknown>
-
-      if (Array.isArray(obj.idrs)) {
-        queue.push(...obj.idrs)
-        continue
-      }
-
-      if (Array.isArray(obj.points)) {
-        queue.push(...obj.points)
-        continue
-      }
-
-      if (Array.isArray(obj.cues)) {
-        queue.push(...obj.cues)
-        continue
-      }
-
-      const entry: ParsedIdrPoint = { raw: obj }
-      const ptsCandidate =
-        obj.pts ??
-        obj.pts90k ??
-        obj.timecode ??
-        obj.timecode90k ??
-        obj.timestamp90k ??
-        obj.position ??
-        obj.idrPts
-
-      if (ptsCandidate !== undefined) {
-        const num = Number(ptsCandidate)
-        if (Number.isFinite(num)) {
-          entry.pts = num
-        }
-      }
-
-      if (entry.pts === undefined) {
-        const secondsCandidate =
-          obj.seconds ??
-          obj.time ??
-          obj.timeSeconds ??
-          obj.timestampSeconds ??
-          obj.idrTime
-
-        if (secondsCandidate !== undefined) {
-          const seconds = Number(secondsCandidate)
-          if (Number.isFinite(seconds)) {
-            entry.seconds = seconds
-          }
-        }
-      }
-
-      if (entry.pts !== undefined || entry.seconds !== undefined) {
-        points.push(entry)
-      }
-    }
-  }
-
-  return points
+  return filtered
 }
 
 /**
@@ -709,6 +601,16 @@ export class ChannelDO {
   private getIdrTimeline(variant: string): IDRTimeline | undefined {
     return this.idrTimelines.get(variant)
   }
+
+  private getPtsPdtMap(channel: string, variant: string): PtsPdtMap {
+    const key = `${channel}::${variant}`
+    let map = this.ptsPdtMaps.get(key)
+    if (!map) {
+      map = new PtsPdtMap()
+      this.ptsPdtMaps.set(key, map)
+    }
+    return map
+  }
   
   /**
    * Generate synthetic slate segments when no slate is configured
@@ -883,6 +785,33 @@ export class ChannelDO {
       const adPodBase = req.headers.get('X-Ad-Pod-Base') || this.env.AD_POD_BASE
       const signHost = req.headers.get('X-Sign-Host') || this.env.SIGN_HOST
 
+      if (u.pathname === "/ingest/ts") {
+        if (req.method !== "POST") {
+          return new Response("method not allowed", { status: 405 })
+        }
+
+        try {
+          const arrayBuffer = await req.arrayBuffer()
+          const payload = new Uint8Array(arrayBuffer)
+          const events = parseScte35FromTransportStream(payload)
+          await appendScte35Events(this.state, events)
+
+          console.log(
+            `[SCTE35] Ingest request processed for channel=${channelId}, cues=${events.length}, bytes=${payload.byteLength}`
+          )
+
+          return new Response(JSON.stringify({ ok: true, events: events.length }), {
+            headers: { "content-type": "application/json" }
+          })
+        } catch (err) {
+          console.error("SCTE-35 ingest failure:", err)
+          return new Response(JSON.stringify({ ok: false, error: "ingest_failed" }), {
+            status: 500,
+            headers: { "content-type": "application/json" }
+          })
+        }
+      }
+
       // Control plane: POST /cue to start/stop an ad break for this channel
       if (u.pathname === "/cue") {
         if (req.method !== "POST") return new Response("method not allowed", { status: 405 })
@@ -957,6 +886,21 @@ export class ChannelDO {
       // Format: scte35-audio_eng=128000-video=1000000.m3u8
       const viewerBitrate = extractBitrateFromVariant(variant)
 
+      const ptsMap = this.getPtsPdtMap(channel, variant)
+      const metricsEmitter = this.env.METRICS
+        ? (metric: string, value: number, dimensions?: Record<string, string>) => {
+            try {
+              ;(this.env.METRICS as any).writeDataPoint({
+                metric,
+                value,
+                dimensions: { channel, variant, ...(dimensions || {}) }
+              })
+            } catch (err) {
+              console.warn(`Failed to emit metric ${metric}:`, err)
+            }
+          }
+        : undefined
+
       // PERFORMANCE FIX: Check if this is a segment request FIRST
       // Segments should bypass all config/database lookups
       if (!variant.endsWith('.m3u8')) {
@@ -976,7 +920,14 @@ export class ChannelDO {
       const originResponse = await fetchOriginVariant(originUrl, channel, variant)
       
       // For manifests, read as text for processing
-      const origin = await originResponse.text()
+      let origin = await originResponse.text()
+
+      const mappingResult = reconcileCueStartDates(origin, ptsMap, {
+        variantId: variant,
+        logger: console,
+        metrics: metricsEmitter
+      })
+      origin = mappingResult.manifest
 
       // Detect and store bitrates if this is a master manifest
       // Fire-and-forget to avoid delaying the response
@@ -1013,37 +964,47 @@ export class ChannelDO {
         console.log(`Ad state version changed during request (${initialAdStateVersion} -> ${currentAdStateVersion}), using latest state`)
       }
 
-      // Parse SCTE-35 signals from origin manifest (with enhanced binary parsing)
-      const scte35Signals = parseSCTE35FromManifest(origin)
+      const transportEvents = await getRecentScte35Events(this.state)
+      const eventById = new Map<string, Scte35Event>()
+      transportEvents.forEach(event => eventById.set(event.eventId, event))
+
+      const scte35Signals = transportEvents
+        .map(event => eventToSignal(event))
+        .filter((signal): signal is SCTE35Signal => signal !== null)
+
       let activeBreak = findActiveBreak(scte35Signals)
 
-      if (scte35Signals.length > 0) {
-        console.log(`Found ${scte35Signals.length} SCTE-35 signals`)
+      if (transportEvents.length > 0) {
+        const skipped = transportEvents.length - scte35Signals.length
+        console.log(
+          `[SCTE35] Loaded ${transportEvents.length} transport cues (normalized=${scte35Signals.length}${skipped > 0 ? `, skipped=${skipped}` : ''})`
+        )
 
         if (activeBreak) {
-          // CRITICAL: Validate SCTE-35 signal before using it
-          // Extract PDT for temporal validation (using request-scoped cache)
+          const sourceEvent = eventById.get(activeBreak.id)
+          if (sourceEvent) {
+            const ccLog = sourceEvent.continuityCounters.length > 0 ? sourceEvent.continuityCounters.join(",") : "n/a"
+            const rawPreview = sourceEvent.rawHex.length > 48 ? `${sourceEvent.rawHex.slice(0, 48)}…` : sourceEvent.rawHex
+            console.log(
+              `[SCTE35] Active cue ${activeBreak.id}: command=${sourceEvent.commandType}, pid=0x${sourceEvent.pid.toString(16)}, continuity=[${ccLog}], raw=${rawPreview}`
+            )
+          }
+
           const pdts = getCachedPDTs(origin)
           const mostRecentPDT = pdts.length > 0 ? pdts[pdts.length - 1] : undefined
-
           const validation = validateSCTE35Signal(activeBreak, mostRecentPDT)
 
-          // Log validation results
           if (!validation.valid) {
             console.error(`❌ SCTE-35 Validation FAILED for signal ${activeBreak.id}:`)
             validation.errors.forEach(err => console.error(`   - ${err}`))
-
-            // Reject invalid signal - do not attempt ad insertion
             activeBreak = null
             console.log(`⚠️  Rejecting invalid SCTE-35 signal to prevent playback issues`)
           } else {
-            // Log warnings but allow signal through
             if (validation.warnings.length > 0) {
               console.warn(`⚠️  SCTE-35 Validation warnings for signal ${activeBreak.id}:`)
               validation.warnings.forEach(warn => console.warn(`   - ${warn}`))
             }
 
-            // Log enhanced binary data if available
             if (activeBreak.binaryData) {
               console.log(`✅ SCTE-35 Binary Parsing: Event ID=${activeBreak.binaryData.spliceEventId}, ` +
                 `PTS=${activeBreak.pts ? `${activeBreak.pts} (${(activeBreak.pts / 90000).toFixed(3)}s)` : 'N/A'}, ` +
@@ -1262,11 +1223,40 @@ export class ChannelDO {
           stableDuration = adState!.durationSec
           console.log(`Using persisted ad state: start=${startISO}, duration=${stableDuration}s`)
         } else {
-          startISO = scte35StartPDT || new Date(Math.floor(now / 1000) * 1000).toISOString()
-          // Use integer milliseconds to avoid floating-point precision issues
+          let startCandidate = scte35StartPDT || null
+          let startSource: 'scte35' | 'pts_map' | 'calculated' = startCandidate ? 'scte35' : 'calculated'
+
+          if (!startCandidate && activeBreak?.pts !== undefined) {
+            const estimate = ptsMap.estimate(activeBreak.pts)
+            if (estimate) {
+              startCandidate = estimate.iso
+              startSource = 'pts_map'
+              metricsEmitter?.('pts_pdt_cue_alignment', 1, { channel, variant, source: 'pts_map' })
+            } else {
+              metricsEmitter?.('pts_pdt_cue_alignment', 0, { channel, variant, source: 'missing_map' })
+            }
+          }
+
+          if (!startCandidate) {
+            startCandidate = new Date(Math.floor(now / 1000) * 1000).toISOString()
+            startSource = 'calculated'
+          }
+
+          if (!scte35StartPDT && startCandidate) {
+            scte35StartPDT = startCandidate
+          }
+
+          startISO = startCandidate
           const durationMs = Math.round(breakDurationSec * 1000)
           stableDuration = durationMs / 1000  // Exact representation
-          console.log(`Using calculated values: start=${startISO}, duration=${stableDuration}s (from ${breakDurationSec}s)`)
+
+          if (startSource === 'pts_map') {
+            metricsEmitter?.('pts_pdt_cue_alignment_source', 1, { channel, variant, source: 'pts_map' })
+          } else if (startSource === 'scte35') {
+            metricsEmitter?.('pts_pdt_cue_alignment_source', 1, { channel, variant, source: 'scte35' })
+          } else {
+            metricsEmitter?.('pts_pdt_cue_alignment_source', 1, { channel, variant, source: 'calculated' })
+          }
         }
         
         // PERFORMANCE OPTIMIZATION: Use pre-calculated decision if available in ad state
@@ -1502,7 +1492,15 @@ export class ChannelDO {
                       adActive ? (adState!.podId || "ad") : pod.podId,
                       startISO,
                       stableDuration,
-                      interstitialURI
+                      interstitialURI,
+                      undefined,
+                      {
+                        pts: activeBreak?.pts,
+                        mapper: ptsMap,
+                        variantId: variant,
+                        logger: console,
+                        metrics: metricsEmitter
+                      }
                     )
 
                     await this.env.BEACON_QUEUE.send(beaconMsg)
