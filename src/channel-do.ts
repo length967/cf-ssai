@@ -1,4 +1,4 @@
-import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, extractPDTs, extractBitrates, reconcileCueStartDates } from "./utils/hls"
+import { injectInterstitialCues, insertDiscontinuity, replaceSegmentsWithAds, extractPDTs, extractBitrates } from "./utils/hls"
 import { signPath } from "./utils/sign"
 import { parseScte35FromTransportStream, eventToSignal, getBreakDuration, findActiveBreak, validateSCTE35Signal } from "./utils/scte35"
 import { getChannelConfig } from "./utils/channel-config"
@@ -1334,13 +1334,15 @@ export class ChannelDO {
           // Strip origin SCTE-35 markers before adding our interstitial
           const cleanOrigin = stripOriginSCTE35Markers(origin)
           // Use stableDuration for consistent interstitial timing
-          const sgai = addDaterangeInterstitial(
-            cleanOrigin,
-            adActive ? (adState!.podId || "ad") : pod.podId,
-            startISO,
-            stableDuration,
-            interstitialURI
-          )
+          const baseAttributes = activeBreak?.rawAttributes ? { ...activeBreak.rawAttributes } : undefined
+          const sgai = injectInterstitialCues(cleanOrigin, {
+            id: adActive ? (adState!.podId || "ad") : pod.podId,
+            startDateISO: startISO,
+            durationSec: stableDuration,
+            assetURI: interstitialURI,
+            baseAttributes,
+            scte35Payload: activeBreak?.rawCommand
+          })
           
           await this.env.BEACON_QUEUE.send(beaconMsg)
           return new Response(sgai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
@@ -1487,21 +1489,15 @@ export class ChannelDO {
                     const adItem = pod.items.find(item => item.bitrate === viewerBitrate) || pod.items[0]
                     const interstitialURI = await signAdPlaylist(signHost, this.env.SEGMENT_SECRET, adItem.playlistUrl)
 
-                    const sgai = addDaterangeInterstitial(
-                      cleanOrigin,
-                      adActive ? (adState!.podId || "ad") : pod.podId,
-                      startISO,
-                      stableDuration,
-                      interstitialURI,
-                      undefined,
-                      {
-                        pts: activeBreak?.pts,
-                        mapper: ptsMap,
-                        variantId: variant,
-                        logger: console,
-                        metrics: metricsEmitter
-                      }
-                    )
+                    const fallbackAttributes = activeBreak?.rawAttributes ? { ...activeBreak.rawAttributes } : undefined
+                    const sgai = injectInterstitialCues(cleanOrigin, {
+                      id: adActive ? (adState!.podId || "ad") : pod.podId,
+                      startDateISO: startISO,
+                      durationSec: stableDuration,
+                      assetURI: interstitialURI,
+                      baseAttributes: fallbackAttributes,
+                      scte35Payload: activeBreak?.rawCommand
+                    })
 
                     await this.env.BEACON_QUEUE.send(beaconMsg)
                     return new Response(sgai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })

@@ -5,13 +5,13 @@ import { strict as assert } from "node:assert"
 import { test, describe } from "node:test"
 import {
   insertDiscontinuity,
-  addDaterangeInterstitial,
+  injectInterstitialCues,
   replaceSegmentsWithAds,
   calculateManifestDuration,
   parseVariant
-} from "../src/utils/hls"
-import { parseSCTE35FromManifest } from "../src/utils/scte35"
-import { signPath } from "../src/utils/sign"
+} from "../src/utils/hls.ts"
+import { parseSCTE35FromManifest } from "../src/utils/scte35.ts"
+import { signPath } from "../src/utils/sign.ts"
 import { windowBucket } from "../src/utils/time"
 
 // Helper to measure execution time
@@ -64,19 +64,18 @@ describe("HLS Performance", () => {
     console.log(`  ⏱️  10000-segment manifest: ${durationMs.toFixed(2)}ms`)
   })
 
-  test("addDaterangeInterstitial() performance is consistent", async () => {
+  test("injectInterstitialCues() performance is consistent", async () => {
     const durations: number[] = []
     const manifest = generateLargeManifest(100)
-    
+
     for (let i = 0; i < 100; i++) {
-      const { durationMs } = await measureTime(() => 
-        addDaterangeInterstitial(
-          manifest,
-          `ad-${i}`,
-          "2025-10-31T10:00:00Z",
-          30,
-          "https://ads.example.com/ad.m3u8"
-        )
+      const { durationMs } = await measureTime(() =>
+        injectInterstitialCues(manifest, {
+          id: `ad-${i}`,
+          startDateISO: "2025-10-31T10:00:00Z",
+          durationSec: 30,
+          assetURI: "https://ads.example.com/ad.m3u8"
+        })
       )
       durations.push(durationMs)
     }

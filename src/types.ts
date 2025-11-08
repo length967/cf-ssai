@@ -109,6 +109,9 @@ export type ViewerJWT = {
         deviceRestrictions?: number
       }
     }
+    // Preserve raw manifest metadata for reinjection
+    rawAttributes?: Record<string, string>
+    rawCommand?: string
   }
   
   export type SCTE35Context = {
