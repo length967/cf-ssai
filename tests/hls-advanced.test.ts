@@ -31,6 +31,25 @@ seg_1002.m4s
 seg_1003.m4s
 `
 
+function buildSequentialManifest(segmentCount: number, startIso = "2025-10-31T12:00:00.000Z") {
+  const lines: string[] = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-TARGETDURATION:4", "#EXT-X-MEDIA-SEQUENCE:1000"]
+  const pdts: string[] = []
+
+  const start = Date.parse(startIso)
+  for (let i = 0; i < segmentCount; i++) {
+    const iso = new Date(start + i * 4000).toISOString()
+    pdts.push(iso)
+    lines.push(`#EXT-X-PROGRAM-DATE-TIME:${iso}`)
+    lines.push(`#EXTINF:4.000,`)
+    lines.push(`seg_${1000 + i}.m4s`)
+  }
+
+  return { manifest: lines.join("\n"), pdts }
+}
+
+const LONG_MANIFEST = buildSequentialManifest(20)
+const SSAI_START_PDT = LONG_MANIFEST.pdts[4]
+
 const MASTER_PLAYLIST = `#EXTM3U
 #EXT-X-VERSION:7
 #EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
@@ -40,6 +59,12 @@ v_1600k.m3u8
 #EXT-X-STREAM-INF:BANDWIDTH=2500000,RESOLUTION=1920x1080
 v_2500k.m3u8
 `
+
+const SILENT_LOGGER = {
+  log: () => {},
+  warn: () => {},
+  error: () => {}
+}
 
 describe("HLS Parsing", () => {
   test("parseVariant() extracts all stream info correctly", () => {
@@ -131,13 +156,15 @@ describe("HLS DISCONTINUITY Insertion", () => {
     assert.equal(lines[lastSegIdx - 1].trim(), "#EXT-X-DISCONTINUITY")
   })
 
-  test("insertDiscontinuity() with PDT inserts at correct position", () => {
-    const result = insertDiscontinuity(SAMPLE_MANIFEST, "2025-10-31T12:00:08.000Z")
+  test("insertDiscontinuity() inserts a single discontinuity marker", () => {
+    const result = insertDiscontinuity(SAMPLE_MANIFEST)
     const lines = result.split("\n")
-    
-    const pdtIdx = lines.findIndex(l => l.includes("2025-10-31T12:00:08.000Z"))
-    assert.ok(pdtIdx >= 0)
-    assert.equal(lines[pdtIdx + 1].trim(), "#EXT-X-DISCONTINUITY")
+
+    const lastSegIdx = lines.findIndex(l => l.trim() === "seg_1003.m4s")
+    assert.ok(lastSegIdx > 0)
+    assert.equal(lines[lastSegIdx - 1].trim(), "#EXT-X-DISCONTINUITY")
+    const discontinuityCount = (result.match(/#EXT-X-DISCONTINUITY/g) || []).length
+    assert.equal(discontinuityCount, 1)
   })
 
   test("insertDiscontinuity() handles empty manifest gracefully", () => {
@@ -348,7 +375,7 @@ describe("SSAI Segment Replacement", () => {
 describe("HLS Edge Cases", () => {
   test("handles manifest with no segments", () => {
     const noSegments = "#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4"
-    
+
     // Should not throw
     const result1 = insertDiscontinuity(noSegments)
     const result2 = injectInterstitialCues(noSegments, {
@@ -414,10 +441,63 @@ seg_测试_1.m4s`
   })
 })
 
+describe("PTS↔PDT Mapping", () => {
+  test("PtsPdtMap estimates PDT for subsequent timestamps", () => {
+    const map = new PtsPdtMap()
+    const baseIso = "2025-01-01T00:00:00.000Z"
+    map.ingest(90000n, baseIso)
+
+    const estimate = map.estimate(180000n)
+    assert.ok(estimate)
+    if (estimate) {
+      assert.equal(estimate.iso, "2025-01-01T00:00:01.000Z")
+    }
+  })
+
+  test("reconcileCueStartDates populates missing START-DATE", () => {
+    const manifest = `#EXTM3U\n` +
+      `#EXT-X-PROGRAM-DATE-TIME:2025-01-01T00:00:00.000Z\n` +
+      `#EXT-X-PTS:90000\n` +
+      `#EXTINF:2.000,\n` +
+      `seg0.ts\n` +
+      `#EXT-X-DATERANGE:ID="cue-1",CLASS="test",X-PTS=180000,DURATION=30\n`
+
+    const map = new PtsPdtMap()
+    const { manifest: updated } = reconcileCueStartDates(manifest, map, { logger: SILENT_LOGGER })
+    const daterange = updated.split("\n").find(l => l.startsWith('#EXT-X-DATERANGE:'))
+
+    assert.ok(daterange)
+    assert.ok(daterange?.includes('START-DATE="2025-01-01T00:00:01.000Z"'))
+  })
+
+  test("reconcileCueStartDates resets mapping on DISCONTINUITY", () => {
+    const manifest = `#EXTM3U\n` +
+      `#EXT-X-PROGRAM-DATE-TIME:2025-01-01T00:00:00.000Z\n` +
+      `#EXT-X-PTS:90000\n` +
+      `#EXTINF:2.000,\n` +
+      `seg0.ts\n` +
+      `#EXT-X-DISCONTINUITY\n` +
+      `#EXT-X-PROGRAM-DATE-TIME:2025-01-01T01:00:00.000Z\n` +
+      `#EXT-X-PTS:90000\n` +
+      `#EXTINF:2.000,\n` +
+      `seg1.ts\n`
+
+    const map = new PtsPdtMap()
+    reconcileCueStartDates(manifest, map, { logger: SILENT_LOGGER })
+
+    assert.equal(map.calibrationCount, 1)
+    const latest = map.latest
+    assert.ok(latest)
+    if (latest) {
+      assert.equal(new Date(latest.pdtMs).toISOString(), "2025-01-01T01:00:00.000Z")
+    }
+  })
+})
+
 describe("HLS Validation", () => {
   test("insertDiscontinuity() produces valid HLS syntax", () => {
     const result = insertDiscontinuity(SAMPLE_MANIFEST)
-    
+
     // Basic validation
     assert.ok(result.startsWith("#EXTM3U"))
     assert.ok(result.includes("#EXT-X-VERSION"))
@@ -458,14 +538,14 @@ describe("HLS Validation", () => {
   test("replaceSegmentsWithAds() maintains segment continuity", () => {
     const adSegments = ["https://ads.example.com/ad_seg_1.m4s"]
     
-    const result = replaceSegmentsWithAds(
+    const { manifest } = replaceSegmentsWithAds(
       SAMPLE_MANIFEST,
       "2025-10-31T12:00:08.000Z",
       adSegments,
       30
     )
-    
-    const lines = result.split("\n")
+
+    const lines = manifest.split("\n")
     let hasInfBeforeSegment = true
     
     for (let i = 0; i < lines.length; i++) {
@@ -473,20 +553,29 @@ describe("HLS Validation", () => {
       if (!line.startsWith("#") && line.trim().length > 0 && line.includes(".m4s")) {
         // This is a segment line, previous meaningful line should be EXTINF
         let foundExtinf = false
+        const context: string[] = []
         for (let j = i - 1; j >= 0; j--) {
           if (lines[j].trim().length === 0) continue
-          if (lines[j].startsWith("#EXTINF:")) {
+          const trimmed = lines[j].trim()
+          context.push(trimmed)
+          if (trimmed.startsWith("#EXTINF:")) {
             foundExtinf = true
             break
           }
-          if (!lines[j].startsWith("#EXT-X-DISCONTINUITY") && 
-              !lines[j].startsWith("#EXT-X-PROGRAM-DATE-TIME")) {
+          if (!trimmed.startsWith("#EXT-X-DISCONTINUITY") &&
+              !trimmed.startsWith("#EXT-X-PROGRAM-DATE-TIME")) {
             break
           }
         }
         if (!foundExtinf) {
-          hasInfBeforeSegment = false
-          break
+          const prev = context[0]
+          const prev2 = context[1]
+          const resumeAfterDiscontinuity =
+            prev?.startsWith("#EXT-X-PROGRAM-DATE-TIME") && prev2?.startsWith("#EXT-X-DISCONTINUITY")
+          if (!resumeAfterDiscontinuity) {
+            hasInfBeforeSegment = false
+            break
+          }
         }
       }
     }

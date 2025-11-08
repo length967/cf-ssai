@@ -97,6 +97,10 @@ export type ViewerJWT = {
       protocolVersion?: number
       ptsAdjustment?: bigint
       crcValid?: boolean
+      tier?: number
+      cwIndex?: number
+      encryptedPacket?: boolean
+      encryptionAlgorithm?: number
       segmentationDescriptors?: any[]  // Full segmentation descriptor data
       deliveryRestrictions?: {
         webAllowed?: boolean
@@ -115,6 +119,59 @@ export type ViewerJWT = {
     detectedAt: number
     channel: string
     variant: string
+  }
+
+  export type Scte35EventCommandType =
+    | "splice_insert"
+    | "time_signal"
+    | "bandwidth_reservation"
+    | "private_command"
+    | "reserved"
+
+  export type Scte35Event = {
+    programNumber?: number
+    pid: number
+    eventId: string
+    commandType: Scte35EventCommandType
+    commandTypeId: number
+    spliceEventId?: number
+    spliceEventCancelIndicator?: boolean
+    outOfNetworkIndicator?: boolean
+    programSpliceFlag?: boolean
+    durationFlag?: boolean
+    spliceImmediateFlag?: boolean
+    breakDurationSeconds?: number
+    autoReturn?: boolean
+    segmentationDurationSeconds?: number
+    pts?: number
+    ptsSeconds?: number
+    ptsAdjustment?: number
+    protocolVersion?: number
+    cwIndex?: number
+    tier?: number
+    segmentationEventId?: number
+    segmentationTypeId?: number
+    segmentationTypeName?: string
+    segmentNum?: number
+    segmentsExpected?: number
+    subSegmentNum?: number
+    subSegmentsExpected?: number
+    upidType?: number
+    upid?: string
+    deliveryRestrictions?: {
+      webAllowed?: boolean
+      noRegionalBlackout?: boolean
+      archiveAllowed?: boolean
+      deviceRestrictions?: number
+    }
+    continuityCounters: number[]
+    raw: string
+    rawHex: string
+    crc32?: number
+    crcValid?: boolean
+    encrypted?: boolean
+    encryptionAlgorithm?: number
+    ingestTimestamp: number
   }
 
   // VAST Types
