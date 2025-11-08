@@ -209,9 +209,9 @@ describe("Edge Case Data Scenarios", () => {
 seg_1.m4s`
     
     const result = replaceSegmentsWithAds(manifest, "2025-10-31T10:00:00Z", [], 30)
-    
-    // Should not crash
-    assert.ok(result)
+
+    // Should not crash and should return manifest
+    assert.ok(result.manifest.includes("seg_1.m4s"))
   })
 
   test("Handles PDT that doesn't exist in manifest", () => {
@@ -226,9 +226,9 @@ seg_1.m4s`
       ["https://ads.example.com/seg1.m4s"],
       30
     )
-    
+
     // Should handle gracefully
-    assert.ok(result)
+    assert.equal(result.segmentsSkipped, 0)
   })
 
   test("Handles negative duration", () => {

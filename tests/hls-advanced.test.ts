@@ -242,8 +242,8 @@ describe("SSAI Segment Replacement", () => {
       adSegments,
       30
     )
-    
-    const discontinuityCount = (result.match(/#EXT-X-DISCONTINUITY/g) || []).length
+
+    const discontinuityCount = (result.manifest.match(/#EXT-X-DISCONTINUITY/g) || []).length
     assert.equal(discontinuityCount, 2, "Should have 2 DISCONTINUITY tags")
   })
 
@@ -259,9 +259,9 @@ describe("SSAI Segment Replacement", () => {
       adSegments,
       30
     )
-    
-    assert.ok(result.includes("ad_seg_1.m4s"))
-    assert.ok(result.includes("ad_seg_2.m4s"))
+
+    assert.ok(result.manifest.includes("ad_seg_1.m4s"))
+    assert.ok(result.manifest.includes("ad_seg_2.m4s"))
   })
 
   test("replaceSegmentsWithAds() removes appropriate number of content segments", () => {
@@ -276,11 +276,11 @@ describe("SSAI Segment Replacement", () => {
       adSegments,
       30  // 30 seconds = ~7.5 segments at 4s each
     )
-    
+
     // Should have fewer content segments than original
     const originalSegments = (SAMPLE_MANIFEST.match(/seg_\d+\.m4s/g) || []).length
-    const resultSegments = (result.match(/seg_\d+\.m4s/g) || []).length
-    
+    const resultSegments = (result.manifest.match(/seg_\d+\.m4s/g) || []).length
+
     assert.ok(resultSegments < originalSegments, "Should have fewer content segments")
   })
 
@@ -291,23 +291,23 @@ describe("SSAI Segment Replacement", () => {
       [],
       30
     )
-    
+
     // Should return manifest unchanged (or with minimal changes)
-    assert.ok(result.includes("seg_1000.m4s"))
+    assert.ok(result.manifest.includes("seg_1000.m4s"))
   })
 
   test("replaceSegmentsWithAds() preserves PDT timestamps", () => {
     const adSegments = ["https://ads.example.com/ad_seg_1.m4s"]
-    
+
     const result = replaceSegmentsWithAds(
       SAMPLE_MANIFEST,
       "2025-10-31T12:00:08.000Z",
       adSegments,
       30
     )
-    
+
     // Should still have PDT tags
-    assert.ok(result.includes("#EXT-X-PROGRAM-DATE-TIME:"))
+    assert.ok(result.manifest.includes("#EXT-X-PROGRAM-DATE-TIME:"))
   })
 
   test("replaceSegmentsWithAds() calculates correct segment durations", () => {
@@ -323,9 +323,40 @@ describe("SSAI Segment Replacement", () => {
       adSegments,
       30
     )
-    
+
     // Each ad segment should have duration ~30/3 = 10 seconds
-    assert.ok(result.includes("10.000"))
+    assert.ok(result.manifest.includes("10.000"))
+  })
+
+  test("replaceSegmentsWithAds() annotates closing DATERANGE with reconciliation metrics", () => {
+    const adSegments = [
+      { url: "https://ads.example.com/ad_seg_1.m4s", duration: 12 },
+      { url: "https://ads.example.com/ad_seg_2.m4s", duration: 12 },
+      { url: "https://ads.example.com/ad_seg_3.m4s", duration: 6 }
+    ]
+
+    const result = replaceSegmentsWithAds(
+      SAMPLE_MANIFEST,
+      "2025-10-31T12:00:08.000Z",
+      adSegments,
+      30,
+      30,
+      undefined,
+      {
+        adId: "ad-123",
+        boundarySnap: "exact",
+        cueDecodeStatus: "binary",
+        pidContinuity: "reset",
+        plannedDuration: 30
+      }
+    )
+
+    const closingTag = (result.manifest.match(/#EXT-X-DATERANGE:[^\n]+/g) || []).pop() || ""
+    assert.ok(closingTag.includes("X-PLANNED-DURATION=30.000"))
+    assert.ok(closingTag.includes("X-ACTUAL-AD-DURATION=30.000"))
+    assert.ok(closingTag.includes("X-DURATION-ERROR=0.000"))
+    assert.ok(closingTag.includes("X-BOUNDARY-SNAP=\"exact\""))
+    assert.ok(closingTag.includes("X-CUE-STATUS=\"binary\""))
   })
 })
 
@@ -445,8 +476,8 @@ describe("HLS Validation", () => {
       adSegments,
       30
     )
-    
-    const lines = result.split("\n")
+
+    const lines = result.manifest.split("\n")
     let hasInfBeforeSegment = true
     
     for (let i = 0; i < lines.length; i++) {
