@@ -1,4 +1,4 @@
-import { addDaterangeInterstitial, insertDiscontinuity, extractPDTs, extractBitrates } from "./utils/hls"
+import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, extractPDTs, extractBitrates, calculateSkipPlan, AdSegmentInfo, SkipPlan } from "./utils/hls"
 import { signPath } from "./utils/sign"
 import { parseScte35FromTransportStream, eventToSignal, getBreakDuration, findActiveBreak, validateSCTE35Signal } from "./utils/scte35"
 import { getChannelConfig } from "./utils/channel-config"
@@ -1021,6 +1021,28 @@ export class ChannelDO {
     }
   }
 
+  /**
+   * Trim slate segments from the end of the adjusted ad pod to reduce overrun duration.
+   * Returns total duration trimmed.
+   */
+  private trimSlateSegments(segments: AdSegmentInfo[], trimAmount: number): number {
+    if (trimAmount <= 0) return 0
+
+    let remaining = trimAmount
+    let trimmed = 0
+
+    for (let i = segments.length - 1; i >= 0 && remaining > 0; i--) {
+      const segment = segments[i]
+      if (segment.type === 'slate') {
+        trimmed += segment.duration
+        remaining -= segment.duration
+        segments.splice(i, 1)
+      }
+    }
+
+    return Math.round(trimmed * 1000) / 1000
+  }
+
   async fetch(req: Request): Promise<Response> {
     // CRITICAL FIX: Load ad state version before blocking to detect mid-request changes
     const initialAdStateVersion = await this.state.storage.get<number>('ad_state_version') || 0
@@ -1627,16 +1649,15 @@ export class ChannelDO {
                 const playlistResponse = await fetchWithRetry(adItem.playlistUrl, 3)
                 
                 const playlistContent = await playlistResponse.text()
-                const adSegments: Array<{url: string, duration: number}> = []
-                
+                const adSegments: AdSegmentInfo[] = []
+
                 // Parse playlist to extract segment filenames AND durations
                 const lines = playlistContent.split('\n')
                 let currentDuration = 6.0 // Default fallback
-                
+
                 for (const line of lines) {
                   const trimmed = line.trim()
-                  
-                  // Extract duration from #EXTINF
+
                   if (trimmed.startsWith('#EXTINF:')) {
                     const match = trimmed.match(/#EXTINF:([\d.]+)/)
                     if (match) {
@@ -1644,47 +1665,23 @@ export class ChannelDO {
                     }
                     continue
                   }
-                  
-                  // Skip other comments and empty lines
+
                   if (!trimmed || trimmed.startsWith('#')) continue
-                  
-                  // This is a segment URL - add with its duration
+
                   adSegments.push({
                     url: `${baseUrl}/${trimmed}`,
-                    duration: currentDuration
+                    duration: currentDuration,
+                    type: 'ad'
                   })
                 }
-                
-                // Round total duration to avoid floating-point precision issues
-                let totalDuration = Math.round(adSegments.reduce((sum, seg) => sum + seg.duration, 0) * 100) / 100
-                console.log(`Extracted ${adSegments.length} ad segments (total: ${totalDuration.toFixed(2)}s) from playlist: ${adItem.playlistUrl}`)
-                
-                // Pad with slate if ad is shorter than SCTE-35 break duration
-                if (totalDuration < stableDuration && Math.abs(totalDuration - stableDuration) > 1.0) {
-                  const gapDuration = stableDuration - totalDuration
-                  console.log(`⚠️  Ad duration mismatch: ad=${totalDuration.toFixed(2)}s, break=${stableDuration.toFixed(2)}s, gap=${gapDuration.toFixed(2)}s, padding with slate`)
 
-                  // Fetch channel's slate configuration
-                  try {
-                    const slateSegments = await this.fetchSlateSegments(channelId, viewerBitrate, gapDuration)
-                    if (slateSegments.length > 0) {
-                      adSegments.push(...slateSegments)
-                      totalDuration = Math.round(adSegments.reduce((sum, seg) => sum + seg.duration, 0) * 100) / 100
-                      console.log(`Added ${slateSegments.length} slate segments, new total: ${totalDuration.toFixed(2)}s`)
-                    } else {
-                      console.warn('No slate segments available, gap will remain')
-                    }
-                  } catch (err) {
-                    console.error('Failed to fetch slate segments:', err)
-                  }
-                }
-                
+                let baseAdDuration = Math.round(adSegments.reduce((sum, seg) => sum + seg.duration, 0) * 1000) / 1000
+                console.log(`Extracted ${adSegments.length} ad segments (total: ${baseAdDuration.toFixed(3)}s) from playlist: ${adItem.playlistUrl}`)
+
                 if (adSegments.length > 0) {
                   const cleanOrigin = stripOriginSCTE35Markers(origin)
 
                   // FIX #4: MANIFEST WINDOW VALIDATION
-                  // Check if SCTE-35 PDT is actually in the manifest window before attempting SSAI
-                  // If PDT not found, skip SSAI entirely and jump straight to SGAI fallback
                   let shouldAttemptSSAI = true
                   if (scte35StartPDT) {
                     const pdtsInManifest = getCachedPDTs(cleanOrigin)
@@ -1694,29 +1691,119 @@ export class ChannelDO {
                     }
                   }
 
-                  // CRITICAL: Pass actual ad duration calculated from segments
-                  // This ensures PDT timeline continuity
-                  // Use stable skip count from ad state if available (prevents concurrent request inconsistency)
-                  const stableSkipCount = adState?.contentSegmentsToSkip || adState?.manifestPlan?.stableSkipCount || undefined
-
-                  let sharedResult: SharedInsertionResult | null = null
+                  const stableSkipCount = adState?.contentSegmentsToSkip || undefined
+                  let skipPlan: SkipPlan | null = null
                   if (shouldAttemptSSAI) {
-                    const playlistModel = parsePlaylistModel(cleanOrigin)
-                    sharedResult = applySharedAdInsertion(playlistModel, {
-                      startPDT: scte35StartPDT,
-                      adSegments,
-                      adDuration: totalDuration,
-                      contentSkipDuration: stableDuration,
-                      stableSkipCount,
-                      existingPlan: adState?.manifestPlan
+                    skipPlan = calculateSkipPlan(cleanOrigin, scte35StartPDT, {
+                      scte35Duration: stableDuration,
+                      stableSkipCount
                     })
+
+                    if (!skipPlan || skipPlan.segmentsSkipped === 0 || skipPlan.remainingSegments === 0 || !skipPlan.resumePDT) {
+                      console.warn(`⚠️  Unable to build skip plan for PDT ${scte35StartPDT} (plan=${JSON.stringify(skipPlan)})`)
+                      shouldAttemptSSAI = false
+                    }
                   }
 
-                  // HYBRID SSAI/SGAI: If SCTE-35 PDT not found in manifest (rolled out of window),
-                  // OR if we skipped SSAI due to window validation,
-                  // fall back to SGAI (HLS Interstitials) for late-joining viewers
-                  if (!sharedResult || sharedResult.segmentsSkipped === 0) {
-                    console.log(`🔄 SSAI failed (PDT not in manifest or window guard tripped), falling back to SGAI for late-joining viewer`)
+                  const cueDecodeStatus = adSource === 'api'
+                    ? 'manual'
+                    : activeBreak
+                      ? (activeBreak.binaryData
+                        ? (activeBreak.binaryData.crcValid === false ? 'binary-crc-invalid' : 'binary')
+                        : 'attributes')
+                      : (adSource === 'time' ? 'schedule' : 'unknown')
+
+                  let boundarySnapOutcome = 'exact'
+                  let adjustedSegments: AdSegmentInfo[] = [...adSegments]
+                  let adPlaybackDuration = baseAdDuration
+                  const telemetryFallback = { boundarySnapOutcome: 'fallback', durationError: Math.abs(adPlaybackDuration - stableDuration) }
+
+                  let result = { manifest: cleanOrigin, segmentsSkipped: 0, durationSkipped: 0, actualAdDuration: adPlaybackDuration }
+
+                  if (shouldAttemptSSAI && skipPlan) {
+                    const tolerance = 0.5
+                    const targetContentDuration = Math.round(skipPlan.durationSkipped * 1000) / 1000
+                    let durationDelta = targetContentDuration - adPlaybackDuration
+
+                    if (Math.abs(durationDelta) > tolerance) {
+                      if (durationDelta > 0) {
+                        boundarySnapOutcome = 'padded'
+                        try {
+                          const slateSegments = await this.fetchSlateSegments(channelId, viewerBitrate, durationDelta)
+                          if (slateSegments.length > 0) {
+                            const slateInfos: AdSegmentInfo[] = slateSegments.map(seg => ({ ...seg, type: 'slate' as const }))
+                            adjustedSegments = [...adjustedSegments, ...slateInfos]
+                            adPlaybackDuration = Math.round(adjustedSegments.reduce((sum, seg) => sum + seg.duration, 0) * 1000) / 1000
+                            console.log(`Added ${slateInfos.length} slate segments to align with snapped IN boundary, new ad duration=${adPlaybackDuration.toFixed(3)}s`)
+                          } else {
+                            console.warn('No slate segments available to fill snapped boundary gap')
+                            boundarySnapOutcome = 'underrun'
+                          }
+                        } catch (err) {
+                          console.error('Failed to fetch slate segments for snapped boundary padding:', err)
+                          boundarySnapOutcome = 'underrun'
+                        }
+                      } else {
+                        boundarySnapOutcome = 'trimmed'
+                        const trimmed = this.trimSlateSegments(adjustedSegments, Math.abs(durationDelta))
+                        if (trimmed > 0) {
+                          adPlaybackDuration = Math.round(adjustedSegments.reduce((sum, seg) => sum + seg.duration, 0) * 1000) / 1000
+                          console.log(`Trimmed ${trimmed.toFixed(3)}s of slate to match snapped IN boundary, new ad duration=${adPlaybackDuration.toFixed(3)}s`)
+                        } else {
+                          boundarySnapOutcome = 'overrun'
+                        }
+                      }
+                    }
+
+                    const replacement = replaceSegmentsWithAds(
+                      cleanOrigin,
+                      scte35StartPDT,
+                      adjustedSegments,
+                      adPlaybackDuration,
+                      stableDuration,
+                      stableSkipCount,
+                      {
+                        adId: adActive ? (adState!.podId || 'ad') : pod.podId,
+                        boundarySnap: boundarySnapOutcome,
+                        cueDecodeStatus,
+                        pidContinuity: 'reset',
+                        plannedDuration: stableDuration,
+                        durationError: Math.abs(adPlaybackDuration - stableDuration)
+                      }
+                    )
+
+                    result = replacement
+
+                    beaconMsg.metadata = {
+                      ...beaconMsg.metadata,
+                      telemetry: {
+                        pidContinuity: 'reset',
+                        cueDecodeStatus,
+                        boundarySnap: boundarySnapOutcome,
+                        durationError: Math.abs(replacement.actualAdDuration - stableDuration),
+                        plannedDuration: stableDuration,
+                        actualAdDuration: replacement.actualAdDuration,
+                        actualContentDuration: replacement.durationSkipped
+                      }
+                    }
+                  } else {
+                    beaconMsg.metadata = {
+                      ...beaconMsg.metadata,
+                      telemetry: {
+                        pidContinuity: 'reset',
+                        cueDecodeStatus,
+                        boundarySnap: telemetryFallback.boundarySnapOutcome,
+                        durationError: telemetryFallback.durationError,
+                        plannedDuration: stableDuration,
+                        actualAdDuration: adPlaybackDuration,
+                        actualContentDuration: 0
+                      }
+                    }
+                  }
+
+                  // HYBRID SSAI/SGAI fallback logic
+                  if (result.segmentsSkipped === 0) {
+                    console.log(`🔄 SSAI failed (PDT not in manifest), falling back to SGAI for late-joining viewer`)
 
                     // Use SGAI interstitial insertion instead
                     const adItem = pod.items.find(item => item.bitrate === viewerBitrate) || pod.items[0]

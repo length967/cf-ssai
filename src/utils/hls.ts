@@ -271,177 +271,42 @@ function addSecondsToTimestamp(isoTimestamp: string, seconds: number): string {
   return date.toISOString()
 }
 
-function safeParseBigInt(value: string): bigint | null {
-  if (!value || !/^[0-9]+$/.test(value)) return null
-  try {
-    return BigInt(value)
-  } catch {
-    return null
-  }
+/** Ad segment metadata used during SSAI replacement. */
+export interface AdSegmentInfo {
+  url: string
+  duration: number
+  type?: 'ad' | 'slate'
 }
 
-function extractPtsValue(line: string): bigint | null {
-  const tagMatch = line.match(/#EXT-X-PTS:(\d+)/)
-  if (tagMatch) {
-    return safeParseBigInt(tagMatch[1])
-  }
-
-  const attrMatch = line.match(/(?:^|,)(?:X-)?PTS=(\d+)/)
-  if (attrMatch) {
-    return safeParseBigInt(attrMatch[1])
-  }
-
-  return null
+/**
+ * Skip plan describing how much origin content will be removed around a PDT marker.
+ * This is calculated before inserting ad segments so that slate padding can be sized
+ * to the snapped resume boundary.
+ */
+export interface SkipPlan {
+  markerLineIndex: number
+  skipStartIndex: number
+  resumeContentIndex: number
+  segmentsSkipped: number
+  durationSkipped: number
+  resumePDT?: string | null
+  remainingSegments: number
+  stableSkipCountUsed: boolean
+  segmentsSearchedForPDT: number
 }
 
-function reconcileDaterangeLine(
-  line: string,
-  map: PtsPdtMap,
-  options: { logger: Pick<typeof console, 'log' | 'warn' | 'error'>, variantId?: string, metrics?: MetricEmitter, driftThresholdMs: number }
-): { line: string, driftMs: number | null } {
-  const ptsMatch = line.match(/(?:^|,)(?:X-)?PTS=(\d+)/)
-  const startMatch = line.match(/START-DATE="([^"]*)"/)
-  const ptsValue = ptsMatch ? safeParseBigInt(ptsMatch[1]) : null
-  const currentStart = startMatch ? startMatch[1] : null
-  const variantSuffix = options.variantId ? ` [${options.variantId}]` : ''
-  let driftMs: number | null = null
-  let updatedLine = line
-  let calibrationStart: string | null = currentStart
-
-  if (ptsValue !== null) {
-    let estimate = map.estimate(ptsValue)
-    if (!estimate) {
-      const latest = map.latest
-      if (latest) {
-        const deltaTicks = Number(ptsValue - latest.rawPts)
-        const seconds = deltaTicks / Number(90000)
-        const predictedMs = latest.pdtMs + seconds * 1000
-        estimate = { ms: predictedMs, iso: new Date(predictedMs).toISOString() }
-      }
-    }
-    if (estimate) {
-      if (currentStart) {
-        const parsed = Date.parse(currentStart)
-        if (Number.isFinite(parsed)) {
-          driftMs = parsed - estimate.ms
-          const absDrift = Math.abs(driftMs)
-          const message = `[PTS→PDT] Cue drift ${driftMs.toFixed(2)}ms for ${ptsValue.toString()} ticks${variantSuffix}`
-          if (absDrift > options.driftThresholdMs) {
-            options.logger.warn(message)
-            updatedLine = updatedLine.replace(/START-DATE="([^"]*)"/, `START-DATE="${estimate.iso}"`)
-            calibrationStart = estimate.iso
-          } else {
-            options.logger.log(message)
-          }
-        } else {
-          options.logger.warn(`[PTS→PDT] Invalid START-DATE on cue${variantSuffix}, substituting mapped value`)
-          updatedLine = updatedLine.replace(/START-DATE="([^"]*)"/, `START-DATE="${estimate.iso}"`)
-          calibrationStart = estimate.iso
-          driftMs = 0
-        }
-      } else {
-        options.logger.log(`[PTS→PDT] Filled missing START-DATE for cue${variantSuffix}`)
-        updatedLine = `${updatedLine},START-DATE="${estimate.iso}"`
-        calibrationStart = estimate.iso
-        driftMs = 0
-      }
-    }
-  }
-
-  if (ptsValue !== null && calibrationStart) {
-    map.ingest(ptsValue, calibrationStart)
-  }
-
-  return { line: updatedLine, driftMs }
+export interface SkipPlanOptions {
+  scte35Duration?: number
+  stableSkipCount?: number
 }
 
-export function reconcileCueStartDates(
-  manifest: string,
-  map: PtsPdtMap,
-  options?: CueMappingOptions
-): { manifest: string, lastDriftMs?: number } {
-  const logger = options?.logger ?? console
-  const driftThreshold = options?.driftLogThresholdMs ?? 250
-  const emitMetric = options?.metrics
-  const dims = options?.variantId ? { variant: options.variantId } : undefined
-
-  const lines = manifest.split('\n')
-  const output: string[] = []
-  let pendingPts: bigint | null = null
-  let pendingPdt: string | null = null
-  let lastDriftMs: number | null = null
-
-  const captureCalibration = () => {
-    if (pendingPts !== null && pendingPdt) {
-      const added = map.ingest(pendingPts, pendingPdt)
-      if (added) {
-        logger.log(`[PTS→PDT] Captured calibration ${pendingPts.toString()} → ${pendingPdt}${options?.variantId ? ` [${options.variantId}]` : ''}`)
-      }
-      pendingPts = null
-      pendingPdt = null
-    }
-  }
-
-  for (const line of lines) {
-    if (line.startsWith('#EXT-X-DISCONTINUITY')) {
-      if (map.calibrationCount > 0) {
-        logger.log(`[PTS→PDT] Reset mapping due to DISCONTINUITY${options?.variantId ? ` [${options.variantId}]` : ''}`)
-      }
-      map.reset()
-      pendingPts = null
-      pendingPdt = null
-      output.push(line)
-      continue
-    }
-
-    if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
-      pendingPdt = line.replace('#EXT-X-PROGRAM-DATE-TIME:', '').trim()
-      captureCalibration()
-      output.push(line)
-      continue
-    }
-
-    if (line.startsWith('#EXT-X-DATERANGE:')) {
-      const result = reconcileDaterangeLine(line, map, {
-        logger,
-        variantId: options?.variantId,
-        metrics: emitMetric,
-        driftThresholdMs: driftThreshold
-      })
-
-      if (result.driftMs !== null) {
-        lastDriftMs = result.driftMs
-      }
-
-      output.push(result.line)
-      continue
-    }
-
-    const pts = extractPtsValue(line)
-    if (pts !== null) {
-      pendingPts = pts
-      captureCalibration()
-      output.push(line)
-      continue
-    }
-
-    if (!line.startsWith('#') && line.trim().length > 0) {
-      pendingPts = null
-      pendingPdt = null
-    }
-
-    output.push(line)
-  }
-
-  if (emitMetric) {
-    emitMetric('pts_pdt_mapping_points', map.calibrationCount, dims)
-    emitMetric('pts_pdt_mapping_health', map.calibrationCount > 0 ? 1 : 0, dims)
-    if (lastDriftMs !== null) {
-      emitMetric('pts_pdt_drift_ms', Math.abs(lastDriftMs), dims)
-    }
-  }
-
-  return { manifest: output.join('\n'), lastDriftMs: lastDriftMs ?? undefined }
+export interface ReplaceSegmentsOptions {
+  adId?: string
+  boundarySnap?: string
+  cueDecodeStatus?: string
+  pidContinuity?: string
+  plannedDuration?: number
+  durationError?: number
 }
 
 /**
@@ -472,17 +337,154 @@ function getAverageSegmentDuration(lines: string[]): number {
   return avg
 }
 
+function normalizeAdSegments(
+  adSegments: Array<{ url: string, duration: number, type?: 'ad' | 'slate' }> | string[],
+  adDuration: number
+): AdSegmentInfo[] {
+  if (adSegments.length === 0) return []
+
+  if (typeof adSegments[0] === 'string') {
+    const urls = adSegments as string[]
+    const perSegment = urls.length > 0 ? adDuration / urls.length : 0
+    return urls.map(url => ({ url, duration: perSegment, type: 'ad' as const }))
+  }
+
+  return (adSegments as AdSegmentInfo[]).map(seg => ({ ...seg }))
+}
+
+function calculateSkipPlanFromLines(
+  lines: string[],
+  markerIndex: number,
+  options: SkipPlanOptions
+): SkipPlan | null {
+  const plan: SkipPlan = {
+    markerLineIndex: markerIndex,
+    skipStartIndex: markerIndex + 1,
+    resumeContentIndex: markerIndex + 1,
+    segmentsSkipped: 0,
+    durationSkipped: 0,
+    resumePDT: null,
+    remainingSegments: 0,
+    stableSkipCountUsed: !!(options.stableSkipCount && options.stableSkipCount > 0),
+    segmentsSearchedForPDT: 0
+  }
+
+  const targetDuration = options.scte35Duration ?? 0
+  const stableSkipCount = options.stableSkipCount ?? 0
+
+  let resumeIndex = markerIndex + 1
+  let segmentsSeen = 0
+  let skippedDuration = 0
+
+  while (resumeIndex < lines.length) {
+    const currentLine = lines[resumeIndex]
+
+    if (currentLine.startsWith('#EXTINF:')) {
+      const match = currentLine.match(/#EXTINF:([\d.]+)/)
+      if (match) {
+        skippedDuration += parseFloat(match[1])
+      }
+    }
+
+    if (!currentLine.startsWith('#') && currentLine.trim().length > 0) {
+      segmentsSeen++
+      plan.segmentsSkipped = segmentsSeen
+      plan.durationSkipped = skippedDuration
+
+      if (plan.stableSkipCountUsed) {
+        if (segmentsSeen >= stableSkipCount) {
+          resumeIndex++
+          break
+        }
+      } else if (skippedDuration >= targetDuration) {
+        resumeIndex++
+        break
+      }
+    }
+
+    resumeIndex++
+  }
+
+  plan.resumeContentIndex = resumeIndex
+
+  // Count remaining segments after resume point
+  for (let j = resumeIndex; j < lines.length; j++) {
+    if (!lines[j].startsWith('#') && lines[j].trim().length > 0) {
+      plan.remainingSegments++
+    }
+  }
+
+  // Find resume PDT within a limited window
+  const MAX_SEGMENTS_TO_SEARCH = 15
+  let searchIndex = resumeIndex
+  let segmentsSearched = 0
+  while (searchIndex < lines.length && segmentsSearched < MAX_SEGMENTS_TO_SEARCH) {
+    const searchLine = lines[searchIndex]
+    if (searchLine.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+      plan.resumePDT = searchLine.replace('#EXT-X-PROGRAM-DATE-TIME:', '').trim()
+      plan.resumeContentIndex = searchIndex + 1
+      break
+    }
+
+    if (!searchLine.startsWith('#') && searchLine.trim().length > 0) {
+      segmentsSearched++
+    }
+
+    searchIndex++
+  }
+
+  plan.segmentsSearchedForPDT = segmentsSearched
+
+  return plan
+}
+
+export function calculateSkipPlan(
+  variantText: string,
+  scte35StartPDT: string,
+  options: SkipPlanOptions = {}
+): SkipPlan | null {
+  const lines = variantText.split('\n')
+  const markerIndex = lines.findIndex(line => line.startsWith('#EXT-X-PROGRAM-DATE-TIME:') && line.includes(scte35StartPDT))
+  if (markerIndex === -1) {
+    return null
+  }
+
+  return calculateSkipPlanFromLines(lines, markerIndex, options)
+}
+
+function buildClosingDateRangeTag(
+  resumePDT: string,
+  options: ReplaceSegmentsOptions,
+  actualAdDuration: number,
+  actualContentDuration: number,
+  plannedDuration: number
+): string {
+  const durationError = options.durationError ?? Math.abs(actualAdDuration - plannedDuration)
+  const attrs: string[] = []
+  attrs.push(`ID="${options.adId ? `${options.adId}-return` : 'ssai-return'}"`)
+  attrs.push('CLASS="com.apple.hls.scte35.in"')
+  attrs.push(`START-DATE="${resumePDT}"`)
+  attrs.push('SCTE35-IN=YES')
+  attrs.push('DURATION=0.000')
+  attrs.push(`X-PLANNED-DURATION=${plannedDuration.toFixed(3)}`)
+  attrs.push(`X-ACTUAL-AD-DURATION=${actualAdDuration.toFixed(3)}`)
+  attrs.push(`X-ACTUAL-CONTENT-DURATION=${actualContentDuration.toFixed(3)}`)
+  attrs.push(`X-DURATION-ERROR=${durationError.toFixed(3)}`)
+  if (options.boundarySnap) {
+    attrs.push(`X-BOUNDARY-SNAP="${options.boundarySnap}"`)
+  }
+  if (options.cueDecodeStatus) {
+    attrs.push(`X-CUE-STATUS="${options.cueDecodeStatus}"`)
+  }
+  if (options.pidContinuity) {
+    attrs.push(`X-PID-CONTINUITY="${options.pidContinuity}"`)
+  }
+  return `#EXT-X-DATERANGE:${attrs.join(',')}`
+}
+
 /**
  * Replace content segments with ad segments for true SSAI
- * Inserts DISCONTINUITY tags before and after ad pod
- * 
- * @param variantText - Original manifest
- * @param scte35StartPDT - PDT where ad break starts
- * @param adSegments - Ad segments with actual durations
- * @param adDuration - Actual ad duration (sum of ad segment durations)
- * @param scte35Duration - SCTE-35 break duration (how much content to skip)
- * @param stableSkipCount - Optional: Pre-calculated stable segment skip count from ad state
- * @returns Object with manifest and skip statistics
+ * Inserts DISCONTINUITY tags before and after ad pod and records telemetry
  */
 export interface ReplaceSegmentsWithAdsOptions {
   cuePts90k?: number
@@ -514,286 +516,93 @@ export interface ReplaceSegmentsResult {
 export function replaceSegmentsWithAds(
   variantText: string,
   scte35StartPDT: string,
-  adSegments: Array<{url: string, duration: number}> | string[],
+  adSegments: Array<{url: string, duration: number, type?: 'ad' | 'slate'}> | string[],
   adDuration: number,
-  scte35Duration?: number,  // Optional: SCTE-35 duration if different from ad duration
-  stableSkipCount?: number,  // Optional: Use pre-calculated skip count for stability
-  options: ReplaceSegmentsWithAdsOptions = {}
-): ReplaceSegmentsResult {
-  // Use SCTE-35 duration for content skipping, or fall back to ad duration
-  const contentSkipDuration = scte35Duration || adDuration
-  const lines = variantText.split("\n")
+  scte35Duration?: number,
+  stableSkipCount?: number,
+  options: ReplaceSegmentsOptions = {}
+): { manifest: string, segmentsSkipped: number, durationSkipped: number, actualAdDuration: number } {
+  const lines = variantText.split('\n')
   const output: string[] = []
+  const normalizedSegments = normalizeAdSegments(adSegments, adDuration)
+  const actualAdDuration = normalizedSegments.reduce((sum, seg) => sum + seg.duration, 0)
+  const plannedDuration = options.plannedDuration ?? scte35Duration ?? actualAdDuration
 
-  let boundaryInfo: ReplaceSegmentsBoundary | undefined
-  let requestedCut: ReplaceSegmentsResult["requestedCut"]
-  
   // Detect actual segment duration from content manifest
   const contentSegmentDuration = getAverageSegmentDuration(lines)
-  const segmentsToReplace = Math.ceil(contentSkipDuration / contentSegmentDuration)
-  
-  console.log(`Ad duration: ${adDuration}s, SCTE-35 duration: ${contentSkipDuration}s, Content segment duration: ${contentSegmentDuration}s, Segments to skip: ${segmentsToReplace}`)
+  const segmentsToReplace = Math.ceil(plannedDuration / contentSegmentDuration)
+  console.log(`Ad duration: ${actualAdDuration}s, Planned duration: ${plannedDuration}s, Content segment duration: ${contentSegmentDuration}s, Segments to skip: ${segmentsToReplace}`)
 
-  // DISABLED: Manifest window awareness was causing inconsistent skip counts across variants
-  // When variants are requested at slightly different times (normal for HLS), they would
-  // see different manifest windows and skip different amounts of content, causing timeline desync
-  // Instead, we always skip the full SCTE-35 duration from wherever we find the marker
-  const effectiveSkipDuration = contentSkipDuration
-
-  let foundMarker = false
   let segmentsReplaced = 0
   let actualSkippedDuration = 0
+  let processedMarker = false
 
   for (let i = 0; i < lines.length; i++) {
     const line = lines[i]
-    
-    // Look for SCTE-35 marker or PDT that matches start time
-    if (!foundMarker && line.startsWith("#EXT-X-PROGRAM-DATE-TIME:") && line.includes(scte35StartPDT)) {
-      foundMarker = true
-      output.push(line)  // Keep the PDT
-      
-      // Parse the starting PDT timestamp for ad timeline continuity
-      const startPDT = line.replace("#EXT-X-PROGRAM-DATE-TIME:", "").trim()
-      
-      const startDate = new Date(startPDT)
 
-      let firstContentExtension: string | null = null
-      for (let lookAhead = i + 1; lookAhead < lines.length; lookAhead++) {
-        const candidate = lines[lookAhead]
-        if (!candidate.startsWith('#') && candidate.trim().length > 0) {
-          firstContentExtension = inferSegmentExtension(candidate)
-          break
-        }
+    if (!processedMarker && line.startsWith('#EXT-X-PROGRAM-DATE-TIME:') && line.includes(scte35StartPDT)) {
+      output.push(line)
+      const plan = calculateSkipPlanFromLines(lines, i, {
+        scte35Duration: scte35Duration ?? plannedDuration,
+        stableSkipCount
+      })
+
+      if (!plan || plan.segmentsSkipped === 0) {
+        console.warn(`⚠️  Unable to calculate skip plan for PDT ${scte35StartPDT}`)
+        return { manifest: variantText, segmentsSkipped: 0, durationSkipped: 0, actualAdDuration }
       }
 
-      let adExtension: string | null = null
-      const adLines: string[] = []
-
-      console.log(`Inserting ${adSegments.length} ad segments without PDT tags (evaluating need for DISCONTINUITY)`)
-
-      for (let j = 0; j < adSegments.length; j++) {
-        const segment = adSegments[j]
-        let url: string
-        let durationValue: number
-        if (typeof segment === 'string') {
-          durationValue = adDuration / adSegments.length
-          url = segment
-        } else {
-          durationValue = segment.duration
-          url = segment.url
-        }
-
-        if (!adExtension) {
-          adExtension = inferSegmentExtension(url)
-        }
-
-        adLines.push(`#EXTINF:${durationValue.toFixed(3)},`)
-        adLines.push(url)
-      }
-      
-      // CRITICAL FIX: Use stable skip count if provided, otherwise calculate
-      // This ensures all concurrent requests skip the same segments
-      let skippedDuration = 0
-      let skippedCount = 0
-      const skipStartIndex = i
-      let resumeIndex = i + 1
-      
-      if (stableSkipCount !== undefined && stableSkipCount > 0) {
-        // Use pre-calculated stable skip count (from ad state persistence)
-        console.log(`Using stable skip count: ${stableSkipCount} segments (cached from first request)`)
-        
-        // Skip exactly stableSkipCount segments
-        let segmentsSeen = 0
-        while (resumeIndex < lines.length && segmentsSeen < stableSkipCount) {
-          const line = lines[resumeIndex]
-          
-          // Parse EXTINF duration for tracking
-          if (line.startsWith('#EXTINF:')) {
-            const match = line.match(/#EXTINF:([\d.]+)/)
-            if (match) {
-              skippedDuration += parseFloat(match[1])
-            }
-          }
-          
-          // Count actual segment URIs (not tags)
-          if (!line.startsWith('#') && line.trim().length > 0) {
-            segmentsSeen++
-          }
-          
-          resumeIndex++
-        }
-        skippedCount = segmentsSeen
-      } else {
-        // First request: calculate skip based on duration (adjusted for window movement)
-        const targetSkipDuration = effectiveSkipDuration
-        while (resumeIndex < lines.length && skippedDuration < targetSkipDuration) {
-          const line = lines[resumeIndex]
-          
-          // Parse EXTINF duration for this segment
-          if (line.startsWith('#EXTINF:')) {
-            const match = line.match(/#EXTINF:([\d.]+)/)
-            if (match) {
-              const segDuration = parseFloat(match[1])
-              skippedDuration += segDuration
-            }
-          }
-          
-          // Count actual segment URIs (not tags)
-          if (!line.startsWith('#') && line.trim().length > 0) {
-            skippedCount++
-          }
-          
-          resumeIndex++
-        }
-      }
-      
-      console.log(`Skipped ${skippedCount} content segments (${skippedDuration.toFixed(2)}s of ${contentSkipDuration}s target) from index ${skipStartIndex} to ${resumeIndex}`)
-
-      // CRITICAL FIX: Validate that we have enough remaining content segments
-      // Count remaining segments after the resume point
-      let remainingSegments = 0
-      for (let j = resumeIndex; j < lines.length; j++) {
-        if (!lines[j].startsWith('#') && lines[j].trim().length > 0) {
-          remainingSegments++
-        }
+      if (plan.remainingSegments === 0) {
+        console.error('❌ No content segments remaining after ad insertion - manifest window rolled past break')
+        return { manifest: variantText, segmentsSkipped: 0, durationSkipped: 0, actualAdDuration }
       }
 
-      console.log(`Remaining content segments after ad break: ${remainingSegments}`)
-
-      // CRITICAL: If no content segments remain, the manifest window has moved past the ad break
-      // Return with segmentsSkipped=0 to trigger SGAI fallback in the caller
-      if (remainingSegments === 0) {
-        console.error(`❌ No content segments remaining after ad insertion - manifest window has rolled past ad break`)
-        console.error(`   Ad started at ${startPDT}, tried to skip ${skippedDuration.toFixed(2)}s, but manifest has no segments left`)
-        return {
-          manifest: variantText,  // Return original manifest unmodified
-          segmentsSkipped: 0,      // Signal failure to trigger SGAI fallback
-          durationSkipped: 0
-        }
+      if (!plan.resumePDT) {
+        console.error('❌ Could not locate resume PDT within search window, aborting SSAI insertion')
+        return { manifest: variantText, segmentsSkipped: 0, durationSkipped: 0, actualAdDuration }
       }
 
-      // CRITICAL FIX: Find and preserve the ACTUAL PDT from the resume segment
-      // DO NOT calculate resume PDT - the origin stream clock kept running during the ad break
-      // We must use the origin's timestamp to avoid timeline discontinuities
-      let resumePDT: string | null = null
-      let searchIndex = resumeIndex
-      let segmentsSearched = 0
-      const MAX_SEGMENTS_TO_SEARCH = 15  // Search up to 15 segments (handles sparse PDT tags)
+      console.log(`Calculated skip plan: skip ${plan.segmentsSkipped} segments (${plan.durationSkipped.toFixed(3)}s), resume PDT ${plan.resumePDT}`)
 
-      // Look ahead to find the next PDT tag from the origin manifest
-      // Count SEGMENTS not lines (sparse PDT manifests have ~1 PDT per 10 segments)
-      while (searchIndex < lines.length && !resumePDT && segmentsSearched < MAX_SEGMENTS_TO_SEARCH) {
-        const searchLine = lines[searchIndex]
-
-        if (searchLine.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
-          resumePDT = searchLine.replace('#EXT-X-PROGRAM-DATE-TIME:', '').trim()
-          console.log(`✅ Found origin resume PDT: ${resumePDT} (searched ${segmentsSearched} segments)`)
-          break
-        }
-
-        // Count actual segment URLs (not comment lines)
-        if (!searchLine.startsWith('#') && searchLine.trim().length > 0) {
-          segmentsSearched++
-        }
-
-        searchIndex++
+      output.push('#EXT-X-DISCONTINUITY')
+      console.log(`Inserting ${normalizedSegments.length} ad segments WITHOUT PDT tags (DISCONTINUITY resets timeline)`)
+      for (const segment of normalizedSegments) {
+        output.push(`#EXTINF:${segment.duration.toFixed(3)},`)
+        output.push(segment.url)
       }
+      output.push('#EXT-X-DISCONTINUITY')
 
-      if (!resumePDT && segmentsSearched >= MAX_SEGMENTS_TO_SEARCH) {
-        console.warn(`⚠️  Could not find resume PDT after searching ${segmentsSearched} segments`)
-      }
+      output.push(`#EXT-X-PROGRAM-DATE-TIME:${plan.resumePDT}`)
+      const closingTag = buildClosingDateRangeTag(
+        plan.resumePDT,
+        options,
+        actualAdDuration,
+        plan.durationSkipped,
+        plannedDuration
+      )
+      output.push(closingTag)
 
-      let resumeSegmentExtension: string | null = null
-      for (let probe = resumeIndex; probe < lines.length; probe++) {
-        const candidate = lines[probe]
-        if (!candidate.startsWith('#') && candidate.trim().length > 0) {
-          resumeSegmentExtension = inferSegmentExtension(candidate)
-          break
-        }
-      }
-
-      // Insert the resume PDT before continuing with content segments
-      if (resumePDT) {
-        let needsDiscontinuity = false
-
-        if (adExtension && firstContentExtension && adExtension !== firstContentExtension) {
-          needsDiscontinuity = true
-          console.log(`ℹ️  Detected segment container change from ${firstContentExtension} to ${adExtension} (pre-ad)`)
-        }
-
-        if (adExtension && resumeSegmentExtension && adExtension !== resumeSegmentExtension) {
-          needsDiscontinuity = true
-          console.log(`ℹ️  Detected segment container change from ad (${adExtension}) to content (${resumeSegmentExtension})`)
-        }
-
-        const resumeDate = new Date(resumePDT)
-        if (!Number.isNaN(resumeDate.getTime()) && !Number.isNaN(startDate.getTime())) {
-          const expectedResume = startDate.getTime() + skippedDuration * 1000
-          const delta = Math.abs(resumeDate.getTime() - expectedResume)
-          if (delta > 500) {
-            console.warn(`⚠️  PROGRAM-DATE-TIME continuity delta ${delta}ms exceeds tolerance, inserting DISCONTINUITY`)
-            needsDiscontinuity = true
-          }
-        } else {
-          console.warn(`⚠️  Unable to evaluate PDT continuity (start=${startPDT}, resume=${resumePDT})`)
-        }
-
-        if (needsDiscontinuity) {
-          output.push('#EXT-X-DISCONTINUITY')
-        }
-
-        for (const adLine of adLines) {
-          output.push(adLine)
-        }
-
-        if (needsDiscontinuity) {
-          output.push('#EXT-X-DISCONTINUITY')
-        }
-
-        // Use the ACTUAL PDT from origin - this preserves timeline continuity
-        output.push(`#EXT-X-PROGRAM-DATE-TIME:${resumePDT}`)
-        console.log(`✅ Inserted origin resume PDT: ${resumePDT} (start: ${startPDT}, skipped: ${skippedDuration.toFixed(2)}s, ad: ${adDuration.toFixed(2)}s)`)
-      } else {
-        // CRITICAL: Cannot find origin PDT - this will cause timeline issues
-        // Better to fail gracefully and trigger SGAI fallback than create intermittent stalls
-        console.error(`❌ CRITICAL: Cannot find origin resume PDT within search window`)
-        console.error(`   SCTE-35 start: ${startPDT}, skipped: ${skippedDuration.toFixed(2)}s`)
-        console.error(`   This likely means sparse PDT tags or SCTE-35 signal is too old`)
-        console.error(`   Failing gracefully to trigger SGAI fallback`)
-
-        return {
-          manifest: variantText,  // Return original manifest unmodified
-          segmentsSkipped: 0,     // Signal failure to trigger SGAI fallback
-          durationSkipped: 0
-        }
-      }
-
-      // Update loop index to resume point and CONTINUE processing remaining segments
-      i = resumeIndex - 1  // -1 because outer loop will increment
-      foundMarker = true  // Mark as processed to prevent duplicate insertion
-      segmentsReplaced = skippedCount
-      actualSkippedDuration = skippedDuration
-
-      // CRITICAL: DON'T return here - continue loop to append remaining content segments!
+      i = plan.resumeContentIndex - 1
+      segmentsReplaced = plan.segmentsSkipped
+      actualSkippedDuration = plan.durationSkipped
+      processedMarker = true
       continue
     }
 
     output.push(line)
   }
-  
-  // Return final manifest with skip stats (if ad was inserted) or zeros (if PDT not found)
-  if (segmentsReplaced > 0) {
-    console.log(`✅ Ad insertion completed: ${segmentsReplaced} segments replaced`)
-  } else {
+
+  if (!processedMarker) {
     console.warn(`⚠️  SCTE-35 PDT not found in manifest: ${scte35StartPDT} - ad break has rolled out of live window`)
+  } else {
+    console.log(`✅ Ad insertion completed: ${segmentsReplaced} segments replaced`)
   }
 
   return {
-    manifest: output.join("\n"),
+    manifest: output.join('\n'),
     segmentsSkipped: segmentsReplaced,
     durationSkipped: actualSkippedDuration,
-    boundary: boundaryInfo,
-    requestedCut
+    actualAdDuration
   }
 }
 
