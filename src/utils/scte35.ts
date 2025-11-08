@@ -44,6 +44,7 @@ export function parseSCTE35FromManifest(manifestText: string): SCTE35Signal[] {
 function parseDateRangeSCTE35(line: string): SCTE35Signal | null {
   // Parse attributes from DATERANGE tag
   const attrs = parseDateRangeAttributes(line)
+  const rawAttributes = { ...attrs }
   
   // Check if this is an SCTE-35 signal
   // SCTE-35 signals typically have SCTE35-CMD or SCTE35-OUT/SCTE35-IN attributes
@@ -63,7 +64,7 @@ function parseDateRangeSCTE35(line: string): SCTE35Signal | null {
     const enhancedSignal = createEnhancedSignal(id, binaryCmd, attrs)
     if (enhancedSignal) {
       console.log(`SCTE-35 binary parsing successful: Event ID ${enhancedSignal.binaryData?.spliceEventId}, CRC valid: ${enhancedSignal.binaryData?.crcValid}`)
-      return enhancedSignal
+      return { ...enhancedSignal, rawAttributes, rawCommand: binaryCmd }
     } else {
       console.warn(`SCTE-35 binary parsing failed for ${id}, falling back to attribute parsing`)
     }
@@ -106,7 +107,9 @@ function parseDateRangeSCTE35(line: string): SCTE35Signal | null {
     breakDuration,
     autoReturn,
     segmentNum,
-    segmentsExpected
+    segmentsExpected,
+    rawAttributes,
+    rawCommand: binaryCmd
   }
 }
 
