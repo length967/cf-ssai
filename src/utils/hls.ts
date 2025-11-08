@@ -1,15 +1,6 @@
 // Minimal HLS helpers suitable for Workers
 declare const atob: (data: string) => string
 
-import {
-  BoundaryValidation,
-  IDRTimeline,
-  IDRTimestamp,
-  SnapDecision,
-  snapCueToIdr,
-  validateBoundaryError
-} from "./idr"
-
 export type VariantInfo = { bandwidth?: number; resolution?: string; uri: string; isVideo?: boolean }
 
 /**
