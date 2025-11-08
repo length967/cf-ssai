@@ -1,4 +1,4 @@
-import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, extractPDTs, extractBitrates } from "./utils/hls"
+import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, extractPDTs, extractBitrates, reconcileCueStartDates } from "./utils/hls"
 import { signPath } from "./utils/sign"
 import { parseScte35FromTransportStream, eventToSignal, getBreakDuration, findActiveBreak, validateSCTE35Signal } from "./utils/scte35"
 import { getChannelConfig } from "./utils/channel-config"
@@ -540,10 +540,21 @@ async function signAdPlaylist(signHost: string, segmentSecret: string, playlistP
 export class ChannelDO {
   state: DurableObjectState
   env: Env
+  private ptsPdtMaps = new Map<string, PtsPdtMap>()
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state
     this.env = env
+  }
+
+  private getPtsPdtMap(channel: string, variant: string): PtsPdtMap {
+    const key = `${channel}::${variant}`
+    let map = this.ptsPdtMaps.get(key)
+    if (!map) {
+      map = new PtsPdtMap()
+      this.ptsPdtMaps.set(key, map)
+    }
+    return map
   }
   
   /**
@@ -813,6 +824,21 @@ export class ChannelDO {
       // Format: scte35-audio_eng=128000-video=1000000.m3u8
       const viewerBitrate = extractBitrateFromVariant(variant)
 
+      const ptsMap = this.getPtsPdtMap(channel, variant)
+      const metricsEmitter = this.env.METRICS
+        ? (metric: string, value: number, dimensions?: Record<string, string>) => {
+            try {
+              ;(this.env.METRICS as any).writeDataPoint({
+                metric,
+                value,
+                dimensions: { channel, variant, ...(dimensions || {}) }
+              })
+            } catch (err) {
+              console.warn(`Failed to emit metric ${metric}:`, err)
+            }
+          }
+        : undefined
+
       // PERFORMANCE FIX: Check if this is a segment request FIRST
       // Segments should bypass all config/database lookups
       if (!variant.endsWith('.m3u8')) {
@@ -832,7 +858,14 @@ export class ChannelDO {
       const originResponse = await fetchOriginVariant(originUrl, channel, variant)
       
       // For manifests, read as text for processing
-      const origin = await originResponse.text()
+      let origin = await originResponse.text()
+
+      const mappingResult = reconcileCueStartDates(origin, ptsMap, {
+        variantId: variant,
+        logger: console,
+        metrics: metricsEmitter
+      })
+      origin = mappingResult.manifest
 
       // Detect and store bitrates if this is a master manifest
       // Fire-and-forget to avoid delaying the response
@@ -1128,11 +1161,40 @@ export class ChannelDO {
           stableDuration = adState!.durationSec
           console.log(`Using persisted ad state: start=${startISO}, duration=${stableDuration}s`)
         } else {
-          startISO = scte35StartPDT || new Date(Math.floor(now / 1000) * 1000).toISOString()
-          // Use integer milliseconds to avoid floating-point precision issues
+          let startCandidate = scte35StartPDT || null
+          let startSource: 'scte35' | 'pts_map' | 'calculated' = startCandidate ? 'scte35' : 'calculated'
+
+          if (!startCandidate && activeBreak?.pts !== undefined) {
+            const estimate = ptsMap.estimate(activeBreak.pts)
+            if (estimate) {
+              startCandidate = estimate.iso
+              startSource = 'pts_map'
+              metricsEmitter?.('pts_pdt_cue_alignment', 1, { channel, variant, source: 'pts_map' })
+            } else {
+              metricsEmitter?.('pts_pdt_cue_alignment', 0, { channel, variant, source: 'missing_map' })
+            }
+          }
+
+          if (!startCandidate) {
+            startCandidate = new Date(Math.floor(now / 1000) * 1000).toISOString()
+            startSource = 'calculated'
+          }
+
+          if (!scte35StartPDT && startCandidate) {
+            scte35StartPDT = startCandidate
+          }
+
+          startISO = startCandidate
           const durationMs = Math.round(breakDurationSec * 1000)
           stableDuration = durationMs / 1000  // Exact representation
-          console.log(`Using calculated values: start=${startISO}, duration=${stableDuration}s (from ${breakDurationSec}s)`)
+
+          if (startSource === 'pts_map') {
+            metricsEmitter?.('pts_pdt_cue_alignment_source', 1, { channel, variant, source: 'pts_map' })
+          } else if (startSource === 'scte35') {
+            metricsEmitter?.('pts_pdt_cue_alignment_source', 1, { channel, variant, source: 'scte35' })
+          } else {
+            metricsEmitter?.('pts_pdt_cue_alignment_source', 1, { channel, variant, source: 'calculated' })
+          }
         }
         
         // PERFORMANCE OPTIMIZATION: Use pre-calculated decision if available in ad state
@@ -1351,7 +1413,15 @@ export class ChannelDO {
                       adActive ? (adState!.podId || "ad") : pod.podId,
                       startISO,
                       stableDuration,
-                      interstitialURI
+                      interstitialURI,
+                      undefined,
+                      {
+                        pts: activeBreak?.pts,
+                        mapper: ptsMap,
+                        variantId: variant,
+                        logger: console,
+                        metrics: metricsEmitter
+                      }
                     )
 
                     await this.env.BEACON_QUEUE.send(beaconMsg)

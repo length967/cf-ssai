@@ -1,5 +1,24 @@
 // Minimal HLS helpers suitable for Workers
 
+import { PtsPdtMap } from "./time"
+
+type MetricEmitter = (metric: string, value: number, dimensions?: Record<string, string>) => void
+
+type CueMappingOptions = {
+  variantId?: string
+  logger?: Pick<typeof console, 'log' | 'warn' | 'error'>
+  metrics?: MetricEmitter
+  driftLogThresholdMs?: number
+}
+
+type InterstitialCueOptions = {
+  pts?: bigint | number
+  mapper?: PtsPdtMap
+  variantId?: string
+  logger?: Pick<typeof console, 'log' | 'warn'>
+  metrics?: MetricEmitter
+}
+
 export type VariantInfo = { bandwidth?: number; resolution?: string; uri: string; isVideo?: boolean }
 
 /**
@@ -87,7 +106,8 @@ export function addDaterangeInterstitial(
   startDateISO: string,
   durationSec: number,
   assetURI: string,
-  controls = "skip-restrictions=6"
+  controls = "skip-restrictions=6",
+  options?: InterstitialCueOptions
 ) {
   const tag = `#EXT-X-DATERANGE:ID="${id}",CLASS="com.apple.hls.interstitial",START-DATE="${startDateISO}",DURATION=${durationSec.toFixed(
     3
@@ -95,7 +115,31 @@ export function addDaterangeInterstitial(
   const lines = variantText.trim().split("\n")
   const insertAt = Math.max(0, lines.length - 6)
   lines.splice(insertAt, 0, tag)
-  return lines.join("\n") + (variantText.endsWith("\n") ? "" : "\n")
+  const result = lines.join("\n") + (variantText.endsWith("\n") ? "" : "\n")
+
+  if (options?.pts !== undefined && options.mapper) {
+    const logger = options.logger ?? console
+    const estimate = options.mapper.estimate(options.pts)
+    const variantSuffix = options.variantId ? ` [${options.variantId}]` : ''
+
+    if (estimate) {
+      const startMs = Date.parse(startDateISO)
+      if (Number.isFinite(startMs)) {
+        const driftMs = startMs - estimate.ms
+        logger.log(`[PTS→PDT] Cue drift for ${id}${variantSuffix}: ${driftMs.toFixed(2)}ms`)
+        options.metrics?.('pts_pdt_cue_drift_ms', Math.abs(driftMs), {
+          variant: options.variantId || 'unknown',
+          cue: id
+        })
+      } else {
+        logger.warn(`[PTS→PDT] Unable to parse START-DATE for cue ${id}${variantSuffix}`)
+      }
+    } else {
+      logger.warn(`[PTS→PDT] No calibration available for cue ${id}${variantSuffix}`)
+    }
+  }
+
+  return result
 }
 
 /**
@@ -105,6 +149,179 @@ function addSecondsToTimestamp(isoTimestamp: string, seconds: number): string {
   const date = new Date(isoTimestamp)
   date.setMilliseconds(date.getMilliseconds() + seconds * 1000)
   return date.toISOString()
+}
+
+function safeParseBigInt(value: string): bigint | null {
+  if (!value || !/^[0-9]+$/.test(value)) return null
+  try {
+    return BigInt(value)
+  } catch {
+    return null
+  }
+}
+
+function extractPtsValue(line: string): bigint | null {
+  const tagMatch = line.match(/#EXT-X-PTS:(\d+)/)
+  if (tagMatch) {
+    return safeParseBigInt(tagMatch[1])
+  }
+
+  const attrMatch = line.match(/(?:^|,)(?:X-)?PTS=(\d+)/)
+  if (attrMatch) {
+    return safeParseBigInt(attrMatch[1])
+  }
+
+  return null
+}
+
+function reconcileDaterangeLine(
+  line: string,
+  map: PtsPdtMap,
+  options: { logger: Pick<typeof console, 'log' | 'warn' | 'error'>, variantId?: string, metrics?: MetricEmitter, driftThresholdMs: number }
+): { line: string, driftMs: number | null } {
+  const ptsMatch = line.match(/(?:^|,)(?:X-)?PTS=(\d+)/)
+  const startMatch = line.match(/START-DATE="([^"]*)"/)
+  const ptsValue = ptsMatch ? safeParseBigInt(ptsMatch[1]) : null
+  const currentStart = startMatch ? startMatch[1] : null
+  const variantSuffix = options.variantId ? ` [${options.variantId}]` : ''
+  let driftMs: number | null = null
+  let updatedLine = line
+  let calibrationStart: string | null = currentStart
+
+  if (ptsValue !== null) {
+    let estimate = map.estimate(ptsValue)
+    if (!estimate) {
+      const latest = map.latest
+      if (latest) {
+        const deltaTicks = Number(ptsValue - latest.rawPts)
+        const seconds = deltaTicks / Number(90000)
+        const predictedMs = latest.pdtMs + seconds * 1000
+        estimate = { ms: predictedMs, iso: new Date(predictedMs).toISOString() }
+      }
+    }
+    if (estimate) {
+      if (currentStart) {
+        const parsed = Date.parse(currentStart)
+        if (Number.isFinite(parsed)) {
+          driftMs = parsed - estimate.ms
+          const absDrift = Math.abs(driftMs)
+          const message = `[PTS→PDT] Cue drift ${driftMs.toFixed(2)}ms for ${ptsValue.toString()} ticks${variantSuffix}`
+          if (absDrift > options.driftThresholdMs) {
+            options.logger.warn(message)
+            updatedLine = updatedLine.replace(/START-DATE="([^"]*)"/, `START-DATE="${estimate.iso}"`)
+            calibrationStart = estimate.iso
+          } else {
+            options.logger.log(message)
+          }
+        } else {
+          options.logger.warn(`[PTS→PDT] Invalid START-DATE on cue${variantSuffix}, substituting mapped value`)
+          updatedLine = updatedLine.replace(/START-DATE="([^"]*)"/, `START-DATE="${estimate.iso}"`)
+          calibrationStart = estimate.iso
+          driftMs = 0
+        }
+      } else {
+        options.logger.log(`[PTS→PDT] Filled missing START-DATE for cue${variantSuffix}`)
+        updatedLine = `${updatedLine},START-DATE="${estimate.iso}"`
+        calibrationStart = estimate.iso
+        driftMs = 0
+      }
+    }
+  }
+
+  if (ptsValue !== null && calibrationStart) {
+    map.ingest(ptsValue, calibrationStart)
+  }
+
+  return { line: updatedLine, driftMs }
+}
+
+export function reconcileCueStartDates(
+  manifest: string,
+  map: PtsPdtMap,
+  options?: CueMappingOptions
+): { manifest: string, lastDriftMs?: number } {
+  const logger = options?.logger ?? console
+  const driftThreshold = options?.driftLogThresholdMs ?? 250
+  const emitMetric = options?.metrics
+  const dims = options?.variantId ? { variant: options.variantId } : undefined
+
+  const lines = manifest.split('\n')
+  const output: string[] = []
+  let pendingPts: bigint | null = null
+  let pendingPdt: string | null = null
+  let lastDriftMs: number | null = null
+
+  const captureCalibration = () => {
+    if (pendingPts !== null && pendingPdt) {
+      const added = map.ingest(pendingPts, pendingPdt)
+      if (added) {
+        logger.log(`[PTS→PDT] Captured calibration ${pendingPts.toString()} → ${pendingPdt}${options?.variantId ? ` [${options.variantId}]` : ''}`)
+      }
+      pendingPts = null
+      pendingPdt = null
+    }
+  }
+
+  for (const line of lines) {
+    if (line.startsWith('#EXT-X-DISCONTINUITY')) {
+      if (map.calibrationCount > 0) {
+        logger.log(`[PTS→PDT] Reset mapping due to DISCONTINUITY${options?.variantId ? ` [${options.variantId}]` : ''}`)
+      }
+      map.reset()
+      pendingPts = null
+      pendingPdt = null
+      output.push(line)
+      continue
+    }
+
+    if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+      pendingPdt = line.replace('#EXT-X-PROGRAM-DATE-TIME:', '').trim()
+      captureCalibration()
+      output.push(line)
+      continue
+    }
+
+    if (line.startsWith('#EXT-X-DATERANGE:')) {
+      const result = reconcileDaterangeLine(line, map, {
+        logger,
+        variantId: options?.variantId,
+        metrics: emitMetric,
+        driftThresholdMs: driftThreshold
+      })
+
+      if (result.driftMs !== null) {
+        lastDriftMs = result.driftMs
+      }
+
+      output.push(result.line)
+      continue
+    }
+
+    const pts = extractPtsValue(line)
+    if (pts !== null) {
+      pendingPts = pts
+      captureCalibration()
+      output.push(line)
+      continue
+    }
+
+    if (!line.startsWith('#') && line.trim().length > 0) {
+      pendingPts = null
+      pendingPdt = null
+    }
+
+    output.push(line)
+  }
+
+  if (emitMetric) {
+    emitMetric('pts_pdt_mapping_points', map.calibrationCount, dims)
+    emitMetric('pts_pdt_mapping_health', map.calibrationCount > 0 ? 1 : 0, dims)
+    if (lastDriftMs !== null) {
+      emitMetric('pts_pdt_drift_ms', Math.abs(lastDriftMs), dims)
+    }
+  }
+
+  return { manifest: output.join('\n'), lastDriftMs: lastDriftMs ?? undefined }
 }
 
 /**
