@@ -1,10 +1,10 @@
 import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, extractPDTs, extractBitrates, calculateSkipPlan, AdSegmentInfo, SkipPlan } from "./utils/hls"
 import { signPath } from "./utils/sign"
-import { parseSCTE35FromManifest, isAdBreakStart, getBreakDuration, findActiveBreak, validateSCTE35Signal } from "./utils/scte35"
+import { parseScte35FromTransportStream, eventToSignal, getBreakDuration, findActiveBreak, validateSCTE35Signal } from "./utils/scte35"
 import { getChannelConfig } from "./utils/channel-config"
 import type { ChannelConfig } from "./utils/channel-config"
 import type { Env } from "./manifest-worker"
-import type { DecisionResponse, BeaconMessage, SCTE35Signal } from "./types"
+import type { DecisionResponse, BeaconMessage, SCTE35Signal, Scte35Event } from "./types"
 
 // ============================================================================
 // CONFIGURATION CONSTANTS
@@ -42,6 +42,36 @@ interface AdState {
   // PRE-CALCULATED DECISION: Store decision once to avoid repeated Worker binding calls and CPU timeouts
   decision?: DecisionResponse  // Pre-calculated ad pod decision
   decisionCalculatedAt?: number  // Timestamp when decision was calculated (for debugging)
+  // SHARED PLAYLIST MODEL: Persist cue decorations & skip plan so every variant renders identically
+  manifestPlan?: SharedManifestPlan
+}
+
+interface SharedManifestPlan {
+  startPDT: string
+  leadingDecorations: string[]
+  trailingDecorations: string[]
+  stableSkipCount: number
+  updatedAt: number
+}
+
+interface PlaylistSegmentModel {
+  tags: string[]
+  uri: string
+  sequence: number
+}
+
+interface PlaylistModel {
+  header: string[]
+  footer: string[]
+  mediaSequence: number
+  segments: PlaylistSegmentModel[]
+}
+
+interface SharedInsertionResult {
+  model: PlaylistModel
+  segmentsSkipped: number
+  durationSkipped: number
+  plan: SharedManifestPlan
 }
 
 const AD_STATE_KEY = "ad_state"
@@ -67,6 +97,266 @@ async function clearAdState(state: DurableObjectState): Promise<void> {
   const currentVersion = await state.storage.get<number>('ad_state_version') || 0
   await state.storage.put('ad_state_version', currentVersion + 1)
   await state.storage.delete(AD_STATE_KEY)
+}
+
+const MIN_SEGMENTS_DURING_BREAK = 3
+
+function pushUnique(target: string[], value: string) {
+  if (!target.includes(value)) {
+    target.push(value)
+  }
+}
+
+function decorationPriority(tag: string): number {
+  if (tag.startsWith('#EXT-X-PROGRAM-DATE-TIME')) return 0
+  if (tag.startsWith('#EXT-X-DATERANGE')) return 1
+  if (tag.startsWith('#EXT-X-CUE-OUT')) return 2
+  if (tag.startsWith('#EXT-X-CUE')) return 3
+  return 4
+}
+
+function sortDecorations(tags: string[]): string[] {
+  return tags.slice().sort((a, b) => decorationPriority(a) - decorationPriority(b))
+}
+
+function parseDurationFromTags(tags: string[]): number {
+  const extinf = tags.find(t => t.startsWith('#EXTINF:'))
+  if (!extinf) return 0
+  const value = extinf.replace('#EXTINF:', '').split(',')[0]
+  const parsed = parseFloat(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function gatherDecorations(tags: string[], leading: string[], trailing: string[]) {
+  for (const tag of tags) {
+    if (tag.startsWith('#EXTINF')) continue
+    if (tag.startsWith('#EXT-X-PROGRAM-DATE-TIME')) {
+      pushUnique(leading, tag)
+    } else if (tag.startsWith('#EXT-X-DATERANGE')) {
+      pushUnique(leading, tag)
+    } else if (tag.startsWith('#EXT-X-CUE-IN')) {
+      pushUnique(trailing, tag)
+    } else if (tag.startsWith('#EXT-X-CUE')) {
+      pushUnique(leading, tag)
+    }
+  }
+}
+
+function parsePlaylistModel(manifest: string): PlaylistModel {
+  const lines = manifest.split('\n')
+  const header: string[] = []
+  const footer: string[] = []
+  const segments: PlaylistSegmentModel[] = []
+  let pendingTags: string[] = []
+  let inHeader = true
+  let mediaSequence = 0
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (line.length === 0) continue
+
+    if (inHeader) {
+      const isSegmentTag = line.startsWith('#EXTINF') ||
+        line.startsWith('#EXT-X-PROGRAM-DATE-TIME') ||
+        line.startsWith('#EXT-X-DISCONTINUITY') ||
+        line.startsWith('#EXT-X-CUE') ||
+        line.startsWith('#EXT-X-DATERANGE')
+
+      if (!line.startsWith('#') || isSegmentTag) {
+        inHeader = false
+      }
+
+      if (inHeader) {
+        header.push(line)
+        if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+          const value = parseInt(line.split(':')[1] || '0', 10)
+          if (!Number.isNaN(value)) mediaSequence = value
+        }
+        continue
+      }
+    }
+
+    if (line.startsWith('#')) {
+      pendingTags.push(line)
+    } else {
+      const segment: PlaylistSegmentModel = {
+        tags: pendingTags,
+        uri: line,
+        sequence: 0
+      }
+      segments.push(segment)
+      pendingTags = []
+    }
+  }
+
+  if (pendingTags.length > 0) {
+    footer.push(...pendingTags)
+  }
+
+  let nextSequence = mediaSequence
+  for (const segment of segments) {
+    segment.sequence = nextSequence++
+  }
+
+  return { header, footer, mediaSequence, segments }
+}
+
+function renderPlaylistModel(model: PlaylistModel): string {
+  const header = model.header.slice()
+  let hasMediaSequence = false
+  for (let i = 0; i < header.length; i++) {
+    if (header[i].startsWith('#EXT-X-MEDIA-SEQUENCE')) {
+      header[i] = `#EXT-X-MEDIA-SEQUENCE:${model.mediaSequence}`
+      hasMediaSequence = true
+    }
+  }
+  if (!hasMediaSequence) {
+    header.push(`#EXT-X-MEDIA-SEQUENCE:${model.mediaSequence}`)
+  }
+
+  const lines: string[] = []
+  lines.push(...header)
+  for (const segment of model.segments) {
+    lines.push(...segment.tags)
+    lines.push(segment.uri)
+  }
+  lines.push(...model.footer)
+
+  return lines.join('\n') + (lines.length ? '\n' : '')
+}
+
+function applySharedAdInsertion(
+  model: PlaylistModel,
+  options: {
+    startPDT?: string
+    adSegments: Array<{ url: string, duration: number }>
+    adDuration: number
+    contentSkipDuration?: number
+    stableSkipCount?: number
+    existingPlan?: SharedManifestPlan
+  }
+): SharedInsertionResult | null {
+  const { startPDT, adSegments, adDuration, contentSkipDuration, stableSkipCount, existingPlan } = options
+
+  if (!adSegments.length) return null
+
+  const targetPDT = startPDT || existingPlan?.startPDT
+  if (!targetPDT) return null
+
+  if (!model.segments.length) return null
+
+  const leadingDecorations = existingPlan?.leadingDecorations ? [...existingPlan.leadingDecorations] : []
+  const trailingDecorations = existingPlan?.trailingDecorations ? [...existingPlan.trailingDecorations] : []
+
+  const startIndex = model.segments.findIndex(segment =>
+    segment.tags.some(tag => tag.startsWith('#EXT-X-PROGRAM-DATE-TIME:') && tag.includes(targetPDT))
+  )
+
+  if (startIndex === -1) {
+    console.warn(`applySharedAdInsertion: start PDT ${targetPDT} not found in manifest`)
+    return null
+  }
+
+  gatherDecorations(model.segments[startIndex].tags, leadingDecorations, trailingDecorations)
+
+  const skipDurationTarget = contentSkipDuration ?? adDuration
+
+  let skippedDuration = 0
+  let skipCount = 0
+  let cursor = startIndex
+
+  while (cursor < model.segments.length) {
+    if (stableSkipCount !== undefined && skipCount >= stableSkipCount) break
+    if (stableSkipCount === undefined && skipCount > 0 && skippedDuration >= skipDurationTarget) break
+
+    const segment = model.segments[cursor]
+    gatherDecorations(segment.tags, leadingDecorations, trailingDecorations)
+
+    skippedDuration += parseDurationFromTags(segment.tags)
+    skipCount++
+    cursor++
+
+    if (stableSkipCount === undefined && skippedDuration >= skipDurationTarget) break
+  }
+
+  if (stableSkipCount !== undefined && skipCount < stableSkipCount) {
+    console.warn(`applySharedAdInsertion: manifest window too small (need ${stableSkipCount}, have ${skipCount})`)
+    return null
+  }
+
+  if (skipCount === 0) {
+    console.warn('applySharedAdInsertion: nothing to replace (skipCount=0)')
+    return null
+  }
+
+  const removed = model.segments.splice(startIndex, skipCount)
+  for (const seg of removed) {
+    gatherDecorations(seg.tags, leadingDecorations, trailingDecorations)
+  }
+
+  const orderedLeading = sortDecorations(leadingDecorations)
+  const orderedTrailing = sortDecorations(trailingDecorations)
+
+  const insertedSegments: PlaylistSegmentModel[] = adSegments.map((segment, index) => {
+    const tags: string[] = []
+    if (index === 0) {
+      for (const tag of orderedLeading) {
+        if (!tag.startsWith('#EXTINF')) {
+          pushUnique(tags, tag)
+        }
+      }
+      pushUnique(tags, '#EXT-X-DISCONTINUITY')
+    }
+    tags.push(`#EXTINF:${segment.duration.toFixed(3)},`)
+    return {
+      tags,
+      uri: segment.url,
+      sequence: 0
+    }
+  })
+
+  model.segments.splice(startIndex, 0, ...insertedSegments)
+
+  const resumeIndex = startIndex + insertedSegments.length
+  if (resumeIndex >= model.segments.length) {
+    console.warn('applySharedAdInsertion: no content remains after ad pod')
+    return null
+  }
+
+  const resumeTags = model.segments[resumeIndex].tags.slice()
+  pushUnique(resumeTags, '#EXT-X-DISCONTINUITY')
+  for (const tag of orderedTrailing) {
+    pushUnique(resumeTags, tag)
+  }
+  model.segments[resumeIndex].tags = resumeTags
+
+  if (model.segments.length - startIndex < MIN_SEGMENTS_DURING_BREAK) {
+    console.warn(`applySharedAdInsertion: refusing to prune below ${MIN_SEGMENTS_DURING_BREAK} segments during break`)
+    return null
+  }
+
+  let nextSequence = model.mediaSequence
+  for (const segment of model.segments) {
+    segment.sequence = nextSequence++
+  }
+  if (model.segments.length > 0) {
+    model.mediaSequence = model.segments[0].sequence
+  }
+
+  const plan: SharedManifestPlan = {
+    startPDT: targetPDT,
+    leadingDecorations: orderedLeading,
+    trailingDecorations: orderedTrailing,
+    stableSkipCount: stableSkipCount ?? skipCount,
+    updatedAt: Date.now()
+  }
+
+  return {
+    model,
+    segmentsSkipped: skipCount,
+    durationSkipped: skippedDuration,
+    plan
+  }
 }
 
 /**
@@ -499,10 +789,76 @@ async function signAdPlaylist(signHost: string, segmentSecret: string, playlistP
 export class ChannelDO {
   state: DurableObjectState
   env: Env
+  private idrTimelines: Map<string, IDRTimeline>
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state
     this.env = env
+    this.idrTimelines = new Map()
+  }
+
+  private updateIdrTimeline(variant: string, headers: Headers): void {
+    const encoderHeader = findHeaderValue(headers, ENCODER_IDR_HEADERS)
+    const segmenterHeader = findHeaderValue(headers, SEGMENTER_IDR_HEADERS)
+
+    const encoderPoints = parseIdrHeaderValue(encoderHeader)
+    const segmenterPoints = parseIdrHeaderValue(segmenterHeader)
+
+    if (!encoderPoints.length && !segmenterPoints.length) {
+      return
+    }
+
+    const encoderMetadata: EncoderIDRMetadata | undefined = encoderPoints.length
+      ? {
+          variant,
+          cues: encoderPoints.map(point => {
+            if (point.pts !== undefined && point.seconds !== undefined) {
+              return { pts: point.pts, seconds: point.seconds }
+            }
+            if (point.pts !== undefined) {
+              return { pts: point.pts }
+            }
+            return { seconds: point.seconds }
+          })
+        }
+      : undefined
+
+    const segmenterCallbacks: SegmenterIDRCallback[] = segmenterPoints.map(point => {
+      const callback: SegmenterIDRCallback = {}
+      if (point.pts !== undefined) callback.pts = point.pts
+      if (point.seconds !== undefined) callback.timeSeconds = point.seconds
+      return callback
+    })
+
+    const existing = this.idrTimelines.get(variant) ?? null
+    const updated = collectIdrTimestamps({
+      existing,
+      variant,
+      encoder: encoderMetadata,
+      segmenter: segmenterCallbacks,
+      maxEntries: 1024
+    })
+
+    this.idrTimelines.set(variant, updated)
+
+    console.log(
+      `[IDR] Timeline updated for ${variant}: total=${updated.values.length}, ` +
+      `encoder=${updated.sourceCounts.encoder}, segmenter=${updated.sourceCounts.segmenter}`
+    )
+  }
+
+  private getIdrTimeline(variant: string): IDRTimeline | undefined {
+    return this.idrTimelines.get(variant)
+  }
+
+  private getPtsPdtMap(channel: string, variant: string): PtsPdtMap {
+    const key = `${channel}::${variant}`
+    let map = this.ptsPdtMaps.get(key)
+    if (!map) {
+      map = new PtsPdtMap()
+      this.ptsPdtMaps.set(key, map)
+    }
+    return map
   }
   
   /**
@@ -700,6 +1056,33 @@ export class ChannelDO {
       const adPodBase = req.headers.get('X-Ad-Pod-Base') || this.env.AD_POD_BASE
       const signHost = req.headers.get('X-Sign-Host') || this.env.SIGN_HOST
 
+      if (u.pathname === "/ingest/ts") {
+        if (req.method !== "POST") {
+          return new Response("method not allowed", { status: 405 })
+        }
+
+        try {
+          const arrayBuffer = await req.arrayBuffer()
+          const payload = new Uint8Array(arrayBuffer)
+          const events = parseScte35FromTransportStream(payload)
+          await appendScte35Events(this.state, events)
+
+          console.log(
+            `[SCTE35] Ingest request processed for channel=${channelId}, cues=${events.length}, bytes=${payload.byteLength}`
+          )
+
+          return new Response(JSON.stringify({ ok: true, events: events.length }), {
+            headers: { "content-type": "application/json" }
+          })
+        } catch (err) {
+          console.error("SCTE-35 ingest failure:", err)
+          return new Response(JSON.stringify({ ok: false, error: "ingest_failed" }), {
+            status: 500,
+            headers: { "content-type": "application/json" }
+          })
+        }
+      }
+
       // Control plane: POST /cue to start/stop an ad break for this channel
       if (u.pathname === "/cue") {
         if (req.method !== "POST") return new Response("method not allowed", { status: 405 })
@@ -763,9 +1146,31 @@ export class ChannelDO {
 
       if (!channel) return new Response("channel required", { status: 400 })
 
+      // Collect IDR metadata from request headers (if present)
+      try {
+        this.updateIdrTimeline(variant, req.headers)
+      } catch (err) {
+        console.warn(`Failed to update IDR timeline for variant ${variant}:`, err)
+      }
+
       // Extract viewer bitrate from variant name for ad selection
       // Format: scte35-audio_eng=128000-video=1000000.m3u8
       const viewerBitrate = extractBitrateFromVariant(variant)
+
+      const ptsMap = this.getPtsPdtMap(channel, variant)
+      const metricsEmitter = this.env.METRICS
+        ? (metric: string, value: number, dimensions?: Record<string, string>) => {
+            try {
+              ;(this.env.METRICS as any).writeDataPoint({
+                metric,
+                value,
+                dimensions: { channel, variant, ...(dimensions || {}) }
+              })
+            } catch (err) {
+              console.warn(`Failed to emit metric ${metric}:`, err)
+            }
+          }
+        : undefined
 
       // PERFORMANCE FIX: Check if this is a segment request FIRST
       // Segments should bypass all config/database lookups
@@ -786,7 +1191,14 @@ export class ChannelDO {
       const originResponse = await fetchOriginVariant(originUrl, channel, variant)
       
       // For manifests, read as text for processing
-      const origin = await originResponse.text()
+      let origin = await originResponse.text()
+
+      const mappingResult = reconcileCueStartDates(origin, ptsMap, {
+        variantId: variant,
+        logger: console,
+        metrics: metricsEmitter
+      })
+      origin = mappingResult.manifest
 
       // Detect and store bitrates if this is a master manifest
       // Fire-and-forget to avoid delaying the response
@@ -823,37 +1235,47 @@ export class ChannelDO {
         console.log(`Ad state version changed during request (${initialAdStateVersion} -> ${currentAdStateVersion}), using latest state`)
       }
 
-      // Parse SCTE-35 signals from origin manifest (with enhanced binary parsing)
-      const scte35Signals = parseSCTE35FromManifest(origin)
+      const transportEvents = await getRecentScte35Events(this.state)
+      const eventById = new Map<string, Scte35Event>()
+      transportEvents.forEach(event => eventById.set(event.eventId, event))
+
+      const scte35Signals = transportEvents
+        .map(event => eventToSignal(event))
+        .filter((signal): signal is SCTE35Signal => signal !== null)
+
       let activeBreak = findActiveBreak(scte35Signals)
 
-      if (scte35Signals.length > 0) {
-        console.log(`Found ${scte35Signals.length} SCTE-35 signals`)
+      if (transportEvents.length > 0) {
+        const skipped = transportEvents.length - scte35Signals.length
+        console.log(
+          `[SCTE35] Loaded ${transportEvents.length} transport cues (normalized=${scte35Signals.length}${skipped > 0 ? `, skipped=${skipped}` : ''})`
+        )
 
         if (activeBreak) {
-          // CRITICAL: Validate SCTE-35 signal before using it
-          // Extract PDT for temporal validation (using request-scoped cache)
+          const sourceEvent = eventById.get(activeBreak.id)
+          if (sourceEvent) {
+            const ccLog = sourceEvent.continuityCounters.length > 0 ? sourceEvent.continuityCounters.join(",") : "n/a"
+            const rawPreview = sourceEvent.rawHex.length > 48 ? `${sourceEvent.rawHex.slice(0, 48)}…` : sourceEvent.rawHex
+            console.log(
+              `[SCTE35] Active cue ${activeBreak.id}: command=${sourceEvent.commandType}, pid=0x${sourceEvent.pid.toString(16)}, continuity=[${ccLog}], raw=${rawPreview}`
+            )
+          }
+
           const pdts = getCachedPDTs(origin)
           const mostRecentPDT = pdts.length > 0 ? pdts[pdts.length - 1] : undefined
-
           const validation = validateSCTE35Signal(activeBreak, mostRecentPDT)
 
-          // Log validation results
           if (!validation.valid) {
             console.error(`❌ SCTE-35 Validation FAILED for signal ${activeBreak.id}:`)
             validation.errors.forEach(err => console.error(`   - ${err}`))
-
-            // Reject invalid signal - do not attempt ad insertion
             activeBreak = null
             console.log(`⚠️  Rejecting invalid SCTE-35 signal to prevent playback issues`)
           } else {
-            // Log warnings but allow signal through
             if (validation.warnings.length > 0) {
               console.warn(`⚠️  SCTE-35 Validation warnings for signal ${activeBreak.id}:`)
               validation.warnings.forEach(warn => console.warn(`   - ${warn}`))
             }
 
-            // Log enhanced binary data if available
             if (activeBreak.binaryData) {
               console.log(`✅ SCTE-35 Binary Parsing: Event ID=${activeBreak.binaryData.spliceEventId}, ` +
                 `PTS=${activeBreak.pts ? `${activeBreak.pts} (${(activeBreak.pts / 90000).toFixed(3)}s)` : 'N/A'}, ` +
@@ -1072,11 +1494,40 @@ export class ChannelDO {
           stableDuration = adState!.durationSec
           console.log(`Using persisted ad state: start=${startISO}, duration=${stableDuration}s`)
         } else {
-          startISO = scte35StartPDT || new Date(Math.floor(now / 1000) * 1000).toISOString()
-          // Use integer milliseconds to avoid floating-point precision issues
+          let startCandidate = scte35StartPDT || null
+          let startSource: 'scte35' | 'pts_map' | 'calculated' = startCandidate ? 'scte35' : 'calculated'
+
+          if (!startCandidate && activeBreak?.pts !== undefined) {
+            const estimate = ptsMap.estimate(activeBreak.pts)
+            if (estimate) {
+              startCandidate = estimate.iso
+              startSource = 'pts_map'
+              metricsEmitter?.('pts_pdt_cue_alignment', 1, { channel, variant, source: 'pts_map' })
+            } else {
+              metricsEmitter?.('pts_pdt_cue_alignment', 0, { channel, variant, source: 'missing_map' })
+            }
+          }
+
+          if (!startCandidate) {
+            startCandidate = new Date(Math.floor(now / 1000) * 1000).toISOString()
+            startSource = 'calculated'
+          }
+
+          if (!scte35StartPDT && startCandidate) {
+            scte35StartPDT = startCandidate
+          }
+
+          startISO = startCandidate
           const durationMs = Math.round(breakDurationSec * 1000)
           stableDuration = durationMs / 1000  // Exact representation
-          console.log(`Using calculated values: start=${startISO}, duration=${stableDuration}s (from ${breakDurationSec}s)`)
+
+          if (startSource === 'pts_map') {
+            metricsEmitter?.('pts_pdt_cue_alignment_source', 1, { channel, variant, source: 'pts_map' })
+          } else if (startSource === 'scte35') {
+            metricsEmitter?.('pts_pdt_cue_alignment_source', 1, { channel, variant, source: 'scte35' })
+          } else {
+            metricsEmitter?.('pts_pdt_cue_alignment_source', 1, { channel, variant, source: 'calculated' })
+          }
         }
         
         // PERFORMANCE OPTIMIZATION: Use pre-calculated decision if available in ad state
@@ -1154,13 +1605,15 @@ export class ChannelDO {
           // Strip origin SCTE-35 markers before adding our interstitial
           const cleanOrigin = stripOriginSCTE35Markers(origin)
           // Use stableDuration for consistent interstitial timing
-          const sgai = addDaterangeInterstitial(
-            cleanOrigin,
-            adActive ? (adState!.podId || "ad") : pod.podId,
-            startISO,
-            stableDuration,
-            interstitialURI
-          )
+          const baseAttributes = activeBreak?.rawAttributes ? { ...activeBreak.rawAttributes } : undefined
+          const sgai = injectInterstitialCues(cleanOrigin, {
+            id: adActive ? (adState!.podId || "ad") : pod.podId,
+            startDateISO: startISO,
+            durationSec: stableDuration,
+            assetURI: interstitialURI,
+            baseAttributes,
+            scte35Payload: activeBreak?.rawCommand
+          })
           
           await this.env.BEACON_QUEUE.send(beaconMsg)
           return new Response(sgai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
@@ -1356,13 +1809,15 @@ export class ChannelDO {
                     const adItem = pod.items.find(item => item.bitrate === viewerBitrate) || pod.items[0]
                     const interstitialURI = await signAdPlaylist(signHost, this.env.SEGMENT_SECRET, adItem.playlistUrl)
 
-                    const sgai = addDaterangeInterstitial(
-                      cleanOrigin,
-                      adActive ? (adState!.podId || "ad") : pod.podId,
-                      startISO,
-                      stableDuration,
-                      interstitialURI
-                    )
+                    const fallbackAttributes = activeBreak?.rawAttributes ? { ...activeBreak.rawAttributes } : undefined
+                    const sgai = injectInterstitialCues(cleanOrigin, {
+                      id: adActive ? (adState!.podId || "ad") : pod.podId,
+                      startDateISO: startISO,
+                      durationSec: stableDuration,
+                      assetURI: interstitialURI,
+                      baseAttributes: fallbackAttributes,
+                      scte35Payload: activeBreak?.rawCommand
+                    })
 
                     await this.env.BEACON_QUEUE.send(beaconMsg)
                     return new Response(sgai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
@@ -1371,27 +1826,29 @@ export class ChannelDO {
                   // SSAI succeeded - persist skip stats ONLY on first request (when skip count is unset/zero)
                   // CRITICAL: Once set, never overwrite to ensure timeline consistency across all variants
                   if (adState && (!adState.contentSegmentsToSkip || adState.contentSegmentsToSkip === 0)) {
-                    // Only persist if we actually skipped content (PDT was found in manifest)
-                    if (result.segmentsSkipped > 0) {
-                      adState.contentSegmentsToSkip = result.segmentsSkipped
-                      adState.skippedDuration = result.durationSkipped
+                    if (sharedResult.segmentsSkipped > 0) {
+                      adState.contentSegmentsToSkip = sharedResult.plan.stableSkipCount
+                      adState.skippedDuration = sharedResult.durationSkipped
+                      adState.manifestPlan = sharedResult.plan
                       await saveAdState(this.state, adState)
-                      console.log(`✅ Persisted stable skip count (FIRST REQUEST): ${result.segmentsSkipped} segments (${result.durationSkipped.toFixed(2)}s)`)
+                      console.log(`✅ Persisted stable skip count (FIRST REQUEST): ${sharedResult.plan.stableSkipCount} segments (${sharedResult.durationSkipped.toFixed(2)}s)`)
                     } else {
                       console.log(`⚠️  Skip count is 0 (PDT not in window) - not persisting, will retry on next request`)
                     }
-                  } else if (adState && adState.contentSegmentsToSkip) {
+                  } else if (adState) {
                     // TELEMETRY: Detect if recalculation produces different skip count (potential bug)
-                    if (result.segmentsSkipped > 0 && result.segmentsSkipped !== adState.contentSegmentsToSkip) {
-                      console.warn(`🚨 TELEMETRY: Skip count mismatch detected! cached=${adState.contentSegmentsToSkip}, recalc=${result.segmentsSkipped}. This may indicate concurrent request inconsistency.`)
-                      // FUTURE: Send to analytics/alerting system
-                    } else {
-                      console.log(`ℹ️  Using existing stable skip count: ${adState.contentSegmentsToSkip} segments (${adState.skippedDuration?.toFixed(2) || 'unknown'}s)`)
+                    if (sharedResult.segmentsSkipped > 0 && adState.contentSegmentsToSkip && sharedResult.plan.stableSkipCount !== adState.contentSegmentsToSkip) {
+                      console.warn(`🚨 TELEMETRY: Skip count mismatch detected! cached=${adState.contentSegmentsToSkip}, recalc=${sharedResult.plan.stableSkipCount}. This may indicate concurrent request inconsistency.`)
                     }
+                    adState.manifestPlan = sharedResult.plan
+                    await saveAdState(this.state, adState)
+                    console.log(`ℹ️  Using shared manifest plan with stable skip count ${sharedResult.plan.stableSkipCount}`)
                   }
 
+                  const renderedManifest = renderPlaylistModel(sharedResult.model)
+
                   await this.env.BEACON_QUEUE.send(beaconMsg)
-                  return new Response(result.manifest, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
+                  return new Response(renderedManifest, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
                 }
               } catch (err) {
                 console.error(`Error fetching/parsing ad playlist:`, err)

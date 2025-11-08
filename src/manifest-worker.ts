@@ -4,6 +4,8 @@ import { verifyJWT, parseJWTUnsafe } from "./utils/jwt"
 import { getChannelConfig, getConfigWithDefaults } from "./utils/channel-config"
 import type { ViewerJWT, BeaconMessage } from "./types"
 
+type MetricsDataset = { writeDataPoint: (data: any) => Promise<void> }
+
 // Bindings available to this Worker
 // In-memory LRU cache for channel configs (optimization for segment passthrough)
 const configCache = new Map<string, {config: any, expires: number}>()
@@ -38,6 +40,8 @@ export interface Env {
 
   // Dev toggles
   DEV_ALLOW_NO_AUTH?: string
+
+  METRICS?: MetricsDataset
 }
 
 /**

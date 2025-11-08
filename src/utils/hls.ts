@@ -1,4 +1,5 @@
 // Minimal HLS helpers suitable for Workers
+declare const atob: (data: string) => string
 
 export type VariantInfo = { bandwidth?: number; resolution?: string; uri: string; isVideo?: boolean }
 
@@ -81,21 +82,184 @@ export function insertDiscontinuity(variantText: string): string {
 }
 
 /** Add an HLS Interstitial DATERANGE for SGAI-capable clients. */
-export function addDaterangeInterstitial(
-  variantText: string,
-  id: string,
-  startDateISO: string,
-  durationSec: number,
-  assetURI: string,
-  controls = "skip-restrictions=6"
-) {
-  const tag = `#EXT-X-DATERANGE:ID="${id}",CLASS="com.apple.hls.interstitial",START-DATE="${startDateISO}",DURATION=${durationSec.toFixed(
-    3
-  )},X-ASSET-URI="${assetURI}",X-PLAYOUT-CONTROLS="${controls}"`
-  const lines = variantText.trim().split("\n")
+type DaterangeAttributeValue = string | number | boolean
+
+export interface InterstitialCueConfig {
+  id: string
+  startDateISO: string
+  durationSec: number
+  assetURI: string
+  controls?: string
+  baseAttributes?: Record<string, DaterangeAttributeValue>
+  cueInId?: string
+  scte35Payload?: string
+}
+
+function formatDaterangeLine(attrs: Record<string, DaterangeAttributeValue>): string {
+  const parts: string[] = []
+  for (const [key, rawValue] of Object.entries(attrs)) {
+    if (rawValue === undefined || rawValue === null) continue
+    let encoded: string
+    if (typeof rawValue === "number") {
+      const value = Number.isFinite(rawValue)
+        ? rawValue % 1 === 0
+          ? rawValue.toString()
+          : rawValue.toFixed(3)
+        : rawValue.toString()
+      encoded = value
+    } else if (typeof rawValue === "boolean") {
+      encoded = rawValue ? "YES" : "NO"
+    } else {
+      encoded = `"${rawValue.replace(/"/g, '\\"')}"`
+    }
+    parts.push(`${key}=${encoded}`)
+  }
+  return `#EXT-X-DATERANGE:${parts.join(",")}`
+}
+
+function decodeBase64ToBytes(base64: string): Uint8Array {
+  const clean = base64.replace(/\s+/g, "").trim()
+  if (typeof atob === "function") {
+    const binary = atob(clean)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i)
+    }
+    return bytes
+  }
+  return Uint8Array.from(Buffer.from(clean, "base64"))
+}
+
+function ensureHexEncodedScte35(payload?: string): string | undefined {
+  if (!payload) return undefined
+  const trimmed = payload.trim()
+  if (/^0x[0-9a-fA-F]+$/.test(trimmed)) {
+    return `0x${trimmed.slice(2).toLowerCase()}`
+  }
+  if (trimmed.toUpperCase() === "YES") {
+    return "0x0"
+  }
+  try {
+    const bytes = decodeBase64ToBytes(trimmed)
+    if (!bytes.length) return "0x0"
+    const hex = Array.from(bytes)
+      .map(b => b.toString(16).padStart(2, "0"))
+      .join("")
+    return `0x${hex}`
+  } catch {
+    return "0x0"
+  }
+}
+
+function buildBaseAttributes(config: InterstitialCueConfig): Record<string, DaterangeAttributeValue> {
+  const attrs: Record<string, DaterangeAttributeValue> = {}
+  if (config.baseAttributes) {
+    for (const [key, value] of Object.entries(config.baseAttributes)) {
+      if (value === undefined || value === null) continue
+      attrs[key] = value
+    }
+  }
+
+  attrs["ID"] = typeof attrs["ID"] === "string" ? attrs["ID"] : config.id
+  attrs["CLASS"] = attrs["CLASS"] || "com.apple.hls.interstitial"
+  attrs["START-DATE"] = config.startDateISO
+  const durationStr = Number.isFinite(config.durationSec)
+    ? config.durationSec.toFixed(3)
+    : String(config.durationSec)
+  attrs["DURATION"] = durationStr
+  if ("PLANNED-DURATION" in attrs) {
+    attrs["PLANNED-DURATION"] = durationStr
+  }
+  attrs["X-ASSET-URI"] = config.assetURI
+  if (config.controls || !attrs["X-PLAYOUT-CONTROLS"]) {
+    attrs["X-PLAYOUT-CONTROLS"] = config.controls || "skip-restrictions=6"
+  }
+
+  return attrs
+}
+
+export function renderInterstitialCueOut(config: InterstitialCueConfig): string {
+  const attrs = buildBaseAttributes(config)
+  const existing = typeof attrs["SCTE35-OUT"] === "string" ? (attrs["SCTE35-OUT"] as string) : undefined
+  delete attrs["SCTE35-OUT"]
+  delete attrs["SCTE35-IN"]
+  const encoded = ensureHexEncodedScte35(config.scte35Payload ?? existing)
+  if (encoded) {
+    attrs["SCTE35-OUT"] = encoded
+  }
+  return formatDaterangeLine(attrs)
+}
+
+export function renderInterstitialCueIn(config: InterstitialCueConfig): string {
+  const attrs = buildBaseAttributes(config)
+  attrs["ID"] = config.cueInId || `${config.id}:complete`
+  const completionStart = addSecondsToTimestamp(config.startDateISO, config.durationSec)
+  attrs["START-DATE"] = completionStart
+  attrs["END-ON-NEXT"] = true
+  attrs["DURATION"] = "0.000"
+  if ("PLANNED-DURATION" in attrs) {
+    attrs["PLANNED-DURATION"] = "0.000"
+  }
+  delete attrs["SCTE35-OUT"]
+  const existing = typeof attrs["SCTE35-IN"] === "string" ? (attrs["SCTE35-IN"] as string) : undefined
+  const encoded = ensureHexEncodedScte35(config.scte35Payload ?? existing)
+  if (encoded) {
+    attrs["SCTE35-IN"] = encoded
+  }
+  return formatDaterangeLine(attrs)
+}
+
+function renderCueOutTag(durationSec: number, payload?: string): string {
+  const normalized = ensureHexEncodedScte35(payload)
+  const parts = [`DURATION=${Number.isFinite(durationSec) ? durationSec.toFixed(3) : String(durationSec)}`]
+  if (normalized) {
+    parts.push(`SCTE35=${normalized}`)
+  }
+  return `#EXT-X-CUE-OUT:${parts.join(",")}`
+}
+
+function renderCueInTag(): string {
+  return "#EXT-X-CUE-IN"
+}
+
+export function injectInterstitialCues(manifest: string, config: InterstitialCueConfig): string {
+  const newlineTerminated = manifest.endsWith("\n")
+  const body = newlineTerminated ? manifest.slice(0, -1) : manifest
+  const lines = body.length ? body.split("\n") : []
   const insertAt = Math.max(0, lines.length - 6)
-  lines.splice(insertAt, 0, tag)
-  return lines.join("\n") + (variantText.endsWith("\n") ? "" : "\n")
+  const basePayload = config.scte35Payload ||
+    (config.baseAttributes && typeof config.baseAttributes["SCTE35-OUT"] === "string"
+      ? (config.baseAttributes["SCTE35-OUT"] as string)
+      : undefined)
+  const encodedPayload = ensureHexEncodedScte35(basePayload)
+  const renderConfig: InterstitialCueConfig = {
+    ...config,
+    scte35Payload: encodedPayload ?? config.scte35Payload
+  }
+
+  const cueOutRange = renderInterstitialCueOut(renderConfig)
+  const cueInRange = renderInterstitialCueIn(renderConfig)
+  const cueOut = renderCueOutTag(config.durationSec, encodedPayload ?? config.scte35Payload)
+  const cueIn = renderCueInTag()
+
+  const updated = [
+    ...lines.slice(0, insertAt),
+    cueOutRange,
+    cueOut,
+    cueInRange,
+    cueIn,
+    ...lines.slice(insertAt)
+  ]
+
+  const joined = updated.join("\n")
+  return newlineTerminated ? `${joined}\n` : joined
+}
+
+function inferSegmentExtension(uri: string): string | null {
+  const clean = uri.split(/[?#]/)[0]
+  const idx = clean.lastIndexOf(".")
+  if (idx === -1) return null
+  return clean.slice(idx + 1).toLowerCase()
 }
 
 /**
@@ -322,6 +486,33 @@ function buildClosingDateRangeTag(
  * Replace content segments with ad segments for true SSAI
  * Inserts DISCONTINUITY tags before and after ad pod and records telemetry
  */
+export interface ReplaceSegmentsWithAdsOptions {
+  cuePts90k?: number
+  idrTimeline?: IDRTimeline | IDRTimestamp[]
+  recordBoundaryDecision?: (decision: SnapDecision, validation: BoundaryValidation) => void
+  snapLookAheadPts?: number
+  boundaryTolerancePts?: number
+}
+
+export interface ReplaceSegmentsBoundary {
+  decision: SnapDecision
+  validation: BoundaryValidation
+}
+
+export interface ReplaceSegmentsResult {
+  manifest: string
+  segmentsSkipped: number
+  durationSkipped: number
+  boundary?: ReplaceSegmentsBoundary
+  requestedCut?: {
+    cuePts90k: number
+    snappedPts90k: number
+    deltaPts: number
+    deltaSeconds: number
+    source: string
+  }
+}
+
 export function replaceSegmentsWithAds(
   variantText: string,
   scte35StartPDT: string,
