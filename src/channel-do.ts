@@ -1,11 +1,10 @@
 import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, extractPDTs, extractBitrates, reconcileCueStartDates } from "./utils/hls"
 import { signPath } from "./utils/sign"
-import { parseSCTE35FromManifest, isAdBreakStart, getBreakDuration, findActiveBreak, validateSCTE35Signal } from "./utils/scte35"
+import { parseScte35FromTransportStream, eventToSignal, getBreakDuration, findActiveBreak, validateSCTE35Signal } from "./utils/scte35"
 import { getChannelConfig } from "./utils/channel-config"
 import type { ChannelConfig } from "./utils/channel-config"
 import type { Env } from "./manifest-worker"
-import type { DecisionResponse, BeaconMessage, SCTE35Signal } from "./types"
-import { PtsPdtMap } from "./utils/time"
+import type { DecisionResponse, BeaconMessage, SCTE35Signal, Scte35Event } from "./types"
 
 // ============================================================================
 // CONFIGURATION CONSTANTS
@@ -68,6 +67,47 @@ async function clearAdState(state: DurableObjectState): Promise<void> {
   const currentVersion = await state.storage.get<number>('ad_state_version') || 0
   await state.storage.put('ad_state_version', currentVersion + 1)
   await state.storage.delete(AD_STATE_KEY)
+}
+
+const SCTE35_EVENT_STORE_KEY = "scte35_events"
+const SCTE35_EVENT_TTL_MS = 5 * 60 * 1000
+const SCTE35_EVENT_MAX = 96
+
+async function appendScte35Events(state: DurableObjectState, events: Scte35Event[]): Promise<void> {
+  if (events.length === 0) return
+
+  const now = Date.now()
+  const existing = (await state.storage.get<Scte35Event[]>(SCTE35_EVENT_STORE_KEY)) || []
+  const filtered = existing.filter(event => now - event.ingestTimestamp <= SCTE35_EVENT_TTL_MS)
+  const combined = filtered.concat(events)
+
+  const deduped: Scte35Event[] = []
+  const seen = new Set<string>()
+  for (const event of combined) {
+    if (seen.has(event.eventId)) continue
+    seen.add(event.eventId)
+    deduped.push(event)
+  }
+
+  while (deduped.length > SCTE35_EVENT_MAX) {
+    deduped.shift()
+  }
+
+  await state.storage.put(SCTE35_EVENT_STORE_KEY, deduped)
+  console.log(`[SCTE35] Stored ${events.length} new transport cues (buffer=${deduped.length})`)
+}
+
+async function getRecentScte35Events(state: DurableObjectState): Promise<Scte35Event[]> {
+  const now = Date.now()
+  const stored = (await state.storage.get<Scte35Event[]>(SCTE35_EVENT_STORE_KEY)) || []
+  const filtered = stored.filter(event => now - event.ingestTimestamp <= SCTE35_EVENT_TTL_MS)
+
+  if (filtered.length !== stored.length) {
+    await state.storage.put(SCTE35_EVENT_STORE_KEY, filtered)
+    console.log(`[SCTE35] Pruned ${stored.length - filtered.length} expired transport cues (remaining=${filtered.length})`)
+  }
+
+  return filtered
 }
 
 /**
@@ -690,6 +730,33 @@ export class ChannelDO {
       const adPodBase = req.headers.get('X-Ad-Pod-Base') || this.env.AD_POD_BASE
       const signHost = req.headers.get('X-Sign-Host') || this.env.SIGN_HOST
 
+      if (u.pathname === "/ingest/ts") {
+        if (req.method !== "POST") {
+          return new Response("method not allowed", { status: 405 })
+        }
+
+        try {
+          const arrayBuffer = await req.arrayBuffer()
+          const payload = new Uint8Array(arrayBuffer)
+          const events = parseScte35FromTransportStream(payload)
+          await appendScte35Events(this.state, events)
+
+          console.log(
+            `[SCTE35] Ingest request processed for channel=${channelId}, cues=${events.length}, bytes=${payload.byteLength}`
+          )
+
+          return new Response(JSON.stringify({ ok: true, events: events.length }), {
+            headers: { "content-type": "application/json" }
+          })
+        } catch (err) {
+          console.error("SCTE-35 ingest failure:", err)
+          return new Response(JSON.stringify({ ok: false, error: "ingest_failed" }), {
+            status: 500,
+            headers: { "content-type": "application/json" }
+          })
+        }
+      }
+
       // Control plane: POST /cue to start/stop an ad break for this channel
       if (u.pathname === "/cue") {
         if (req.method !== "POST") return new Response("method not allowed", { status: 405 })
@@ -835,37 +902,47 @@ export class ChannelDO {
         console.log(`Ad state version changed during request (${initialAdStateVersion} -> ${currentAdStateVersion}), using latest state`)
       }
 
-      // Parse SCTE-35 signals from origin manifest (with enhanced binary parsing)
-      const scte35Signals = parseSCTE35FromManifest(origin)
+      const transportEvents = await getRecentScte35Events(this.state)
+      const eventById = new Map<string, Scte35Event>()
+      transportEvents.forEach(event => eventById.set(event.eventId, event))
+
+      const scte35Signals = transportEvents
+        .map(event => eventToSignal(event))
+        .filter((signal): signal is SCTE35Signal => signal !== null)
+
       let activeBreak = findActiveBreak(scte35Signals)
 
-      if (scte35Signals.length > 0) {
-        console.log(`Found ${scte35Signals.length} SCTE-35 signals`)
+      if (transportEvents.length > 0) {
+        const skipped = transportEvents.length - scte35Signals.length
+        console.log(
+          `[SCTE35] Loaded ${transportEvents.length} transport cues (normalized=${scte35Signals.length}${skipped > 0 ? `, skipped=${skipped}` : ''})`
+        )
 
         if (activeBreak) {
-          // CRITICAL: Validate SCTE-35 signal before using it
-          // Extract PDT for temporal validation (using request-scoped cache)
+          const sourceEvent = eventById.get(activeBreak.id)
+          if (sourceEvent) {
+            const ccLog = sourceEvent.continuityCounters.length > 0 ? sourceEvent.continuityCounters.join(",") : "n/a"
+            const rawPreview = sourceEvent.rawHex.length > 48 ? `${sourceEvent.rawHex.slice(0, 48)}…` : sourceEvent.rawHex
+            console.log(
+              `[SCTE35] Active cue ${activeBreak.id}: command=${sourceEvent.commandType}, pid=0x${sourceEvent.pid.toString(16)}, continuity=[${ccLog}], raw=${rawPreview}`
+            )
+          }
+
           const pdts = getCachedPDTs(origin)
           const mostRecentPDT = pdts.length > 0 ? pdts[pdts.length - 1] : undefined
-
           const validation = validateSCTE35Signal(activeBreak, mostRecentPDT)
 
-          // Log validation results
           if (!validation.valid) {
             console.error(`❌ SCTE-35 Validation FAILED for signal ${activeBreak.id}:`)
             validation.errors.forEach(err => console.error(`   - ${err}`))
-
-            // Reject invalid signal - do not attempt ad insertion
             activeBreak = null
             console.log(`⚠️  Rejecting invalid SCTE-35 signal to prevent playback issues`)
           } else {
-            // Log warnings but allow signal through
             if (validation.warnings.length > 0) {
               console.warn(`⚠️  SCTE-35 Validation warnings for signal ${activeBreak.id}:`)
               validation.warnings.forEach(warn => console.warn(`   - ${warn}`))
             }
 
-            // Log enhanced binary data if available
             if (activeBreak.binaryData) {
               console.log(`✅ SCTE-35 Binary Parsing: Event ID=${activeBreak.binaryData.spliceEventId}, ` +
                 `PTS=${activeBreak.pts ? `${activeBreak.pts} (${(activeBreak.pts / 90000).toFixed(3)}s)` : 'N/A'}, ` +
