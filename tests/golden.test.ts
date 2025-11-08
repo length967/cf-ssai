@@ -1,7 +1,7 @@
 // tests/golden.test.ts
 import { strict as assert } from "node:assert";
 import { test, describe } from "node:test";
-import { insertDiscontinuity, addDaterangeInterstitial } from "../src/utils/hls.ts";
+import { insertDiscontinuity, injectInterstitialCues } from "../src/utils/hls.ts";
 import { signPath } from "../src/utils/sign.ts";
 import { windowBucket } from "../src/utils/time.ts";
 import { parseJWTUnsafe } from "../src/utils/jwt.ts";
@@ -31,19 +31,19 @@ describe("utils/hls.ts", () => {
     assert.equal(lines[lastSegIdx - 1].trim(), "#EXT-X-DISCONTINUITY");
   });
 
-  test("addDaterangeInterstitial(): inserts a valid interstitial DATERANGE tag", () => {
-    const out = addDaterangeInterstitial(
-      ORIGIN,
-      "ad-0",
-      "2025-10-31T12:00:08Z",
-      30,
-      "https://ads.example.com/pods/example-pod/v_1600k/playlist.m3u8"
-    );
-    assert.match(out, /#EXT-X-DATERANGE:/);
+  test("injectInterstitialCues(): inserts valid interstitial markers", () => {
+    const out = injectInterstitialCues(ORIGIN, {
+      id: "ad-0",
+      startDateISO: "2025-10-31T12:00:08Z",
+      durationSec: 30,
+      assetURI: "https://ads.example.com/pods/example-pod/v_1600k/playlist.m3u8"
+    });
+    assert.match(out, /#EXT-X-DATERANGE:ID="ad-0"/);
     assert.match(out, /CLASS="com\.apple\.hls\.interstitial"/);
     assert.match(out, /START-DATE="2025-10-31T12:00:08Z"/);
     assert.match(out, /DURATION=30\.000/);
-    assert.match(out, /X-ASSET-URI="https:\/\/ads\.example\.com\/pods\/example-pod\/v_1600k\/playlist\.m3u8"/);
+    assert.match(out, /#EXT-X-CUE-OUT:DURATION=30\.000/);
+    assert.match(out, /#EXT-X-CUE-IN/);
   });
 });
 

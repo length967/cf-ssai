@@ -1,4 +1,5 @@
 // Minimal HLS helpers suitable for Workers
+declare const atob: (data: string) => string
 
 export type VariantInfo = { bandwidth?: number; resolution?: string; uri: string; isVideo?: boolean }
 
@@ -81,21 +82,184 @@ export function insertDiscontinuity(variantText: string): string {
 }
 
 /** Add an HLS Interstitial DATERANGE for SGAI-capable clients. */
-export function addDaterangeInterstitial(
-  variantText: string,
-  id: string,
-  startDateISO: string,
-  durationSec: number,
-  assetURI: string,
-  controls = "skip-restrictions=6"
-) {
-  const tag = `#EXT-X-DATERANGE:ID="${id}",CLASS="com.apple.hls.interstitial",START-DATE="${startDateISO}",DURATION=${durationSec.toFixed(
-    3
-  )},X-ASSET-URI="${assetURI}",X-PLAYOUT-CONTROLS="${controls}"`
-  const lines = variantText.trim().split("\n")
+type DaterangeAttributeValue = string | number | boolean
+
+export interface InterstitialCueConfig {
+  id: string
+  startDateISO: string
+  durationSec: number
+  assetURI: string
+  controls?: string
+  baseAttributes?: Record<string, DaterangeAttributeValue>
+  cueInId?: string
+  scte35Payload?: string
+}
+
+function formatDaterangeLine(attrs: Record<string, DaterangeAttributeValue>): string {
+  const parts: string[] = []
+  for (const [key, rawValue] of Object.entries(attrs)) {
+    if (rawValue === undefined || rawValue === null) continue
+    let encoded: string
+    if (typeof rawValue === "number") {
+      const value = Number.isFinite(rawValue)
+        ? rawValue % 1 === 0
+          ? rawValue.toString()
+          : rawValue.toFixed(3)
+        : rawValue.toString()
+      encoded = value
+    } else if (typeof rawValue === "boolean") {
+      encoded = rawValue ? "YES" : "NO"
+    } else {
+      encoded = `"${rawValue.replace(/"/g, '\\"')}"`
+    }
+    parts.push(`${key}=${encoded}`)
+  }
+  return `#EXT-X-DATERANGE:${parts.join(",")}`
+}
+
+function decodeBase64ToBytes(base64: string): Uint8Array {
+  const clean = base64.replace(/\s+/g, "").trim()
+  if (typeof atob === "function") {
+    const binary = atob(clean)
+    const bytes = new Uint8Array(binary.length)
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i)
+    }
+    return bytes
+  }
+  return Uint8Array.from(Buffer.from(clean, "base64"))
+}
+
+function ensureHexEncodedScte35(payload?: string): string | undefined {
+  if (!payload) return undefined
+  const trimmed = payload.trim()
+  if (/^0x[0-9a-fA-F]+$/.test(trimmed)) {
+    return `0x${trimmed.slice(2).toLowerCase()}`
+  }
+  if (trimmed.toUpperCase() === "YES") {
+    return "0x0"
+  }
+  try {
+    const bytes = decodeBase64ToBytes(trimmed)
+    if (!bytes.length) return "0x0"
+    const hex = Array.from(bytes)
+      .map(b => b.toString(16).padStart(2, "0"))
+      .join("")
+    return `0x${hex}`
+  } catch {
+    return "0x0"
+  }
+}
+
+function buildBaseAttributes(config: InterstitialCueConfig): Record<string, DaterangeAttributeValue> {
+  const attrs: Record<string, DaterangeAttributeValue> = {}
+  if (config.baseAttributes) {
+    for (const [key, value] of Object.entries(config.baseAttributes)) {
+      if (value === undefined || value === null) continue
+      attrs[key] = value
+    }
+  }
+
+  attrs["ID"] = typeof attrs["ID"] === "string" ? attrs["ID"] : config.id
+  attrs["CLASS"] = attrs["CLASS"] || "com.apple.hls.interstitial"
+  attrs["START-DATE"] = config.startDateISO
+  const durationStr = Number.isFinite(config.durationSec)
+    ? config.durationSec.toFixed(3)
+    : String(config.durationSec)
+  attrs["DURATION"] = durationStr
+  if ("PLANNED-DURATION" in attrs) {
+    attrs["PLANNED-DURATION"] = durationStr
+  }
+  attrs["X-ASSET-URI"] = config.assetURI
+  if (config.controls || !attrs["X-PLAYOUT-CONTROLS"]) {
+    attrs["X-PLAYOUT-CONTROLS"] = config.controls || "skip-restrictions=6"
+  }
+
+  return attrs
+}
+
+export function renderInterstitialCueOut(config: InterstitialCueConfig): string {
+  const attrs = buildBaseAttributes(config)
+  const existing = typeof attrs["SCTE35-OUT"] === "string" ? (attrs["SCTE35-OUT"] as string) : undefined
+  delete attrs["SCTE35-OUT"]
+  delete attrs["SCTE35-IN"]
+  const encoded = ensureHexEncodedScte35(config.scte35Payload ?? existing)
+  if (encoded) {
+    attrs["SCTE35-OUT"] = encoded
+  }
+  return formatDaterangeLine(attrs)
+}
+
+export function renderInterstitialCueIn(config: InterstitialCueConfig): string {
+  const attrs = buildBaseAttributes(config)
+  attrs["ID"] = config.cueInId || `${config.id}:complete`
+  const completionStart = addSecondsToTimestamp(config.startDateISO, config.durationSec)
+  attrs["START-DATE"] = completionStart
+  attrs["END-ON-NEXT"] = true
+  attrs["DURATION"] = "0.000"
+  if ("PLANNED-DURATION" in attrs) {
+    attrs["PLANNED-DURATION"] = "0.000"
+  }
+  delete attrs["SCTE35-OUT"]
+  const existing = typeof attrs["SCTE35-IN"] === "string" ? (attrs["SCTE35-IN"] as string) : undefined
+  const encoded = ensureHexEncodedScte35(config.scte35Payload ?? existing)
+  if (encoded) {
+    attrs["SCTE35-IN"] = encoded
+  }
+  return formatDaterangeLine(attrs)
+}
+
+function renderCueOutTag(durationSec: number, payload?: string): string {
+  const normalized = ensureHexEncodedScte35(payload)
+  const parts = [`DURATION=${Number.isFinite(durationSec) ? durationSec.toFixed(3) : String(durationSec)}`]
+  if (normalized) {
+    parts.push(`SCTE35=${normalized}`)
+  }
+  return `#EXT-X-CUE-OUT:${parts.join(",")}`
+}
+
+function renderCueInTag(): string {
+  return "#EXT-X-CUE-IN"
+}
+
+export function injectInterstitialCues(manifest: string, config: InterstitialCueConfig): string {
+  const newlineTerminated = manifest.endsWith("\n")
+  const body = newlineTerminated ? manifest.slice(0, -1) : manifest
+  const lines = body.length ? body.split("\n") : []
   const insertAt = Math.max(0, lines.length - 6)
-  lines.splice(insertAt, 0, tag)
-  return lines.join("\n") + (variantText.endsWith("\n") ? "" : "\n")
+  const basePayload = config.scte35Payload ||
+    (config.baseAttributes && typeof config.baseAttributes["SCTE35-OUT"] === "string"
+      ? (config.baseAttributes["SCTE35-OUT"] as string)
+      : undefined)
+  const encodedPayload = ensureHexEncodedScte35(basePayload)
+  const renderConfig: InterstitialCueConfig = {
+    ...config,
+    scte35Payload: encodedPayload ?? config.scte35Payload
+  }
+
+  const cueOutRange = renderInterstitialCueOut(renderConfig)
+  const cueInRange = renderInterstitialCueIn(renderConfig)
+  const cueOut = renderCueOutTag(config.durationSec, encodedPayload ?? config.scte35Payload)
+  const cueIn = renderCueInTag()
+
+  const updated = [
+    ...lines.slice(0, insertAt),
+    cueOutRange,
+    cueOut,
+    cueInRange,
+    cueIn,
+    ...lines.slice(insertAt)
+  ]
+
+  const joined = updated.join("\n")
+  return newlineTerminated ? `${joined}\n` : joined
+}
+
+function inferSegmentExtension(uri: string): string | null {
+  const clean = uri.split(/[?#]/)[0]
+  const idx = clean.lastIndexOf(".")
+  if (idx === -1) return null
+  return clean.slice(idx + 1).toLowerCase()
 }
 
 /**
@@ -105,6 +269,179 @@ function addSecondsToTimestamp(isoTimestamp: string, seconds: number): string {
   const date = new Date(isoTimestamp)
   date.setMilliseconds(date.getMilliseconds() + seconds * 1000)
   return date.toISOString()
+}
+
+function safeParseBigInt(value: string): bigint | null {
+  if (!value || !/^[0-9]+$/.test(value)) return null
+  try {
+    return BigInt(value)
+  } catch {
+    return null
+  }
+}
+
+function extractPtsValue(line: string): bigint | null {
+  const tagMatch = line.match(/#EXT-X-PTS:(\d+)/)
+  if (tagMatch) {
+    return safeParseBigInt(tagMatch[1])
+  }
+
+  const attrMatch = line.match(/(?:^|,)(?:X-)?PTS=(\d+)/)
+  if (attrMatch) {
+    return safeParseBigInt(attrMatch[1])
+  }
+
+  return null
+}
+
+function reconcileDaterangeLine(
+  line: string,
+  map: PtsPdtMap,
+  options: { logger: Pick<typeof console, 'log' | 'warn' | 'error'>, variantId?: string, metrics?: MetricEmitter, driftThresholdMs: number }
+): { line: string, driftMs: number | null } {
+  const ptsMatch = line.match(/(?:^|,)(?:X-)?PTS=(\d+)/)
+  const startMatch = line.match(/START-DATE="([^"]*)"/)
+  const ptsValue = ptsMatch ? safeParseBigInt(ptsMatch[1]) : null
+  const currentStart = startMatch ? startMatch[1] : null
+  const variantSuffix = options.variantId ? ` [${options.variantId}]` : ''
+  let driftMs: number | null = null
+  let updatedLine = line
+  let calibrationStart: string | null = currentStart
+
+  if (ptsValue !== null) {
+    let estimate = map.estimate(ptsValue)
+    if (!estimate) {
+      const latest = map.latest
+      if (latest) {
+        const deltaTicks = Number(ptsValue - latest.rawPts)
+        const seconds = deltaTicks / Number(90000)
+        const predictedMs = latest.pdtMs + seconds * 1000
+        estimate = { ms: predictedMs, iso: new Date(predictedMs).toISOString() }
+      }
+    }
+    if (estimate) {
+      if (currentStart) {
+        const parsed = Date.parse(currentStart)
+        if (Number.isFinite(parsed)) {
+          driftMs = parsed - estimate.ms
+          const absDrift = Math.abs(driftMs)
+          const message = `[PTS→PDT] Cue drift ${driftMs.toFixed(2)}ms for ${ptsValue.toString()} ticks${variantSuffix}`
+          if (absDrift > options.driftThresholdMs) {
+            options.logger.warn(message)
+            updatedLine = updatedLine.replace(/START-DATE="([^"]*)"/, `START-DATE="${estimate.iso}"`)
+            calibrationStart = estimate.iso
+          } else {
+            options.logger.log(message)
+          }
+        } else {
+          options.logger.warn(`[PTS→PDT] Invalid START-DATE on cue${variantSuffix}, substituting mapped value`)
+          updatedLine = updatedLine.replace(/START-DATE="([^"]*)"/, `START-DATE="${estimate.iso}"`)
+          calibrationStart = estimate.iso
+          driftMs = 0
+        }
+      } else {
+        options.logger.log(`[PTS→PDT] Filled missing START-DATE for cue${variantSuffix}`)
+        updatedLine = `${updatedLine},START-DATE="${estimate.iso}"`
+        calibrationStart = estimate.iso
+        driftMs = 0
+      }
+    }
+  }
+
+  if (ptsValue !== null && calibrationStart) {
+    map.ingest(ptsValue, calibrationStart)
+  }
+
+  return { line: updatedLine, driftMs }
+}
+
+export function reconcileCueStartDates(
+  manifest: string,
+  map: PtsPdtMap,
+  options?: CueMappingOptions
+): { manifest: string, lastDriftMs?: number } {
+  const logger = options?.logger ?? console
+  const driftThreshold = options?.driftLogThresholdMs ?? 250
+  const emitMetric = options?.metrics
+  const dims = options?.variantId ? { variant: options.variantId } : undefined
+
+  const lines = manifest.split('\n')
+  const output: string[] = []
+  let pendingPts: bigint | null = null
+  let pendingPdt: string | null = null
+  let lastDriftMs: number | null = null
+
+  const captureCalibration = () => {
+    if (pendingPts !== null && pendingPdt) {
+      const added = map.ingest(pendingPts, pendingPdt)
+      if (added) {
+        logger.log(`[PTS→PDT] Captured calibration ${pendingPts.toString()} → ${pendingPdt}${options?.variantId ? ` [${options.variantId}]` : ''}`)
+      }
+      pendingPts = null
+      pendingPdt = null
+    }
+  }
+
+  for (const line of lines) {
+    if (line.startsWith('#EXT-X-DISCONTINUITY')) {
+      if (map.calibrationCount > 0) {
+        logger.log(`[PTS→PDT] Reset mapping due to DISCONTINUITY${options?.variantId ? ` [${options.variantId}]` : ''}`)
+      }
+      map.reset()
+      pendingPts = null
+      pendingPdt = null
+      output.push(line)
+      continue
+    }
+
+    if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+      pendingPdt = line.replace('#EXT-X-PROGRAM-DATE-TIME:', '').trim()
+      captureCalibration()
+      output.push(line)
+      continue
+    }
+
+    if (line.startsWith('#EXT-X-DATERANGE:')) {
+      const result = reconcileDaterangeLine(line, map, {
+        logger,
+        variantId: options?.variantId,
+        metrics: emitMetric,
+        driftThresholdMs: driftThreshold
+      })
+
+      if (result.driftMs !== null) {
+        lastDriftMs = result.driftMs
+      }
+
+      output.push(result.line)
+      continue
+    }
+
+    const pts = extractPtsValue(line)
+    if (pts !== null) {
+      pendingPts = pts
+      captureCalibration()
+      output.push(line)
+      continue
+    }
+
+    if (!line.startsWith('#') && line.trim().length > 0) {
+      pendingPts = null
+      pendingPdt = null
+    }
+
+    output.push(line)
+  }
+
+  if (emitMetric) {
+    emitMetric('pts_pdt_mapping_points', map.calibrationCount, dims)
+    emitMetric('pts_pdt_mapping_health', map.calibrationCount > 0 ? 1 : 0, dims)
+    if (lastDriftMs !== null) {
+      emitMetric('pts_pdt_drift_ms', Math.abs(lastDriftMs), dims)
+    }
+  }
+
+  return { manifest: output.join('\n'), lastDriftMs: lastDriftMs ?? undefined }
 }
 
 /**
@@ -147,18 +484,49 @@ function getAverageSegmentDuration(lines: string[]): number {
  * @param stableSkipCount - Optional: Pre-calculated stable segment skip count from ad state
  * @returns Object with manifest and skip statistics
  */
+export interface ReplaceSegmentsWithAdsOptions {
+  cuePts90k?: number
+  idrTimeline?: IDRTimeline | IDRTimestamp[]
+  recordBoundaryDecision?: (decision: SnapDecision, validation: BoundaryValidation) => void
+  snapLookAheadPts?: number
+  boundaryTolerancePts?: number
+}
+
+export interface ReplaceSegmentsBoundary {
+  decision: SnapDecision
+  validation: BoundaryValidation
+}
+
+export interface ReplaceSegmentsResult {
+  manifest: string
+  segmentsSkipped: number
+  durationSkipped: number
+  boundary?: ReplaceSegmentsBoundary
+  requestedCut?: {
+    cuePts90k: number
+    snappedPts90k: number
+    deltaPts: number
+    deltaSeconds: number
+    source: string
+  }
+}
+
 export function replaceSegmentsWithAds(
   variantText: string,
   scte35StartPDT: string,
   adSegments: Array<{url: string, duration: number}> | string[],
   adDuration: number,
   scte35Duration?: number,  // Optional: SCTE-35 duration if different from ad duration
-  stableSkipCount?: number  // Optional: Use pre-calculated skip count for stability
-): { manifest: string, segmentsSkipped: number, durationSkipped: number } {
+  stableSkipCount?: number,  // Optional: Use pre-calculated skip count for stability
+  options: ReplaceSegmentsWithAdsOptions = {}
+): ReplaceSegmentsResult {
   // Use SCTE-35 duration for content skipping, or fall back to ad duration
   const contentSkipDuration = scte35Duration || adDuration
   const lines = variantText.split("\n")
   const output: string[] = []
+
+  let boundaryInfo: ReplaceSegmentsBoundary | undefined
+  let requestedCut: ReplaceSegmentsResult["requestedCut"]
   
   // Detect actual segment duration from content manifest
   const contentSegmentDuration = getAverageSegmentDuration(lines)
@@ -187,35 +555,41 @@ export function replaceSegmentsWithAds(
       // Parse the starting PDT timestamp for ad timeline continuity
       const startPDT = line.replace("#EXT-X-PROGRAM-DATE-TIME:", "").trim()
       
-      // Add DISCONTINUITY before ad
-      output.push("#EXT-X-DISCONTINUITY")
+      const startDate = new Date(startPDT)
 
-      // Insert ad segments WITHOUT PDT tags
-      // CRITICAL: Ad segment PDTs are unnecessary after DISCONTINUITY and can cause timeline issues
-      // The DISCONTINUITY tag tells the player to reset its timeline tracking
-      // Adding PDTs calculated from historical SCTE-35 time creates backwards jumps
-      console.log(`Inserting ${adSegments.length} ad segments WITHOUT PDT tags (DISCONTINUITY resets timeline)`)
+      let firstContentExtension: string | null = null
+      for (let lookAhead = i + 1; lookAhead < lines.length; lookAhead++) {
+        const candidate = lines[lookAhead]
+        if (!candidate.startsWith('#') && candidate.trim().length > 0) {
+          firstContentExtension = inferSegmentExtension(candidate)
+          break
+        }
+      }
+
+      let adExtension: string | null = null
+      const adLines: string[] = []
+
+      console.log(`Inserting ${adSegments.length} ad segments without PDT tags (evaluating need for DISCONTINUITY)`)
 
       for (let j = 0; j < adSegments.length; j++) {
         const segment = adSegments[j]
-
-        // NO PDT TAG - let player handle timeline after DISCONTINUITY
-
-        // Support both object format {url, duration} and legacy string format
+        let url: string
+        let durationValue: number
         if (typeof segment === 'string') {
-          // Legacy: calculate duration (fallback)
-          const segmentDuration = adDuration / adSegments.length
-          output.push(`#EXTINF:${segmentDuration.toFixed(3)},`)
-          output.push(segment)
+          durationValue = adDuration / adSegments.length
+          url = segment
         } else {
-          // New: use actual duration from ad playlist
-          output.push(`#EXTINF:${segment.duration.toFixed(3)},`)
-          output.push(segment.url)
+          durationValue = segment.duration
+          url = segment.url
         }
+
+        if (!adExtension) {
+          adExtension = inferSegmentExtension(url)
+        }
+
+        adLines.push(`#EXTINF:${durationValue.toFixed(3)},`)
+        adLines.push(url)
       }
-      
-      // Add DISCONTINUITY after ad
-      output.push("#EXT-X-DISCONTINUITY")
       
       // CRITICAL FIX: Use stable skip count if provided, otherwise calculate
       // This ensures all concurrent requests skip the same segments
@@ -329,8 +703,53 @@ export function replaceSegmentsWithAds(
         console.warn(`⚠️  Could not find resume PDT after searching ${segmentsSearched} segments`)
       }
 
+      let resumeSegmentExtension: string | null = null
+      for (let probe = resumeIndex; probe < lines.length; probe++) {
+        const candidate = lines[probe]
+        if (!candidate.startsWith('#') && candidate.trim().length > 0) {
+          resumeSegmentExtension = inferSegmentExtension(candidate)
+          break
+        }
+      }
+
       // Insert the resume PDT before continuing with content segments
       if (resumePDT) {
+        let needsDiscontinuity = false
+
+        if (adExtension && firstContentExtension && adExtension !== firstContentExtension) {
+          needsDiscontinuity = true
+          console.log(`ℹ️  Detected segment container change from ${firstContentExtension} to ${adExtension} (pre-ad)`)
+        }
+
+        if (adExtension && resumeSegmentExtension && adExtension !== resumeSegmentExtension) {
+          needsDiscontinuity = true
+          console.log(`ℹ️  Detected segment container change from ad (${adExtension}) to content (${resumeSegmentExtension})`)
+        }
+
+        const resumeDate = new Date(resumePDT)
+        if (!Number.isNaN(resumeDate.getTime()) && !Number.isNaN(startDate.getTime())) {
+          const expectedResume = startDate.getTime() + skippedDuration * 1000
+          const delta = Math.abs(resumeDate.getTime() - expectedResume)
+          if (delta > 500) {
+            console.warn(`⚠️  PROGRAM-DATE-TIME continuity delta ${delta}ms exceeds tolerance, inserting DISCONTINUITY`)
+            needsDiscontinuity = true
+          }
+        } else {
+          console.warn(`⚠️  Unable to evaluate PDT continuity (start=${startPDT}, resume=${resumePDT})`)
+        }
+
+        if (needsDiscontinuity) {
+          output.push('#EXT-X-DISCONTINUITY')
+        }
+
+        for (const adLine of adLines) {
+          output.push(adLine)
+        }
+
+        if (needsDiscontinuity) {
+          output.push('#EXT-X-DISCONTINUITY')
+        }
+
         // Use the ACTUAL PDT from origin - this preserves timeline continuity
         output.push(`#EXT-X-PROGRAM-DATE-TIME:${resumePDT}`)
         console.log(`✅ Inserted origin resume PDT: ${resumePDT} (start: ${startPDT}, skipped: ${skippedDuration.toFixed(2)}s, ad: ${adDuration.toFixed(2)}s)`)
@@ -372,7 +791,9 @@ export function replaceSegmentsWithAds(
   return {
     manifest: output.join("\n"),
     segmentsSkipped: segmentsReplaced,
-    durationSkipped: actualSkippedDuration
+    durationSkipped: actualSkippedDuration,
+    boundary: boundaryInfo,
+    requestedCut
   }
 }
 
