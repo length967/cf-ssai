@@ -1,10 +1,11 @@
 import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, extractPDTs, extractBitrates } from "./utils/hls"
 import { signPath } from "./utils/sign"
-import { parseSCTE35FromManifest, isAdBreakStart, getBreakDuration, findActiveBreak, validateSCTE35Signal } from "./utils/scte35"
+import { getBreakDuration, validateSCTE35Signal } from "./utils/scte35"
+import { createTransportStreamState, ingestTransportStreamSegment, type TransportStreamState } from "./utils/scte35-transport"
 import { getChannelConfig } from "./utils/channel-config"
 import type { ChannelConfig } from "./utils/channel-config"
 import type { Env } from "./manifest-worker"
-import type { DecisionResponse, BeaconMessage, SCTE35Signal } from "./types"
+import type { DecisionResponse, BeaconMessage, SCTE35Signal, Scte35Event } from "./types"
 
 // ============================================================================
 // CONFIGURATION CONSTANTS
@@ -22,6 +23,15 @@ const DECISION_TTL_MS = 30 * 1000
  * Used to detect bugs where concurrent requests produce different skip counts.
  */
 const SKIP_COUNT_RECALC_COUNTER_KEY = 'skip_count_recalc_attempts'
+
+type VariantTransportState = {
+  stream: TransportStreamState
+  processedSequences: Set<number>
+  seenEventSignatures: Set<string>
+  recentEvents: Scte35Event[]
+  activeEvent: Scte35Event | null
+  lastSequence?: number
+}
 
 // ============================================================================
 // Live ad state persisted per channel
@@ -210,6 +220,70 @@ function stripOriginSCTE35Markers(manifest: string): string {
   return filtered.join('\n')
 }
 
+function buildVariantManifestUrl(originUrl: string, variant: string): string {
+  let baseUrl = originUrl
+  if (baseUrl.endsWith('.m3u8') || baseUrl.endsWith('.isml/.m3u8')) {
+    const lastSlash = baseUrl.lastIndexOf('/')
+    if (lastSlash > 0) {
+      baseUrl = baseUrl.substring(0, lastSlash)
+    }
+  }
+
+  return `${baseUrl}/${variant}`
+}
+
+function parseSegmentPlaylist(manifest: string): Array<{ sequence: number; uri: string }> {
+  const lines = manifest.split('\n')
+  const segments: Array<{ sequence: number; uri: string }> = []
+  let sequenceCursor = 0
+
+  for (const raw of lines) {
+    const line = raw.trim()
+    if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+      const value = parseInt(line.split(':')[1] || '0', 10)
+      if (!Number.isNaN(value)) {
+        sequenceCursor = value
+      }
+      continue
+    }
+
+    if (!line || line.startsWith('#')) {
+      continue
+    }
+
+    segments.push({ sequence: sequenceCursor, uri: line })
+    sequenceCursor += 1
+  }
+
+  return segments
+}
+
+function resolveSegmentUrl(manifestUrl: string, segmentUri: string): string {
+  try {
+    return new URL(segmentUri, manifestUrl).toString()
+  } catch {
+    return segmentUri
+  }
+}
+
+function eventToLegacySignal(event: Scte35Event): SCTE35Signal {
+  return {
+    id: event.id,
+    type: event.type === 'OUT' ? 'splice_insert' : 'return_signal',
+    pts: event.pts90k,
+    duration: event.breakDuration90k !== undefined ? event.breakDuration90k / 90000 : undefined,
+    breakDuration: event.breakDuration90k !== undefined ? event.breakDuration90k / 90000 : undefined,
+    pts90k: event.pts90k,
+    breakDuration90k: event.breakDuration90k,
+    rawHex: event.rawHex,
+    binaryData: {
+      spliceEventId: event.spliceEventId,
+      crcValid: event.crcValid,
+      tier: event.tier,
+    }
+  }
+}
+
 // -----------------------------------------------------------------------------
 // Helper: fetch origin or return fallback variant
 // -----------------------------------------------------------------------------
@@ -218,19 +292,7 @@ async function fetchOriginVariant(originUrl: string, channel: string, variant: s
   // This handles both formats:
   // - Base path: https://origin.com/path/to/stream
   // - Full master manifest: https://origin.com/path/to/stream/.m3u8
-  let baseUrl = originUrl
-  if (baseUrl.endsWith('.m3u8') || baseUrl.endsWith('.isml/.m3u8')) {
-    // Remove the manifest filename to get base path
-    const lastSlash = baseUrl.lastIndexOf('/')
-    if (lastSlash > 0) {
-      baseUrl = baseUrl.substring(0, lastSlash)
-    }
-  }
-  
-  // Construct the full URL for the requested variant
-  // NOTE: Don't use encodeURIComponent() - the = signs are part of the filename!
-  // Unified Streaming format: scte35-audio_eng=64000-video=500000.m3u8
-  const u = `${baseUrl}/${variant}`
+  const u = buildVariantManifestUrl(originUrl, variant)
   console.log(`Fetching origin variant: ${u}`)
   
   try {
@@ -499,10 +561,12 @@ async function signAdPlaylist(signHost: string, segmentSecret: string, playlistP
 export class ChannelDO {
   state: DurableObjectState
   env: Env
+  private transportStates: Map<string, VariantTransportState>
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state
     this.env = env
+    this.transportStates = new Map()
   }
   
   /**
@@ -665,6 +729,107 @@ export class ChannelDO {
     }
   }
 
+  private async ingestTransportCues(
+    originUrl: string,
+    channelId: string,
+    variant: string,
+    manifest: string
+  ): Promise<{ activeEvent: Scte35Event | null; events: Scte35Event[] }> {
+    if (!manifest.includes('#EXTINF')) {
+      return { activeEvent: null, events: [] }
+    }
+
+    const key = `${channelId}:${variant}`
+    let state = this.transportStates.get(key)
+
+    if (!state) {
+      state = {
+        stream: createTransportStreamState(),
+        processedSequences: new Set(),
+        seenEventSignatures: new Set(),
+        recentEvents: [],
+        activeEvent: null,
+      }
+      this.transportStates.set(key, state)
+    }
+
+    const manifestUrl = buildVariantManifestUrl(originUrl, variant)
+    const segments = parseSegmentPlaylist(manifest)
+
+    if (segments.length === 0) {
+      return { activeEvent: state.activeEvent ?? null, events: [...state.recentEvents] }
+    }
+
+    let fetched = 0
+    const maxSegments = 3
+
+    for (const segment of segments) {
+      if (state.processedSequences.has(segment.sequence)) {
+        continue
+      }
+
+      if (state.lastSequence !== undefined && segment.sequence <= state.lastSequence) {
+        state.processedSequences.add(segment.sequence)
+        continue
+      }
+
+      if (fetched >= maxSegments) {
+        break
+      }
+
+      const segmentUrl = resolveSegmentUrl(manifestUrl, segment.uri)
+
+      try {
+        const response = await fetchWithRetry(segmentUrl, 2)
+        if (!response.ok) {
+          console.warn(`SCTE-35 ingest: segment fetch failed ${response.status} ${segmentUrl}`)
+          continue
+        }
+
+        const bytes = new Uint8Array(await response.arrayBuffer())
+        const { events } = ingestTransportStreamSegment(bytes, state.stream)
+
+        fetched += 1
+
+        for (const event of events) {
+          const signature = `${event.id}:${event.pts90k}:${event.type}`
+          if (state.seenEventSignatures.has(signature)) {
+            continue
+          }
+
+          state.seenEventSignatures.add(signature)
+          state.recentEvents.push(event)
+          if (state.recentEvents.length > 20) {
+            state.recentEvents.shift()
+          }
+
+          if (event.type === 'OUT') {
+            state.activeEvent = event
+          } else if (event.type === 'IN' && state.activeEvent && state.activeEvent.id === event.id) {
+            state.activeEvent = null
+          }
+        }
+      } catch (err) {
+        console.warn(`SCTE-35 ingest: error fetching ${segmentUrl}`, err)
+      } finally {
+        state.processedSequences.add(segment.sequence)
+        state.lastSequence = state.lastSequence === undefined
+          ? segment.sequence
+          : Math.max(state.lastSequence, segment.sequence)
+        if (state.lastSequence !== undefined && state.processedSequences.size > 256) {
+          const threshold = state.lastSequence - 256
+          for (const seq of Array.from(state.processedSequences)) {
+            if (seq < threshold) {
+              state.processedSequences.delete(seq)
+            }
+          }
+        }
+      }
+    }
+
+    return { activeEvent: state.activeEvent ?? null, events: [...state.recentEvents] }
+  }
+
   async fetch(req: Request): Promise<Response> {
     // CRITICAL FIX: Load ad state version before blocking to detect mid-request changes
     const initialAdStateVersion = await this.state.storage.get<number>('ad_state_version') || 0
@@ -801,45 +966,38 @@ export class ChannelDO {
         console.log(`Ad state version changed during request (${initialAdStateVersion} -> ${currentAdStateVersion}), using latest state`)
       }
 
-      // Parse SCTE-35 signals from origin manifest (with enhanced binary parsing)
-      const scte35Signals = parseSCTE35FromManifest(origin)
-      let activeBreak = findActiveBreak(scte35Signals)
+      const transportIngest = await this.ingestTransportCues(originUrl, channel, variant, origin)
+      if (transportIngest.events.length > 0) {
+        console.log(`SCTE-35 ingest: cached ${transportIngest.events.length} transport cues for ${channel}/${variant}`)
+      }
 
-      if (scte35Signals.length > 0) {
-        console.log(`Found ${scte35Signals.length} SCTE-35 signals`)
+      let activeBreakEvent = transportIngest.activeEvent
+      let activeBreak: SCTE35Signal | null = activeBreakEvent ? eventToLegacySignal(activeBreakEvent) : null
 
-        if (activeBreak) {
-          // CRITICAL: Validate SCTE-35 signal before using it
-          // Extract PDT for temporal validation (using request-scoped cache)
-          const pdts = getCachedPDTs(origin)
-          const mostRecentPDT = pdts.length > 0 ? pdts[pdts.length - 1] : undefined
+      if (activeBreak) {
+        const pdts = getCachedPDTs(origin)
+        const mostRecentPDT = pdts.length > 0 ? pdts[pdts.length - 1] : undefined
+        const validation = validateSCTE35Signal(activeBreak, mostRecentPDT)
 
-          const validation = validateSCTE35Signal(activeBreak, mostRecentPDT)
+        if (!validation.valid) {
+          console.error(`❌ SCTE-35 Validation FAILED for signal ${activeBreak.id}:`)
+          validation.errors.forEach(err => console.error(`   - ${err}`))
+          activeBreak = null
+          activeBreakEvent = null
+          console.log(`⚠️  Rejecting invalid SCTE-35 signal to prevent playback issues`)
+        } else {
+          if (validation.warnings.length > 0) {
+            console.warn(`⚠️  SCTE-35 Validation warnings for signal ${activeBreak.id}:`)
+            validation.warnings.forEach(warn => console.warn(`   - ${warn}`))
+          }
 
-          // Log validation results
-          if (!validation.valid) {
-            console.error(`❌ SCTE-35 Validation FAILED for signal ${activeBreak.id}:`)
-            validation.errors.forEach(err => console.error(`   - ${err}`))
-
-            // Reject invalid signal - do not attempt ad insertion
-            activeBreak = null
-            console.log(`⚠️  Rejecting invalid SCTE-35 signal to prevent playback issues`)
+          if (activeBreak.binaryData) {
+            console.log(`✅ SCTE-35 Binary Parsing: Event ID=${activeBreak.binaryData.spliceEventId}, ` +
+              `PTS=${activeBreak.pts ? `${activeBreak.pts} (${(activeBreak.pts / 90000).toFixed(3)}s)` : 'N/A'}, ` +
+              `CRC Valid=${activeBreak.binaryData.crcValid}, ` +
+              `Duration=${activeBreak.duration}s`)
           } else {
-            // Log warnings but allow signal through
-            if (validation.warnings.length > 0) {
-              console.warn(`⚠️  SCTE-35 Validation warnings for signal ${activeBreak.id}:`)
-              validation.warnings.forEach(warn => console.warn(`   - ${warn}`))
-            }
-
-            // Log enhanced binary data if available
-            if (activeBreak.binaryData) {
-              console.log(`✅ SCTE-35 Binary Parsing: Event ID=${activeBreak.binaryData.spliceEventId}, ` +
-                `PTS=${activeBreak.pts ? `${activeBreak.pts} (${(activeBreak.pts / 90000).toFixed(3)}s)` : 'N/A'}, ` +
-                `CRC Valid=${activeBreak.binaryData.crcValid}, ` +
-                `Duration=${activeBreak.duration}s`)
-            } else {
-              console.log(`✅ SCTE-35 Attribute Parsing: ${activeBreak.id} (${activeBreak.duration}s)`)
-            }
+            console.log(`✅ SCTE-35 transport cue accepted: ${activeBreak.id} (${activeBreak.duration}s)`)
           }
         }
       }

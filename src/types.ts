@@ -68,6 +68,24 @@ export type ViewerJWT = {
   }
 
   // SCTE-35 Signal Types
+  export type Scte35SpliceType = "OUT" | "IN"
+
+  export interface Scte35Event {
+    id: string
+    type: Scte35SpliceType
+    pts90k: number
+    breakDuration90k?: number
+    rawHex: string
+    continuityCounter: number
+    crcValid: boolean
+    recvAtMs: number
+    tier?: number
+    segmentationTypeId?: number
+    segmentationTypeName?: string
+    spliceEventId?: number
+    segmentationEventId?: number
+  }
+
   export type SCTE35SignalType = "splice_insert" | "time_signal" | "return_signal"
   
   export type SCTE35SegmentationType = 
@@ -91,6 +109,9 @@ export type ViewerJWT = {
     autoReturn?: boolean
     segmentNum?: number
     segmentsExpected?: number
+    rawHex?: string
+    pts90k?: number
+    breakDuration90k?: number
     // Enhanced binary data (when parsed from SCTE35-CMD)
     binaryData?: {
       spliceEventId?: number
@@ -98,6 +119,7 @@ export type ViewerJWT = {
       ptsAdjustment?: bigint
       crcValid?: boolean
       segmentationDescriptors?: any[]  // Full segmentation descriptor data
+      tier?: number
       deliveryRestrictions?: {
         webAllowed?: boolean
         noRegionalBlackout?: boolean
