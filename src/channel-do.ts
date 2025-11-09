@@ -2,6 +2,7 @@ import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, 
 import { signPath } from "./utils/sign"
 import { getBreakDuration, validateSCTE35Signal } from "./utils/scte35"
 import { createTransportStreamState, ingestTransportStreamSegment, type TransportStreamState } from "./utils/scte35-transport"
+import { addPtsPdtSample, predictPtsToIso, type PtsPdtMapping } from "./utils/pts-pdt-map"
 import { getChannelConfig } from "./utils/channel-config"
 import type { ChannelConfig } from "./utils/channel-config"
 import type { Env } from "./manifest-worker"
@@ -31,6 +32,8 @@ type VariantTransportState = {
   recentEvents: Scte35Event[]
   activeEvent: Scte35Event | null
   lastSequence?: number
+  ptsPdtMap?: PtsPdtMapping
+  lastDriftMs?: number
 }
 
 // ============================================================================
@@ -577,10 +580,14 @@ function buildVariantManifestUrl(originUrl: string, variant: string): string {
   return `${baseUrl}/${variant}`
 }
 
-function parseSegmentPlaylist(manifest: string): Array<{ sequence: number; uri: string }> {
+function parseSegmentPlaylist(manifest: string): Array<{ sequence: number; uri: string; pdtMs?: number; durationSec?: number; discontinuity?: boolean }> {
   const lines = manifest.split('\n')
-  const segments: Array<{ sequence: number; uri: string }> = []
+  const segments: Array<{ sequence: number; uri: string; pdtMs?: number; durationSec?: number; discontinuity?: boolean }> = []
   let sequenceCursor = 0
+  let pendingDuration: number | undefined
+  let pendingPdtMs: number | undefined
+  let runningPdtMs: number | undefined
+  let discontinuity = false
 
   for (const raw of lines) {
     const line = raw.trim()
@@ -592,12 +599,60 @@ function parseSegmentPlaylist(manifest: string): Array<{ sequence: number; uri: 
       continue
     }
 
+    if (line.startsWith('#EXT-X-PROGRAM-DATE-TIME:')) {
+      const value = line.split(':')[1]
+      if (value) {
+        const parsed = Date.parse(value)
+        if (!Number.isNaN(parsed)) {
+          pendingPdtMs = parsed
+          runningPdtMs = parsed
+        }
+      }
+      continue
+    }
+
+    if (line.startsWith('#EXTINF:')) {
+      const value = line.split(':')[1]
+      if (value) {
+        const duration = parseFloat(value)
+        if (!Number.isNaN(duration)) {
+          pendingDuration = duration
+        }
+      }
+      continue
+    }
+
+    if (line.startsWith('#EXT-X-DISCONTINUITY')) {
+      discontinuity = true
+      continue
+    }
+
     if (!line || line.startsWith('#')) {
       continue
     }
 
-    segments.push({ sequence: sequenceCursor, uri: line })
+    const segmentPdt = pendingPdtMs ?? runningPdtMs
+    segments.push({
+      sequence: sequenceCursor,
+      uri: line,
+      pdtMs: segmentPdt,
+      durationSec: pendingDuration,
+      discontinuity,
+    })
     sequenceCursor += 1
+
+    if (segmentPdt !== undefined && pendingDuration !== undefined) {
+      runningPdtMs = segmentPdt + pendingDuration * 1000
+      pendingPdtMs = runningPdtMs
+    } else if (runningPdtMs !== undefined && pendingDuration !== undefined) {
+      runningPdtMs += pendingDuration * 1000
+      pendingPdtMs = runningPdtMs
+    } else if (pendingPdtMs !== undefined) {
+      runningPdtMs = pendingPdtMs
+    }
+
+    pendingDuration = undefined
+    discontinuity = false
   }
 
   return segments
@@ -1270,6 +1325,8 @@ export class ChannelDO {
         seenEventSignatures: new Set(),
         recentEvents: [],
         activeEvent: null,
+        ptsPdtMap: undefined,
+        lastDriftMs: undefined,
       }
       this.transportStates.set(key, state)
     }
@@ -1294,6 +1351,14 @@ export class ChannelDO {
         continue
       }
 
+      if (segment.discontinuity) {
+        if (state.ptsPdtMap) {
+          console.log(`PTS↔PDT mapper reset due to discontinuity on sequence ${segment.sequence}`)
+        }
+        state.ptsPdtMap = undefined
+        state.lastDriftMs = undefined
+      }
+
       if (fetched >= maxSegments) {
         break
       }
@@ -1308,7 +1373,7 @@ export class ChannelDO {
         }
 
         const bytes = new Uint8Array(await response.arrayBuffer())
-        const { events } = ingestTransportStreamSegment(bytes, state.stream)
+        const { events, videoPts } = ingestTransportStreamSegment(bytes, state.stream)
 
         fetched += 1
 
@@ -1328,6 +1393,15 @@ export class ChannelDO {
             state.activeEvent = event
           } else if (event.type === 'IN' && state.activeEvent && state.activeEvent.id === event.id) {
             state.activeEvent = null
+          }
+        }
+
+        if (segment.pdtMs !== undefined && videoPts.length > 0) {
+          const updated = addPtsPdtSample(state.ptsPdtMap, { pts90k: videoPts[0], pdtMs: segment.pdtMs })
+          state.ptsPdtMap = updated
+          if (updated.lastDriftMs !== undefined) {
+            state.lastDriftMs = updated.lastDriftMs
+            console.log(`PTS↔PDT mapper updated drift=${updated.lastDriftMs.toFixed(2)}ms slope=${updated.slopeMsPerTick.toFixed(6)}`)
           }
         }
       } catch (err) {
@@ -1557,6 +1631,8 @@ export class ChannelDO {
 
       let activeBreakEvent = transportIngest.activeEvent
       let activeBreak: SCTE35Signal | null = activeBreakEvent ? eventToLegacySignal(activeBreakEvent) : null
+      const transportKey = `${channel}:${variant}`
+      const variantTransportState = this.transportStates.get(transportKey)
 
       if (activeBreak) {
         const pdts = getCachedPDTs(origin)
@@ -1662,9 +1738,21 @@ export class ChannelDO {
           adSource = "scte35"
           
           // Find the PDT timestamp for the break (using request-scoped cache)
-          const pdts = getCachedPDTs(origin)
-          if (pdts.length > 0) {
-            scte35StartPDT = pdts[pdts.length - 1]  // Use most recent PDT near signal
+          if (variantTransportState?.ptsPdtMap && activeBreakEvent) {
+            const predicted = predictPtsToIso(variantTransportState.ptsPdtMap, activeBreakEvent.pts90k)
+            if (predicted) {
+              scte35StartPDT = predicted
+              if (variantTransportState.lastDriftMs !== undefined) {
+                console.log(`PTS↔PDT prediction drift=${variantTransportState.lastDriftMs.toFixed(2)}ms for event ${activeBreakEvent.id}`)
+              }
+            }
+          }
+
+          if (!scte35StartPDT) {
+            const pdts = getCachedPDTs(origin)
+            if (pdts.length > 0) {
+              scte35StartPDT = pdts[pdts.length - 1]  // Fallback to manifest PDT when mapper unavailable
+            }
           }
 
           // DEDUPLICATION: Check if we've already processed this SCTE-35 signal

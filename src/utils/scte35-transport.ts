@@ -5,6 +5,8 @@ const TS_PACKET_SIZE = 188
 const SYNC_BYTE = 0x47
 const PAT_PID = 0x0000
 const STREAM_TYPE_SCTE35 = 0x86
+const STREAM_TYPE_H264 = 0x1b
+const STREAM_TYPE_H265 = 0x24
 
 interface SectionAssembler {
   buffer: Uint8Array
@@ -16,23 +18,28 @@ export interface TransportStreamState {
   programNumber?: number
   pmtPid?: number
   sctePid?: number
+  videoPids: Set<number>
   continuityCounters: Map<number, number>
   assembler: SectionAssembler
+  lastVideoPts: Map<number, number>
 }
 
 export function createTransportStreamState(): TransportStreamState {
   return {
+    videoPids: new Set(),
     continuityCounters: new Map(),
-    assembler: { buffer: new Uint8Array(0) }
+    assembler: { buffer: new Uint8Array(0) },
+    lastVideoPts: new Map(),
   }
 }
 
 export function ingestTransportStreamSegment(
   segment: Uint8Array | ArrayBuffer,
   state: TransportStreamState
-): { events: Scte35Event[] } {
+): { events: Scte35Event[]; videoPts: number[] } {
   const data = segment instanceof Uint8Array ? segment : new Uint8Array(segment)
   const events: Scte35Event[] = []
+  const videoPts: number[] = []
 
   for (let offset = 0; offset + TS_PACKET_SIZE <= data.length; offset += TS_PACKET_SIZE) {
     const packet = data.subarray(offset, offset + TS_PACKET_SIZE)
@@ -63,13 +70,26 @@ export function ingestTransportStreamSegment(
       continue
     }
 
+    if (payloadUnitStartIndicator && state.videoPids.has(pid)) {
+      const pts = parseVideoPts(payload)
+      if (pts !== null) {
+        const previousPts = state.lastVideoPts.get(pid)
+        if (previousPts !== pts) {
+          state.lastVideoPts.set(pid, pts)
+          if (videoPts.length === 0) {
+            videoPts.push(pts)
+          }
+        }
+      }
+    }
+
     if (state.sctePid !== undefined && pid === state.sctePid) {
       const newEvents = parseSctePayload(payload, payloadUnitStartIndicator, continuityCounter, state)
       events.push(...newEvents)
     }
   }
 
-  return { events }
+  return { events, videoPts }
 }
 
 function extractPayload(packet: Uint8Array, adaptationFieldControl: number): Uint8Array | null {
@@ -162,6 +182,11 @@ function parsePmt(payload: Uint8Array, payloadUnitStartIndicator: boolean, state
         console.log(`SCTE-35 ingest: SCTE PID discovered -> 0x${elementaryPid.toString(16)}`)
       }
       state.sctePid = elementaryPid
+    } else if (streamType === STREAM_TYPE_H264 || streamType === STREAM_TYPE_H265) {
+      if (!state.videoPids.has(elementaryPid)) {
+        state.videoPids.add(elementaryPid)
+        console.log(`SCTE-35 ingest: video PID discovered -> 0x${elementaryPid.toString(16)}`)
+      }
     }
   }
 }
@@ -244,6 +269,47 @@ function concatBuffers(a: Uint8Array, b: Uint8Array): Uint8Array {
   out.set(a)
   out.set(b, a.length)
   return out
+}
+
+function parseVideoPts(payload: Uint8Array): number | null {
+  if (payload.length < 9) {
+    return null
+  }
+
+  if (!(payload[0] === 0x00 && payload[1] === 0x00 && payload[2] === 0x01)) {
+    return null
+  }
+
+  const ptsDtsFlags = (payload[7] >> 6) & 0x03
+  const headerLength = payload[8]
+
+  if ((ptsDtsFlags & 0x02) === 0) {
+    return null
+  }
+
+  if (headerLength < 5) {
+    return null
+  }
+
+  const ptsStart = 9
+  if (ptsStart + headerLength > payload.length || ptsStart + 5 > payload.length) {
+    return null
+  }
+
+  const b0 = payload[ptsStart]
+  const b1 = payload[ptsStart + 1]
+  const b2 = payload[ptsStart + 2]
+  const b3 = payload[ptsStart + 3]
+  const b4 = payload[ptsStart + 4]
+
+  const pts =
+    ((b0 & 0x0e) << 29) |
+    ((b1 & 0xff) << 22) |
+    ((b2 & 0xfe) << 14) |
+    ((b3 & 0xff) << 7) |
+    ((b4 & 0xfe) >> 1)
+
+  return pts
 }
 
 function buildEventFromSection(section: Uint8Array, continuityCounter: number): Scte35Event | null {
