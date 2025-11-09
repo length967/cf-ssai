@@ -34,6 +34,7 @@ type VariantTransportState = {
   lastSequence?: number
   ptsPdtMap?: PtsPdtMapping
   lastDriftMs?: number
+  idrTimeline: Map<number, number>
 }
 
 // ============================================================================
@@ -1138,11 +1139,81 @@ export class ChannelDO {
   state: DurableObjectState
   env: Env
   private transportStates: Map<string, VariantTransportState>
+  private variantKey(channelId: string, variant: string): string {
+    return `${channelId}:${variant}`
+  }
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state
     this.env = env
     this.transportStates = new Map()
+  }
+
+  private getPtsPdtMap(channelId: string, variant: string): PtsPdtMapping | undefined {
+    const key = this.variantKey(channelId, variant)
+    return this.transportStates.get(key)?.ptsPdtMap
+  }
+
+  private updateIdrTimeline(
+    channelOrKey: string,
+    variantOrSequence: string | number,
+    maybeSequenceOrPts?: number | number[],
+    maybePtsList?: number[]
+  ): void {
+    let key: string | undefined
+    let sequence: number | undefined
+    let ptsList: number[] | undefined
+
+    if (typeof variantOrSequence === "string") {
+      key = this.variantKey(channelOrKey, variantOrSequence)
+      if (typeof maybeSequenceOrPts === "number" && Array.isArray(maybePtsList)) {
+        sequence = maybeSequenceOrPts
+        ptsList = maybePtsList
+      } else if (Array.isArray(maybeSequenceOrPts)) {
+        ptsList = maybeSequenceOrPts
+      }
+    } else {
+      key = channelOrKey
+      if (typeof variantOrSequence === "number" && Array.isArray(maybeSequenceOrPts)) {
+        sequence = variantOrSequence
+        ptsList = maybeSequenceOrPts
+      }
+    }
+
+    if (!key || !Array.isArray(ptsList) || ptsList.length === 0) {
+      return
+    }
+
+    const pts90k = ptsList.find(value => Number.isFinite(value))
+    if (pts90k === undefined) {
+      return
+    }
+
+    const state = this.transportStates.get(key)
+    if (!state) {
+      return
+    }
+
+    if (!(state.idrTimeline instanceof Map)) {
+      state.idrTimeline = new Map()
+    }
+
+    const sequenceNumber = typeof sequence === "number" && Number.isFinite(sequence)
+      ? sequence
+      : state.lastSequence !== undefined
+        ? state.lastSequence + 1
+        : 0
+
+    state.idrTimeline.set(sequenceNumber, pts90k)
+
+    if (state.idrTimeline.size > 512) {
+      const cutoff = sequenceNumber - 256
+      for (const seq of state.idrTimeline.keys()) {
+        if (seq < cutoff) {
+          state.idrTimeline.delete(seq)
+        }
+      }
+    }
   }
   
   /**
@@ -1315,7 +1386,7 @@ export class ChannelDO {
       return { activeEvent: null, events: [] }
     }
 
-    const key = `${channelId}:${variant}`
+    const key = this.variantKey(channelId, variant)
     let state = this.transportStates.get(key)
 
     if (!state) {
@@ -1327,6 +1398,7 @@ export class ChannelDO {
         activeEvent: null,
         ptsPdtMap: undefined,
         lastDriftMs: undefined,
+        idrTimeline: new Map(),
       }
       this.transportStates.set(key, state)
     }
@@ -1394,6 +1466,10 @@ export class ChannelDO {
           } else if (event.type === 'IN' && state.activeEvent && state.activeEvent.id === event.id) {
             state.activeEvent = null
           }
+        }
+
+        if (videoPts.length > 0) {
+          this.updateIdrTimeline(channelId, variant, segment.sequence, videoPts)
         }
 
         if (segment.pdtMs !== undefined && videoPts.length > 0) {
@@ -1633,6 +1709,7 @@ export class ChannelDO {
       let activeBreak: SCTE35Signal | null = activeBreakEvent ? eventToLegacySignal(activeBreakEvent) : null
       const transportKey = `${channel}:${variant}`
       const variantTransportState = this.transportStates.get(transportKey)
+      const ptsPdtMap = this.getPtsPdtMap(channel, variant)
 
       if (activeBreak) {
         const pdts = getCachedPDTs(origin)
@@ -1738,11 +1815,11 @@ export class ChannelDO {
           adSource = "scte35"
           
           // Find the PDT timestamp for the break (using request-scoped cache)
-          if (variantTransportState?.ptsPdtMap && activeBreakEvent) {
-            const predicted = predictPtsToIso(variantTransportState.ptsPdtMap, activeBreakEvent.pts90k)
+          if (ptsPdtMap && activeBreakEvent) {
+            const predicted = predictPtsToIso(ptsPdtMap, activeBreakEvent.pts90k)
             if (predicted) {
               scte35StartPDT = predicted
-              if (variantTransportState.lastDriftMs !== undefined) {
+              if (variantTransportState?.lastDriftMs !== undefined) {
                 console.log(`PTS↔PDT prediction drift=${variantTransportState.lastDriftMs.toFixed(2)}ms for event ${activeBreakEvent.id}`)
               }
             }
