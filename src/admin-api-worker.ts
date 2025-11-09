@@ -267,10 +267,12 @@ class AdminAPI {
         console.warn('Failed to parse org channel bitrate_ladder')
       }
     }
-    
+
     // Priority 3: Fallback to sensible defaults for common streaming
     console.log('⚠️  Using default bitrate ladder (no channel-specific configuration found)')
-    return [800, 1600, 2400, 3600] // Balanced ladder covering mobile to 4K
+    // Include audio-only variants for streams that may have audio-only renditions
+    // These will be auto-detected as audio-only by FFmpeg (<= 256kbps threshold)
+    return [64, 128, 256, 800, 1600, 2400, 3600] // Audio-only + video variants
   }
   
   private corsHeaders(): Record<string, string> {

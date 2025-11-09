@@ -5,12 +5,12 @@ import { strict as assert } from "node:assert"
 import { test, describe } from "node:test"
 import {
   insertDiscontinuity,
-  addDaterangeInterstitial,
+  injectInterstitialCues,
   replaceSegmentsWithAds
-} from "../src/utils/hls"
-import { parseSCTE35FromManifest } from "../src/utils/scte35"
-import { signPath } from "../src/utils/sign"
-import { parseJWTUnsafe } from "../src/utils/jwt"
+} from "../src/utils/hls.ts"
+import { parseSCTE35FromManifest } from "../src/utils/scte35.ts"
+import { signPath } from "../src/utils/sign.ts"
+import { parseJWTUnsafe } from "../src/utils/jwt.ts"
 
 describe("Malformed Input Handling", () => {
   test("Handles null manifest", () => {
@@ -209,9 +209,9 @@ describe("Edge Case Data Scenarios", () => {
 seg_1.m4s`
     
     const result = replaceSegmentsWithAds(manifest, "2025-10-31T10:00:00Z", [], 30)
-    
-    // Should not crash
-    assert.ok(result)
+
+    // Should not crash and should return manifest
+    assert.ok(result.manifest.includes("seg_1.m4s"))
   })
 
   test("Handles PDT that doesn't exist in manifest", () => {
@@ -220,15 +220,15 @@ seg_1.m4s`
 #EXTINF:4.0,
 seg_1.m4s`
     
-    const result = replaceSegmentsWithAds(
+    const { manifest: updatedManifest } = replaceSegmentsWithAds(
       manifest,
       "2025-10-31T12:00:00Z",  // Non-existent PDT
       ["https://ads.example.com/seg1.m4s"],
       30
     )
-    
+
     // Should handle gracefully
-    assert.ok(result)
+    assert.equal(result.segmentsSkipped, 0)
   })
 
   test("Handles negative duration", () => {
@@ -259,13 +259,12 @@ seg_1.m4s`
     const longUrl = "https://example.com/" + "x".repeat(10000) + ".m3u8"
     const manifest = `#EXTM3U\n#EXT-X-VERSION:7\n#EXTINF:4.0,\nseg_1.m4s`
     
-    const result = addDaterangeInterstitial(
-      manifest,
-      "ad-1",
-      "2025-10-31T10:00:00Z",
-      30,
-      longUrl
-    )
+    const result = injectInterstitialCues(manifest, {
+      id: "ad-1",
+      startDateISO: "2025-10-31T10:00:00Z",
+      durationSec: 30,
+      assetURI: longUrl
+    })
     
     assert.ok(result.includes(longUrl))
   })
@@ -422,13 +421,12 @@ seg_1.m4s`
     const maliciousUrl = "https://example.com/../../etc/passwd"
     const manifest = `#EXTM3U\n#EXT-X-VERSION:7\n#EXTINF:4.0,\nseg_1.m4s`
     
-    const result = addDaterangeInterstitial(
-      manifest,
-      "ad-1",
-      "2025-10-31T10:00:00Z",
-      30,
-      maliciousUrl
-    )
+    const result = injectInterstitialCues(manifest, {
+      id: "ad-1",
+      startDateISO: "2025-10-31T10:00:00Z",
+      durationSec: 30,
+      assetURI: maliciousUrl
+    })
     
     // URL should be included as-is (validation happens elsewhere)
     assert.ok(result.includes(maliciousUrl))

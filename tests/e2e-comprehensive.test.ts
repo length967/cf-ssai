@@ -3,11 +3,19 @@
 
 import { strict as assert } from "node:assert"
 import { test, describe } from "node:test"
+import {
+  BASE_URL_MANIFEST,
+  BASE_URL_DECISION,
+  BASE_URL_VAST,
+  BASE_URL_BEACON,
+  shouldRunIntegrationTests
+} from "./test-config.ts"
 
-const BASE_URL_MANIFEST = "http://localhost:8787"
-const BASE_URL_DECISION = "http://localhost:8788"
-const BASE_URL_VAST = "http://localhost:8790"
-const BASE_URL_BEACON = "http://localhost:8789"
+// Skip all integration tests if configured
+if (!shouldRunIntegrationTests()) {
+  console.log("⊘ Skipping E2E tests (SKIP_INTEGRATION=1)")
+  process.exit(0)
+}
 
 // Sample VAST XML for comprehensive testing
 const COMPREHENSIVE_VAST_XML = `<?xml version="1.0" encoding="UTF-8"?>
