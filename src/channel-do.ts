@@ -2113,26 +2113,26 @@ export class ChannelDO {
                   // SSAI succeeded - persist skip stats ONLY on first request (when skip count is unset/zero)
                   // CRITICAL: Once set, never overwrite to ensure timeline consistency across all variants
                   if (adState && (!adState.contentSegmentsToSkip || adState.contentSegmentsToSkip === 0)) {
-                    if (sharedResult.segmentsSkipped > 0) {
-                      adState.contentSegmentsToSkip = sharedResult.plan.stableSkipCount
-                      adState.skippedDuration = sharedResult.durationSkipped
-                      adState.manifestPlan = sharedResult.plan
+                    if (result.segmentsSkipped > 0 && skipPlan) {
+                      adState.contentSegmentsToSkip = skipPlan.stableSkipCount
+                      adState.skippedDuration = result.durationSkipped
+                      adState.manifestPlan = skipPlan
                       await saveAdState(this.state, adState)
-                      console.log(`✅ Persisted stable skip count (FIRST REQUEST): ${sharedResult.plan.stableSkipCount} segments (${sharedResult.durationSkipped.toFixed(2)}s)`)
+                      console.log(`✅ Persisted stable skip count (FIRST REQUEST): ${skipPlan.stableSkipCount} segments (${result.durationSkipped.toFixed(2)}s)`)
                     } else {
                       console.log(`⚠️  Skip count is 0 (PDT not in window) - not persisting, will retry on next request`)
                     }
-                  } else if (adState) {
+                  } else if (adState && skipPlan) {
                     // TELEMETRY: Detect if recalculation produces different skip count (potential bug)
-                    if (sharedResult.segmentsSkipped > 0 && adState.contentSegmentsToSkip && sharedResult.plan.stableSkipCount !== adState.contentSegmentsToSkip) {
-                      console.warn(`🚨 TELEMETRY: Skip count mismatch detected! cached=${adState.contentSegmentsToSkip}, recalc=${sharedResult.plan.stableSkipCount}. This may indicate concurrent request inconsistency.`)
+                    if (result.segmentsSkipped > 0 && adState.contentSegmentsToSkip && skipPlan.stableSkipCount !== adState.contentSegmentsToSkip) {
+                      console.warn(`🚨 TELEMETRY: Skip count mismatch detected! cached=${adState.contentSegmentsToSkip}, recalc=${skipPlan.stableSkipCount}. This may indicate concurrent request inconsistency.`)
                     }
-                    adState.manifestPlan = sharedResult.plan
+                    adState.manifestPlan = skipPlan
                     await saveAdState(this.state, adState)
-                    console.log(`ℹ️  Using shared manifest plan with stable skip count ${sharedResult.plan.stableSkipCount}`)
+                    console.log(`ℹ️  Using shared manifest plan with stable skip count ${skipPlan.stableSkipCount}`)
                   }
 
-                  const renderedManifest = renderPlaylistModel(sharedResult.model)
+                  const renderedManifest = result.manifest
 
                   await this.env.BEACON_QUEUE.send(beaconMsg)
                   return new Response(renderedManifest, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
