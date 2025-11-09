@@ -2096,6 +2096,13 @@ export class ChannelDO {
                     const adItem = pod.items.find(item => item.bitrate === viewerBitrate) || pod.items[0]
                     const interstitialURI = await signAdPlaylist(signHost, this.env.SEGMENT_SECRET, adItem.playlistUrl)
 
+                    // Calculate resume offset: how far to skip ahead in content after ad plays
+                    // This accounts for the live stream progressing while the ad was playing
+                    const resumeOffset = skipPlan ? skipPlan.durationSkipped : 0
+                    if (resumeOffset > 0) {
+                      console.log(`📍 SGAI resume offset: ${resumeOffset.toFixed(2)}s (live stream progression during ad)`)
+                    }
+
                     const fallbackAttributes = activeBreak?.rawAttributes ? { ...activeBreak.rawAttributes } : undefined
                     const sgai = injectInterstitialCues(cleanOrigin, {
                       id: adActive ? (adState!.podId || "ad") : pod.podId,
@@ -2103,7 +2110,8 @@ export class ChannelDO {
                       durationSec: stableDuration,
                       assetURI: interstitialURI,
                       baseAttributes: fallbackAttributes,
-                      scte35Payload: activeBreak?.rawCommand
+                      scte35Payload: activeBreak?.rawCommand,
+                      resumeOffset  // Tell player to skip ahead in content to stay live
                     })
 
                     await this.env.BEACON_QUEUE.send(beaconMsg)

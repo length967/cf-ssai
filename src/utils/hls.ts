@@ -91,6 +91,7 @@ export interface InterstitialCueConfig {
   baseAttributes?: Record<string, DaterangeAttributeValue>
   cueInId?: string
   scte35Payload?: string
+  resumeOffset?: number  // Seconds to skip ahead in content timeline after ad (for live streams)
 }
 
 function formatDaterangeLine(attrs: Record<string, DaterangeAttributeValue>): string {
@@ -197,6 +198,10 @@ export function renderInterstitialCueIn(config: InterstitialCueConfig): string {
   attrs["DURATION"] = "0.000"
   if ("PLANNED-DURATION" in attrs) {
     attrs["PLANNED-DURATION"] = "0.000"
+  }
+  // Add resume offset for live streams - tells player how far to skip ahead in content
+  if (config.resumeOffset !== undefined && config.resumeOffset > 0) {
+    attrs["X-RESUME-OFFSET"] = config.resumeOffset.toFixed(3)
   }
   delete attrs["SCTE35-OUT"]
   const existing = typeof attrs["SCTE35-IN"] === "string" ? (attrs["SCTE35-IN"] as string) : undefined
