@@ -1,206 +1,521 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
-  <meta charset="UTF-8">
-  <title>SSAI Test Player</title>
-  <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-  <style>
-    body {
-      font-family: system-ui, -apple-system, sans-serif;
-      max-width: 1200px;
-      margin: 0 auto;
-      padding: 20px;
-      background: #f5f5f5;
-    }
-    h1 {
-      color: #333;
-    }
-    .container {
-      background: white;
-      padding: 20px;
-      border-radius: 8px;
-      box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-    }
-    video {
-      width: 100%;
-      max-width: 1000px;
-      background: black;
-      border-radius: 4px;
-    }
-    .controls {
-      margin: 20px 0;
-    }
-    select, button {
-      padding: 10px 15px;
-      margin: 5px;
-      font-size: 14px;
-      border: 1px solid #ddd;
-      border-radius: 4px;
-      cursor: pointer;
-    }
-    button {
-      background: #0066cc;
-      color: white;
-      border: none;
-    }
-    button:hover {
-      background: #0052a3;
-    }
-    .stats {
-      margin-top: 20px;
-      padding: 15px;
-      background: #f9f9f9;
-      border-radius: 4px;
-      font-family: monospace;
-      font-size: 12px;
-    }
-    .stats div {
-      margin: 5px 0;
-    }
-    .error {
-      color: #d32f2f;
-      padding: 10px;
-      background: #ffebee;
-      border-radius: 4px;
-      margin: 10px 0;
-    }
-    .success {
-      color: #388e3c;
-      padding: 10px;
-      background: #e8f5e9;
-      border-radius: 4px;
-      margin: 10px 0;
-    }
-  </style>
-</head>
-<body>
-  <h1>🎬 SSAI Test Player</h1>
-  
-  <div class="container">
-    <div class="controls">
-      <label for="streamUrl">Stream URL:</label><br>
-      <select id="streamUrl" style="width: 100%; max-width: 600px; margin-top: 10px;">
-        <option value="http://localhost:8787/demo/sports/v_1600k.m3u8">Master Playlist</option>
-        <option value="http://localhost:8787/demo/sports/scte35-audio_eng=128000-video=1000000.m3u8" selected>Media Playlist (1Mbps)</option>
-        <option value="http://localhost:8787/demo/sports/scte35-audio_eng=128000.m3u8">Audio Only</option>
-      </select>
-      <br>
-      <button onclick="loadStream()">Load Stream</button>
-      <button onclick="player.play()">Play</button>
-      <button onclick="player.pause()">Pause</button>
-    </div>
-
-    <video id="video" controls autoplay muted></video>
-
-    <div id="status"></div>
-
-    <div class="stats" id="stats">
-      <div><strong>HLS.js Status</strong></div>
-      <div id="hlsStatus">Not loaded</div>
-    </div>
-  </div>
-
-  <script>
-    const video = document.getElementById('video');
-    const statusDiv = document.getElementById('status');
-    const statsDiv = document.getElementById('hlsStatus');
-    let hls = null;
-
-    function showStatus(message, type = 'info') {
-      statusDiv.innerHTML = `<div class="${type}">${message}</div>`;
-      setTimeout(() => { statusDiv.innerHTML = ''; }, 5000);
-    }
-
-    function updateStats(message) {
-      const time = new Date().toLocaleTimeString();
-      statsDiv.innerHTML = `[${time}] ${message}`;
-    }
-
-    function loadStream() {
-      const url = document.getElementById('streamUrl').value;
-      
-      if (Hls.isSupported()) {
-        if (hls) {
-          hls.destroy();
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SSAI/SGAI Test Player - HLS.js</title>
+    <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
         }
 
-        hls = new Hls({
-          debug: true,
-          enableWorker: true,
-          lowLatencyMode: true
-        });
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+            background: #1a1a1a;
+            color: #e0e0e0;
+            padding: 20px;
+        }
 
-        hls.on(Hls.Events.MANIFEST_PARSED, function(event, data) {
-          updateStats(`Manifest loaded: ${data.levels.length} quality levels`);
-          showStatus('✅ Stream loaded successfully!', 'success');
-          video.play();
-        });
+        .container {
+            max-width: 1400px;
+            margin: 0 auto;
+        }
 
-        hls.on(Hls.Events.LEVEL_LOADED, function(event, data) {
-          updateStats(`Level loaded: ${data.details.totalduration}s duration, ${data.details.fragments.length} fragments`);
-        });
+        h1 {
+            color: #4CAF50;
+            margin-bottom: 10px;
+            font-size: 24px;
+        }
 
-        hls.on(Hls.Events.FRAG_LOADED, function(event, data) {
-          updateStats(`Fragment loaded: ${data.frag.sn} (${data.frag.duration.toFixed(2)}s)`);
-        });
+        .subtitle {
+            color: #888;
+            margin-bottom: 20px;
+            font-size: 14px;
+        }
 
-        hls.on(Hls.Events.ERROR, function(event, data) {
-          if (data.fatal) {
-            updateStats(`❌ FATAL ERROR: ${data.type} - ${data.details}`);
-            showStatus(`Fatal error: ${data.details}`, 'error');
-            
-            switch(data.type) {
-              case Hls.ErrorTypes.NETWORK_ERROR:
-                showStatus('Network error - retrying...', 'error');
-                hls.startLoad();
-                break;
-              case Hls.ErrorTypes.MEDIA_ERROR:
-                showStatus('Media error - recovering...', 'error');
-                hls.recoverMediaError();
-                break;
-              default:
-                showStatus('Unrecoverable error', 'error');
+        .player-section {
+            background: #2a2a2a;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        video {
+            width: 100%;
+            max-width: 100%;
+            background: #000;
+            border-radius: 4px;
+        }
+
+        .controls {
+            background: #2a2a2a;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .input-group {
+            margin-bottom: 15px;
+        }
+
+        label {
+            display: block;
+            margin-bottom: 5px;
+            color: #aaa;
+            font-size: 13px;
+            font-weight: 500;
+        }
+
+        input[type="text"] {
+            width: 100%;
+            padding: 10px;
+            background: #1a1a1a;
+            border: 1px solid #444;
+            border-radius: 4px;
+            color: #e0e0e0;
+            font-size: 14px;
+        }
+
+        input[type="text"]:focus {
+            outline: none;
+            border-color: #4CAF50;
+        }
+
+        button {
+            background: #4CAF50;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            font-weight: 500;
+            transition: background 0.2s;
+        }
+
+        button:hover {
+            background: #45a049;
+        }
+
+        button:active {
+            background: #3d8b40;
+        }
+
+        .preset-buttons {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-top: 10px;
+        }
+
+        .preset-buttons button {
+            background: #555;
+            font-size: 12px;
+            padding: 8px 16px;
+        }
+
+        .preset-buttons button:hover {
+            background: #666;
+        }
+
+        .logs {
+            background: #2a2a2a;
+            border-radius: 8px;
+            padding: 20px;
+            height: 500px;
+            overflow-y: auto;
+        }
+
+        .logs h2 {
+            margin-bottom: 15px;
+            font-size: 18px;
+            color: #4CAF50;
+        }
+
+        .log-entry {
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            padding: 6px 0;
+            border-bottom: 1px solid #333;
+        }
+
+        .log-entry:last-child {
+            border-bottom: none;
+        }
+
+        .log-time {
+            color: #888;
+            margin-right: 8px;
+        }
+
+        .log-success { color: #4CAF50; }
+        .log-error { color: #f44336; }
+        .log-warning { color: #ff9800; }
+        .log-info { color: #2196F3; }
+        .log-ad { color: #9C27B0; }
+        .log-scte { color: #FFEB3B; }
+
+        .stats {
+            background: #2a2a2a;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+        }
+
+        .stats h2 {
+            margin-bottom: 15px;
+            font-size: 18px;
+            color: #4CAF50;
+        }
+
+        .stat-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 15px;
+        }
+
+        .stat-item {
+            background: #1a1a1a;
+            padding: 12px;
+            border-radius: 4px;
+        }
+
+        .stat-label {
+            color: #888;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            margin-bottom: 5px;
+        }
+
+        .stat-value {
+            color: #e0e0e0;
+            font-size: 20px;
+            font-weight: 600;
+        }
+
+        .stat-value.active {
+            color: #4CAF50;
+        }
+
+        ::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #1a1a1a;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #555;
+            border-radius: 4px;
+        }
+
+        ::-webkit-scrollbar-thumb:hover {
+            background: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎬 SSAI/SGAI Test Player</h1>
+        <p class="subtitle">HLS.js-based player with full support for DISCONTINUITY, Interstitials, and X-RESUME-OFFSET</p>
+
+        <div class="player-section">
+            <video id="video" controls></video>
+        </div>
+
+        <div class="controls">
+            <div class="input-group">
+                <label for="streamUrl">Stream URL (use master.m3u8 for adaptive streaming)</label>
+                <input type="text" id="streamUrl" value="https://cf-ssai.mediamasters.workers.dev/demo/sports/master.m3u8">
+            </div>
+            <button onclick="loadStream()">Load Stream</button>
+
+            <div class="preset-buttons">
+                <button onclick="loadPreset('master')">Master Playlist (Adaptive)</button>
+                <button onclick="loadPreset('audio')">Audio-Only (128k)</button>
+                <button onclick="loadPreset('video-low')">Video Low (658k)</button>
+                <button onclick="loadPreset('video-high')">Video High (1316k)</button>
+            </div>
+        </div>
+
+        <div class="stats">
+            <h2>Live Stats</h2>
+            <div class="stat-grid">
+                <div class="stat-item">
+                    <div class="stat-label">Stream Status</div>
+                    <div class="stat-value" id="stat-status">Not Loaded</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Current Variant</div>
+                    <div class="stat-value" id="stat-variant">-</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Current Bitrate</div>
+                    <div class="stat-value" id="stat-bitrate">0 kbps</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Discontinuities</div>
+                    <div class="stat-value" id="stat-discontinuities">0</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">Ad Segments</div>
+                    <div class="stat-value" id="stat-ads">0</div>
+                </div>
+                <div class="stat-item">
+                    <div class="stat-label">SCTE-35 Markers</div>
+                    <div class="stat-value" id="stat-scte">0</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="logs">
+            <h2>Event Log</h2>
+            <div id="log-container"></div>
+        </div>
+    </div>
+
+    <script>
+        let hls;
+        const video = document.getElementById('video');
+        const logContainer = document.getElementById('log-container');
+
+        // Stats tracking
+        let stats = {
+            discontinuities: 0,
+            ads: 0,
+            scte: 0,
+            interstitials: 0
+        };
+
+        function log(message, type = 'info') {
+            const timestamp = new Date().toLocaleTimeString('en-US', { hour12: false });
+            const entry = document.createElement('div');
+            entry.className = 'log-entry';
+            entry.innerHTML = `<span class="log-time">[${timestamp}]</span><span class="log-${type}">${message}</span>`;
+            logContainer.insertBefore(entry, logContainer.firstChild);
+
+            // Keep only last 200 entries
+            while (logContainer.children.length > 200) {
+                logContainer.removeChild(logContainer.lastChild);
+            }
+        }
+
+        function updateStat(id, value) {
+            const el = document.getElementById(id);
+            if (el) {
+                el.textContent = value;
+                el.classList.add('active');
+                setTimeout(() => el.classList.remove('active'), 300);
+            }
+        }
+
+        function loadPreset(type) {
+            const baseUrl = 'https://cf-ssai.mediamasters.workers.dev/demo/sports/';
+            const urls = {
+                'master': baseUrl + 'master.m3u8',
+                'audio': baseUrl + 'scte35-audio_eng=128000.m3u8',
+                'video-low': baseUrl + 'scte35-audio_eng=64000-video=500000.m3u8',
+                'video-high': baseUrl + 'scte35-audio_eng=128000-video=1000000.m3u8'
+            };
+
+            const input = document.getElementById('streamUrl');
+            input.value = urls[type] || urls['master'];
+            loadStream();
+        }
+
+        function loadStream() {
+            const url = document.getElementById('streamUrl').value.trim();
+
+            if (!url) {
+                log('Please enter a stream URL', 'error');
+                return;
+            }
+
+            // Destroy existing instance
+            if (hls) {
                 hls.destroy();
-                break;
             }
-          } else {
-            updateStats(`⚠️ ${data.type}: ${data.details}`);
-          }
+
+            // Reset stats
+            stats = { discontinuities: 0, ads: 0, scte: 0, interstitials: 0 };
+            updateStat('stat-discontinuities', 0);
+            updateStat('stat-ads', 0);
+            updateStat('stat-scte', 0);
+            updateStat('stat-variant', '-');
+
+            log(`Loading stream: ${url}`, 'info');
+
+            if (Hls.isSupported()) {
+                hls = new Hls({
+                    debug: false,
+                    enableWorker: true,
+                    lowLatencyMode: true,
+                    backBufferLength: 90,
+                    maxBufferLength: 30,
+                    maxMaxBufferLength: 600
+                });
+
+                // HLS.js Events
+                hls.on(Hls.Events.MANIFEST_PARSED, (event, data) => {
+                    log(`✅ Master manifest parsed - ${data.levels.length} quality levels available`, 'success');
+                    data.levels.forEach((level, i) => {
+                        const res = level.width && level.height ? `${level.width}x${level.height}` : 'audio-only';
+                        log(`   Level ${i}: ${Math.round(level.bitrate/1000)}kbps (${res})`, 'info');
+                    });
+                    updateStat('stat-status', 'Playing');
+                    video.play();
+                });
+
+                hls.on(Hls.Events.LEVEL_SWITCHED, (event, data) => {
+                    const level = hls.levels[data.level];
+                    const bitrate = Math.round(level.bitrate / 1000);
+                    const res = level.width && level.height ? `${level.width}x${level.height}` : 'audio-only';
+                    log(`📊 Quality switched to Level ${data.level}: ${res} @ ${bitrate}kbps`, 'info');
+                    updateStat('stat-bitrate', `${bitrate} kbps`);
+                    updateStat('stat-variant', res);
+                });
+
+                hls.on(Hls.Events.LEVEL_LOADING, (event, data) => {
+                    log(`📥 Loading variant playlist: ${data.url.split('/').pop()}`, 'info');
+                });
+
+                hls.on(Hls.Events.FRAG_LOADING, (event, data) => {
+                    const url = data.frag.url || data.frag.relurl;
+                    const segmentName = url.split('/').pop();
+
+                    // Detect ad segments
+                    if (url.includes('/transcoded-ads/') || url.includes('slate_')) {
+                        stats.ads++;
+                        updateStat('stat-ads', stats.ads);
+                        log(`🎬 Ad segment loading: ${segmentName}`, 'ad');
+                    }
+
+                    // Detect discontinuities
+                    if (data.frag.tagList && data.frag.tagList.some(tag => tag[0] === 'DISCONTINUITY')) {
+                        stats.discontinuities++;
+                        updateStat('stat-discontinuities', stats.discontinuities);
+                        log(`⚡ DISCONTINUITY detected (ad insertion boundary)`, 'warning');
+                    }
+                });
+
+                hls.on(Hls.Events.FRAG_LOADED, (event, data) => {
+                    const url = data.frag.url || data.frag.relurl;
+                    if (url.includes('/transcoded-ads/') || url.includes('slate_')) {
+                        log(`✅ Ad segment loaded successfully (${Math.round(data.stats.total/1024)}KB)`, 'success');
+                    }
+                });
+
+                hls.on(Hls.Events.FRAG_BUFFERED, (event, data) => {
+                    // Log buffering progress
+                    const buffered = video.buffered;
+                    if (buffered.length > 0) {
+                        const bufferEnd = buffered.end(buffered.length - 1);
+                        const currentTime = video.currentTime;
+                        const bufferLength = bufferEnd - currentTime;
+                        
+                        if (bufferLength < 2) {
+                            log(`⚠️ Low buffer: ${bufferLength.toFixed(1)}s`, 'warning');
+                        }
+                    }
+                });
+
+                hls.on(Hls.Events.ERROR, (event, data) => {
+                    if (data.fatal) {
+                        switch(data.type) {
+                            case Hls.ErrorTypes.NETWORK_ERROR:
+                                log(`❌ Fatal network error: ${data.details}`, 'error');
+                                log(`   URL: ${data.url}`, 'error');
+                                updateStat('stat-status', 'Network Error');
+                                log('   Attempting recovery...', 'warning');
+                                hls.startLoad();
+                                break;
+                            case Hls.ErrorTypes.MEDIA_ERROR:
+                                log(`❌ Fatal media error: ${data.details}`, 'error');
+                                if (data.reason) {
+                                    log(`   Reason: ${data.reason}`, 'error');
+                                }
+                                updateStat('stat-status', 'Media Error');
+                                log('   Attempting recovery...', 'warning');
+                                hls.recoverMediaError();
+                                break;
+                            default:
+                                log(`❌ Fatal error (${data.type}): ${data.details}`, 'error');
+                                updateStat('stat-status', 'Error');
+                                hls.destroy();
+                                break;
+                        }
+                    } else {
+                        log(`⚠️ Non-fatal error (${data.type}): ${data.details}`, 'warning');
+                    }
+                });
+
+                hls.on(Hls.Events.BUFFER_APPENDING, (event, data) => {
+                    // Track what's being added to buffer
+                    const type = data.type;
+                    const size = data.data ? data.data.byteLength : 0;
+                    log(`📦 Appending ${type} buffer: ${Math.round(size/1024)}KB`, 'info');
+                });
+
+                hls.loadSource(url);
+                hls.attachMedia(video);
+
+            } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+                // Native HLS support (Safari)
+                log('Using native HLS support (Safari)', 'info');
+                video.src = url;
+                video.addEventListener('loadedmetadata', () => {
+                    updateStat('stat-status', 'Playing');
+                    video.play();
+                });
+            } else {
+                log('❌ HLS is not supported in this browser', 'error');
+                updateStat('stat-status', 'Not Supported');
+            }
+        }
+
+        // Video event listeners
+        video.addEventListener('playing', () => {
+            log('▶️ Playback started', 'success');
+            updateStat('stat-status', 'Playing');
         });
 
-        // Look for SCTE-35 markers
-        hls.on(Hls.Events.LEVEL_UPDATED, function(event, data) {
-          const dateRanges = data.details.dateRanges;
-          if (dateRanges && Object.keys(dateRanges).length > 0) {
-            const scte35Count = Object.values(dateRanges).filter(dr => 
-              dr.attr && (dr.attr['SCTE35-OUT'] || dr.attr['SCTE35-IN'])
-            ).length;
-            
-            if (scte35Count > 0) {
-              showStatus(`🎯 Found ${scte35Count} SCTE-35 ad marker(s)!`, 'success');
-            }
-          }
+        video.addEventListener('pause', () => {
+            log('⏸️ Playback paused', 'info');
+            updateStat('stat-status', 'Paused');
         });
 
-        updateStats('Loading stream...');
-        hls.loadSource(url);
-        hls.attachMedia(video);
-        
-      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
-        // Native HLS support (Safari)
-        video.src = url;
-        updateStats('Using native HLS support');
-        showStatus('✅ Using native HLS playback', 'success');
-      } else {
-        showStatus('❌ HLS is not supported in this browser', 'error');
-      }
-    }
+        video.addEventListener('waiting', () => {
+            log('⏳ Buffering... (player waiting for data)', 'warning');
+            updateStat('stat-status', 'Buffering');
+        });
 
-    // Load automatically on page load
-    window.addEventListener('load', function() {
-      loadStream();
-    });
-  </script>
+        video.addEventListener('stalled', () => {
+            log('⏳ Stream stalled (network issue?)', 'error');
+            updateStat('stat-status', 'Stalled');
+        });
+
+        video.addEventListener('error', (e) => {
+            const error = video.error;
+            if (error) {
+                const errorMessages = {
+                    1: 'MEDIA_ERR_ABORTED - Playback aborted',
+                    2: 'MEDIA_ERR_NETWORK - Network error',
+                    3: 'MEDIA_ERR_DECODE - Decode error (codec mismatch?)',
+                    4: 'MEDIA_ERR_SRC_NOT_SUPPORTED - Source not supported'
+                };
+                log(`❌ Video error: ${errorMessages[error.code] || error.message || 'Unknown error'}`, 'error');
+                updateStat('stat-status', 'Error');
+            }
+        });
+
+        log('Player initialized and ready', 'success');
+        log('Click "Master Playlist (Adaptive)" to start testing with adaptive bitrate', 'info');
+        log('The player will automatically select the best quality based on network conditions', 'info');
+    </script>
 </body>
 </html>
-

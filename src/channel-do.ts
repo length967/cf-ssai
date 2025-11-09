@@ -1909,16 +1909,20 @@ export class ChannelDO {
             let adItem = eligibleItems.find(item => item.bitrate === viewerBitrate)
 
             if (!adItem && eligibleItems.length > 0) {
-              // No exact match - find closest bitrate (prefer lower to avoid buffering)
-              const sorted = [...eligibleItems].sort((a, b) => {
-                const diffA = Math.abs(a.bitrate - viewerBitrate)
-                const diffB = Math.abs(b.bitrate - viewerBitrate)
-                // If diffs are equal, prefer lower bitrate
-                if (diffA === diffB) return a.bitrate - b.bitrate
-                return diffA - diffB
-              })
-              adItem = sorted[0]
-              console.log(`No exact match for ${viewerBitrate}bps, using closest: ${adItem.bitrate}bps`)
+              // No exact match - prefer closest LOWER bitrate to avoid buffering/quality jumps
+              // Players handle downscaling better than upscaling
+              const lowerBitrates = eligibleItems.filter(item => item.bitrate <= viewerBitrate)
+              const higherBitrates = eligibleItems.filter(item => item.bitrate > viewerBitrate)
+
+              if (lowerBitrates.length > 0) {
+                // Prefer highest available lower bitrate (closest match below requested)
+                adItem = lowerBitrates.sort((a, b) => b.bitrate - a.bitrate)[0]
+                console.log(`No exact match for ${viewerBitrate}bps, using closest lower: ${adItem.bitrate}bps`)
+              } else if (higherBitrates.length > 0) {
+                // No lower bitrates available, use lowest higher bitrate
+                adItem = higherBitrates.sort((a, b) => a.bitrate - b.bitrate)[0]
+                console.log(`No exact match for ${viewerBitrate}bps, no lower bitrates available, using lowest higher: ${adItem.bitrate}bps`)
+              }
             }
             
             if (adItem) {
@@ -2088,34 +2092,16 @@ export class ChannelDO {
                     }
                   }
 
-                  // HYBRID SSAI/SGAI fallback logic
+                  // SSAI-only mode: Skip ad if insertion point not in manifest
+                  // SGAI (HLS Interstitials) disabled because most players (hls.js, VLC, etc.) don't support it
+                  // Timeline mismatch between live content (with PDT) and VOD ads (without PDT) causes player errors
                   if (result.segmentsSkipped === 0) {
-                    console.log(`🔄 SSAI failed (PDT not in manifest), falling back to SGAI for late-joining viewer`)
+                    console.log(`⏩ SSAI skipped - insertion point not in manifest window (late-joining viewer or ad too far in past)`)
+                    console.log(`   Ad break timestamp: ${startISO}, likely outside ${Math.round(313 * 1.92 / 60)}min manifest window`)
+                    console.log(`   Returning clean origin manifest (no ad insertion)`)
 
-                    // Use SGAI interstitial insertion instead
-                    const adItem = pod.items.find(item => item.bitrate === viewerBitrate) || pod.items[0]
-                    const interstitialURI = await signAdPlaylist(signHost, this.env.SEGMENT_SECRET, adItem.playlistUrl)
-
-                    // Calculate resume offset: how far to skip ahead in content after ad plays
-                    // This accounts for the live stream progressing while the ad was playing
-                    const resumeOffset = skipPlan ? skipPlan.durationSkipped : 0
-                    if (resumeOffset > 0) {
-                      console.log(`📍 SGAI resume offset: ${resumeOffset.toFixed(2)}s (live stream progression during ad)`)
-                    }
-
-                    const fallbackAttributes = activeBreak?.rawAttributes ? { ...activeBreak.rawAttributes } : undefined
-                    const sgai = injectInterstitialCues(cleanOrigin, {
-                      id: adActive ? (adState!.podId || "ad") : pod.podId,
-                      startDateISO: startISO,
-                      durationSec: stableDuration,
-                      assetURI: interstitialURI,
-                      baseAttributes: fallbackAttributes,
-                      scte35Payload: activeBreak?.rawCommand,
-                      resumeOffset  // Tell player to skip ahead in content to stay live
-                    })
-
-                    await this.env.BEACON_QUEUE.send(beaconMsg)
-                    return new Response(sgai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
+                    // Return origin without ads
+                    return new Response(cleanOrigin, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
                   }
 
                   // SSAI succeeded - persist skip stats ONLY on first request (when skip count is unset/zero)
