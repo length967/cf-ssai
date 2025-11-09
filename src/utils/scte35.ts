@@ -50,8 +50,12 @@ function parseDateRangeSCTE35(line: string): SCTE35Signal | null {
   const scte35Cmd = attrs["SCTE35-CMD"]
   const scte35Out = attrs["SCTE35-OUT"]
   const scte35In = attrs["SCTE35-IN"]
-  
-  if (!scte35Cmd && !scte35Out && !scte35In) {
+  const hasSegmentationHints =
+    !!attrs["X-SEGMENTATION-TYPE"] ||
+    !!attrs["X-BREAK-DURATION"] ||
+    (attrs["CLASS"]?.toLowerCase().includes("scte35") ?? false)
+
+  if (!scte35Cmd && !scte35Out && !scte35In && !hasSegmentationHints) {
     return null  // Not an SCTE-35 signal
   }
   
@@ -314,25 +318,22 @@ export function validateSCTE35Signal(signal: SCTE35Signal, pdt?: string): SCTE35
     const hasDurationField = (signal.breakDuration !== undefined && signal.breakDuration !== null) || 
                              (signal.duration !== undefined && signal.duration !== null)
     
-    if (!hasDurationField) {
-      errors.push('Ad break start signal missing duration (breakDuration or duration field required)')
-    } else {
-      const duration = getBreakDuration(signal)
+    const duration = getBreakDuration(signal)
 
-      // Duration must be positive
-      if (duration <= 0) {
-        errors.push(`Invalid ad break duration: ${duration}s (must be > 0)`)
-      }
-      // Duration must be reasonable (0.1s to 300s = 5 minutes)
-      else if (duration < 0.1 || duration > 300) {
-        errors.push(`Unrealistic ad break duration: ${duration}s (must be 0.1-300 seconds)`)
-      }
-      // Warn about unusual durations
-      else if (duration < 5) {
-        warnings.push(`Very short ad break: ${duration}s (typical minimum is 5-10s)`)
-      } else if (duration > 180) {
-        warnings.push(`Very long ad break: ${duration}s (typical maximum is 120-180s)`)
-      }
+    if (!hasDurationField) {
+      warnings.push('Ad break start missing explicit duration; defaulting to 30 seconds')
+    }
+
+    if (duration <= 0) {
+      errors.push(`Invalid ad break duration: ${duration}s (must be > 0)`)
+    }
+    else if (duration < 0.1 || duration > 300) {
+      errors.push(`Unrealistic ad break duration: ${duration}s (must be 0.1-300 seconds)`)
+    }
+    else if (duration < 5) {
+      warnings.push(`Very short ad break: ${duration}s (typical minimum is 5-10s)`)
+    } else if (duration > 180) {
+      warnings.push(`Very long ad break: ${duration}s (typical maximum is 120-180s)`)
     }
   }
 
