@@ -1,4 +1,4 @@
-import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, extractPDTs, extractBitrates } from "./utils/hls"
+import { addDaterangeInterstitial, insertDiscontinuity, replaceSegmentsWithAds, extractPDTs, extractBitrates, calculateSkipPlan, injectInterstitialCues, AdSegmentInfo, SkipPlan } from "./utils/hls"
 import { signPath } from "./utils/sign"
 import { getBreakDuration, validateSCTE35Signal } from "./utils/scte35"
 import { createTransportStreamState, ingestTransportStreamSegment, type TransportStreamState } from "./utils/scte35-transport"
@@ -55,6 +55,36 @@ interface AdState {
   // PRE-CALCULATED DECISION: Store decision once to avoid repeated Worker binding calls and CPU timeouts
   decision?: DecisionResponse  // Pre-calculated ad pod decision
   decisionCalculatedAt?: number  // Timestamp when decision was calculated (for debugging)
+  // SHARED PLAYLIST MODEL: Persist cue decorations & skip plan so every variant renders identically
+  manifestPlan?: SharedManifestPlan
+}
+
+interface SharedManifestPlan {
+  startPDT: string
+  leadingDecorations: string[]
+  trailingDecorations: string[]
+  stableSkipCount: number
+  updatedAt: number
+}
+
+interface PlaylistSegmentModel {
+  tags: string[]
+  uri: string
+  sequence: number
+}
+
+interface PlaylistModel {
+  header: string[]
+  footer: string[]
+  mediaSequence: number
+  segments: PlaylistSegmentModel[]
+}
+
+interface SharedInsertionResult {
+  model: PlaylistModel
+  segmentsSkipped: number
+  durationSkipped: number
+  plan: SharedManifestPlan
 }
 
 const AD_STATE_KEY = "ad_state"
@@ -80,6 +110,321 @@ async function clearAdState(state: DurableObjectState): Promise<void> {
   const currentVersion = await state.storage.get<number>('ad_state_version') || 0
   await state.storage.put('ad_state_version', currentVersion + 1)
   await state.storage.delete(AD_STATE_KEY)
+}
+
+/**
+ * Get recent SCTE-35 events from Durable Object storage
+ * Returns events from transport stream parsing (binary SCTE-35)
+ * Used for detecting ad breaks in real-time
+ */
+async function getRecentScte35Events(state: DurableObjectState): Promise<Scte35Event[]> {
+  const SCTE35_EVENTS_KEY = 'scte35_events'
+  const MAX_EVENT_AGE_MS = 60 * 1000 // Keep events for 60 seconds
+
+  const events = await state.storage.get<Scte35Event[]>(SCTE35_EVENTS_KEY) || []
+
+  // Filter out old events
+  const now = Date.now()
+  const recentEvents = events.filter(event => {
+    const age = now - event.recvAtMs
+    return age < MAX_EVENT_AGE_MS
+  })
+
+  // Update storage if we filtered any out
+  if (recentEvents.length !== events.length) {
+    await state.storage.put(SCTE35_EVENTS_KEY, recentEvents)
+  }
+
+  return recentEvents
+}
+
+/**
+ * Store SCTE-35 event from transport stream parsing
+ * Called when binary SCTE-35 data is detected
+ */
+async function storeScte35Event(state: DurableObjectState, event: Scte35Event): Promise<void> {
+  const SCTE35_EVENTS_KEY = 'scte35_events'
+  const MAX_EVENTS = 100 // Limit storage
+
+  const events = await state.storage.get<Scte35Event[]>(SCTE35_EVENTS_KEY) || []
+
+  // Add new event
+  events.push(event)
+
+  // Keep only most recent events
+  const trimmed = events.slice(-MAX_EVENTS)
+
+  await state.storage.put(SCTE35_EVENTS_KEY, trimmed)
+}
+
+/**
+ * Append multiple SCTE-35 events from transport stream ingestion
+ * Used by /ingest/ts endpoint to store events parsed from binary data
+ */
+async function appendScte35Events(state: DurableObjectState, events: Scte35Event[]): Promise<void> {
+  for (const event of events) {
+    await storeScte35Event(state, event)
+  }
+}
+
+const MIN_SEGMENTS_DURING_BREAK = 3
+
+function pushUnique(target: string[], value: string) {
+  if (!target.includes(value)) {
+    target.push(value)
+  }
+}
+
+function decorationPriority(tag: string): number {
+  if (tag.startsWith('#EXT-X-PROGRAM-DATE-TIME')) return 0
+  if (tag.startsWith('#EXT-X-DATERANGE')) return 1
+  if (tag.startsWith('#EXT-X-CUE-OUT')) return 2
+  if (tag.startsWith('#EXT-X-CUE')) return 3
+  return 4
+}
+
+function sortDecorations(tags: string[]): string[] {
+  return tags.slice().sort((a, b) => decorationPriority(a) - decorationPriority(b))
+}
+
+function parseDurationFromTags(tags: string[]): number {
+  const extinf = tags.find(t => t.startsWith('#EXTINF:'))
+  if (!extinf) return 0
+  const value = extinf.replace('#EXTINF:', '').split(',')[0]
+  const parsed = parseFloat(value)
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+function gatherDecorations(tags: string[], leading: string[], trailing: string[]) {
+  for (const tag of tags) {
+    if (tag.startsWith('#EXTINF')) continue
+    if (tag.startsWith('#EXT-X-PROGRAM-DATE-TIME')) {
+      pushUnique(leading, tag)
+    } else if (tag.startsWith('#EXT-X-DATERANGE')) {
+      pushUnique(leading, tag)
+    } else if (tag.startsWith('#EXT-X-CUE-IN')) {
+      pushUnique(trailing, tag)
+    } else if (tag.startsWith('#EXT-X-CUE')) {
+      pushUnique(leading, tag)
+    }
+  }
+}
+
+function parsePlaylistModel(manifest: string): PlaylistModel {
+  const lines = manifest.split('\n')
+  const header: string[] = []
+  const footer: string[] = []
+  const segments: PlaylistSegmentModel[] = []
+  let pendingTags: string[] = []
+  let inHeader = true
+  let mediaSequence = 0
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim()
+    if (line.length === 0) continue
+
+    if (inHeader) {
+      const isSegmentTag = line.startsWith('#EXTINF') ||
+        line.startsWith('#EXT-X-PROGRAM-DATE-TIME') ||
+        line.startsWith('#EXT-X-DISCONTINUITY') ||
+        line.startsWith('#EXT-X-CUE') ||
+        line.startsWith('#EXT-X-DATERANGE')
+
+      if (!line.startsWith('#') || isSegmentTag) {
+        inHeader = false
+      }
+
+      if (inHeader) {
+        header.push(line)
+        if (line.startsWith('#EXT-X-MEDIA-SEQUENCE:')) {
+          const value = parseInt(line.split(':')[1] || '0', 10)
+          if (!Number.isNaN(value)) mediaSequence = value
+        }
+        continue
+      }
+    }
+
+    if (line.startsWith('#')) {
+      pendingTags.push(line)
+    } else {
+      const segment: PlaylistSegmentModel = {
+        tags: pendingTags,
+        uri: line,
+        sequence: 0
+      }
+      segments.push(segment)
+      pendingTags = []
+    }
+  }
+
+  if (pendingTags.length > 0) {
+    footer.push(...pendingTags)
+  }
+
+  let nextSequence = mediaSequence
+  for (const segment of segments) {
+    segment.sequence = nextSequence++
+  }
+
+  return { header, footer, mediaSequence, segments }
+}
+
+function renderPlaylistModel(model: PlaylistModel): string {
+  const header = model.header.slice()
+  let hasMediaSequence = false
+  for (let i = 0; i < header.length; i++) {
+    if (header[i].startsWith('#EXT-X-MEDIA-SEQUENCE')) {
+      header[i] = `#EXT-X-MEDIA-SEQUENCE:${model.mediaSequence}`
+      hasMediaSequence = true
+    }
+  }
+  if (!hasMediaSequence) {
+    header.push(`#EXT-X-MEDIA-SEQUENCE:${model.mediaSequence}`)
+  }
+
+  const lines: string[] = []
+  lines.push(...header)
+  for (const segment of model.segments) {
+    lines.push(...segment.tags)
+    lines.push(segment.uri)
+  }
+  lines.push(...model.footer)
+
+  return lines.join('\n') + (lines.length ? '\n' : '')
+}
+
+function applySharedAdInsertion(
+  model: PlaylistModel,
+  options: {
+    startPDT?: string
+    adSegments: Array<{ url: string, duration: number }>
+    adDuration: number
+    contentSkipDuration?: number
+    stableSkipCount?: number
+    existingPlan?: SharedManifestPlan
+  }
+): SharedInsertionResult | null {
+  const { startPDT, adSegments, adDuration, contentSkipDuration, stableSkipCount, existingPlan } = options
+
+  if (!adSegments.length) return null
+
+  const targetPDT = startPDT || existingPlan?.startPDT
+  if (!targetPDT) return null
+
+  if (!model.segments.length) return null
+
+  const leadingDecorations = existingPlan?.leadingDecorations ? [...existingPlan.leadingDecorations] : []
+  const trailingDecorations = existingPlan?.trailingDecorations ? [...existingPlan.trailingDecorations] : []
+
+  const startIndex = model.segments.findIndex(segment =>
+    segment.tags.some(tag => tag.startsWith('#EXT-X-PROGRAM-DATE-TIME:') && tag.includes(targetPDT))
+  )
+
+  if (startIndex === -1) {
+    console.warn(`applySharedAdInsertion: start PDT ${targetPDT} not found in manifest`)
+    return null
+  }
+
+  gatherDecorations(model.segments[startIndex].tags, leadingDecorations, trailingDecorations)
+
+  const skipDurationTarget = contentSkipDuration ?? adDuration
+
+  let skippedDuration = 0
+  let skipCount = 0
+  let cursor = startIndex
+
+  while (cursor < model.segments.length) {
+    if (stableSkipCount !== undefined && skipCount >= stableSkipCount) break
+    if (stableSkipCount === undefined && skipCount > 0 && skippedDuration >= skipDurationTarget) break
+
+    const segment = model.segments[cursor]
+    gatherDecorations(segment.tags, leadingDecorations, trailingDecorations)
+
+    skippedDuration += parseDurationFromTags(segment.tags)
+    skipCount++
+    cursor++
+
+    if (stableSkipCount === undefined && skippedDuration >= skipDurationTarget) break
+  }
+
+  if (stableSkipCount !== undefined && skipCount < stableSkipCount) {
+    console.warn(`applySharedAdInsertion: manifest window too small (need ${stableSkipCount}, have ${skipCount})`)
+    return null
+  }
+
+  if (skipCount === 0) {
+    console.warn('applySharedAdInsertion: nothing to replace (skipCount=0)')
+    return null
+  }
+
+  const removed = model.segments.splice(startIndex, skipCount)
+  for (const seg of removed) {
+    gatherDecorations(seg.tags, leadingDecorations, trailingDecorations)
+  }
+
+  const orderedLeading = sortDecorations(leadingDecorations)
+  const orderedTrailing = sortDecorations(trailingDecorations)
+
+  const insertedSegments: PlaylistSegmentModel[] = adSegments.map((segment, index) => {
+    const tags: string[] = []
+    if (index === 0) {
+      for (const tag of orderedLeading) {
+        if (!tag.startsWith('#EXTINF')) {
+          pushUnique(tags, tag)
+        }
+      }
+      pushUnique(tags, '#EXT-X-DISCONTINUITY')
+    }
+    tags.push(`#EXTINF:${segment.duration.toFixed(3)},`)
+    return {
+      tags,
+      uri: segment.url,
+      sequence: 0
+    }
+  })
+
+  model.segments.splice(startIndex, 0, ...insertedSegments)
+
+  const resumeIndex = startIndex + insertedSegments.length
+  if (resumeIndex >= model.segments.length) {
+    console.warn('applySharedAdInsertion: no content remains after ad pod')
+    return null
+  }
+
+  const resumeTags = model.segments[resumeIndex].tags.slice()
+  pushUnique(resumeTags, '#EXT-X-DISCONTINUITY')
+  for (const tag of orderedTrailing) {
+    pushUnique(resumeTags, tag)
+  }
+  model.segments[resumeIndex].tags = resumeTags
+
+  if (model.segments.length - startIndex < MIN_SEGMENTS_DURING_BREAK) {
+    console.warn(`applySharedAdInsertion: refusing to prune below ${MIN_SEGMENTS_DURING_BREAK} segments during break`)
+    return null
+  }
+
+  let nextSequence = model.mediaSequence
+  for (const segment of model.segments) {
+    segment.sequence = nextSequence++
+  }
+  if (model.segments.length > 0) {
+    model.mediaSequence = model.segments[0].sequence
+  }
+
+  const plan: SharedManifestPlan = {
+    startPDT: targetPDT,
+    leadingDecorations: orderedLeading,
+    trailingDecorations: orderedTrailing,
+    stableSkipCount: stableSkipCount ?? skipCount,
+    updatedAt: Date.now()
+  }
+
+  return {
+    model,
+    segmentsSkipped: skipCount,
+    durationSkipped: skippedDuration,
+    plan
+  }
 }
 
 /**
@@ -611,6 +956,182 @@ async function signAdPlaylist(signHost: string, segmentSecret: string, playlistP
 }
 
 // -----------------------------------------------------------------------------
+// Helper functions for IDR timeline and bitrate extraction
+// -----------------------------------------------------------------------------
+
+// Header names that may contain encoder IDR metadata
+const ENCODER_IDR_HEADERS = [
+  'x-encoder-idr-timeline',
+  'x-idr-frames',
+  'x-encoder-keyframes'
+]
+
+// Header names that may contain segmenter IDR callbacks
+const SEGMENTER_IDR_HEADERS = [
+  'x-segmenter-idr',
+  'x-segment-boundary',
+  'x-keyframe-callback'
+]
+
+/**
+ * Find header value from Headers object by trying multiple header names
+ * Returns the first matching header value or undefined
+ */
+function findHeaderValue(headers: Headers, headerNames: string[]): string | undefined {
+  for (const name of headerNames) {
+    const value = headers.get(name)
+    if (value) return value
+  }
+  return undefined
+}
+
+/**
+ * Parse IDR header value which may be comma-separated or JSON
+ * Returns array of objects with optional pts and seconds fields
+ */
+function parseIdrHeaderValue(headerValue: string | undefined): Array<{pts?: number, seconds?: number}> {
+  if (!headerValue) return []
+
+  try {
+    // Try parsing as JSON first
+    const parsed = JSON.parse(headerValue)
+    if (Array.isArray(parsed)) {
+      return parsed.map(item => {
+        if (typeof item === 'number') {
+          return { pts: item }
+        }
+        if (typeof item === 'object' && item !== null) {
+          const result: {pts?: number, seconds?: number} = {}
+          if ('pts' in item) result.pts = Number(item.pts)
+          if ('seconds' in item || 'timeSeconds' in item) {
+            result.seconds = Number(item.seconds || item.timeSeconds)
+          }
+          return result
+        }
+        return {}
+      }).filter(item => item.pts !== undefined || item.seconds !== undefined)
+    }
+  } catch {
+    // Not JSON, try comma-separated numbers
+    const parts = headerValue.split(',').map(s => s.trim()).filter(Boolean)
+    return parts.map(part => {
+      const num = Number(part)
+      return Number.isFinite(num) ? { pts: num } : {}
+    }).filter(item => item.pts !== undefined)
+  }
+
+  return []
+}
+
+/**
+ * Extract bitrate from variant filename
+ * Supports formats:
+ * - video=1000000.m3u8 -> 1000000
+ * - v_1600k.m3u8 -> 1600000
+ * - 1080p_3000.m3u8 -> 3000000
+ */
+function extractBitrateFromVariant(variant: string): number | null {
+  // Try: video=NNNNNN pattern
+  const videoMatch = variant.match(/video=(\d+)/i)
+  if (videoMatch) {
+    return parseInt(videoMatch[1], 10)
+  }
+
+  // Try: v_NNNNk pattern (k = kilobits)
+  const kMatch = variant.match(/v_(\d+)k/i)
+  if (kMatch) {
+    return parseInt(kMatch[1], 10) * 1000
+  }
+
+  // Try: NNNNp_NNNN pattern (resolution_bitrate)
+  const resMatch = variant.match(/\d+p_(\d+)/i)
+  if (resMatch) {
+    return parseInt(resMatch[1], 10) * 1000
+  }
+
+  // Try: any number followed by k
+  const anyKMatch = variant.match(/(\d+)k/i)
+  if (anyKMatch) {
+    return parseInt(anyKMatch[1], 10) * 1000
+  }
+
+  // Try: any standalone number
+  const numMatch = variant.match(/(\d{6,})/);
+  if (numMatch) {
+    return parseInt(numMatch[1], 10)
+  }
+
+  return null
+}
+
+/**
+ * Reconcile SCTE-35 cue START-DATE timestamps with PTS/PDT mapping
+ * Updates DATERANGE tags to ensure accurate wall-clock alignment
+ *
+ * @param manifest - HLS manifest text
+ * @param ptsMap - PTS to PDT mapping for this variant
+ * @param options - Configuration options
+ * @returns Object with updated manifest and metrics
+ */
+function reconcileCueStartDates(
+  manifest: string,
+  ptsMap: PtsPdtMap | null,
+  options?: {
+    variantId?: string
+    logger?: Console
+    metrics?: any
+  }
+): { manifest: string; adjustedCount?: number } {
+  // If no PTS/PDT map, return unchanged
+  if (!ptsMap) {
+    return { manifest, adjustedCount: 0 }
+  }
+
+  const logger = options?.logger || console
+  let adjustedCount = 0
+
+  // Process DATERANGE tags to reconcile START-DATE with PTS mapping
+  // This ensures cues align with actual segment timestamps
+  const lines = manifest.split('\n')
+  const output: string[] = []
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+
+    // Look for DATERANGE tags with SCTE35 markers
+    if (line.startsWith('#EXT-X-DATERANGE:') &&
+        (line.includes('SCTE35-OUT') || line.includes('SCTE35-IN') || line.includes('SCTE35-CMD'))) {
+
+      // Extract START-DATE if present
+      const startDateMatch = line.match(/START-DATE="([^"]+)"/)
+      if (startDateMatch) {
+        const originalDate = startDateMatch[1]
+
+        // For now, keep the original date - reconciliation with PTS would require
+        // additional context about which PTS this cue corresponds to
+        // This is a placeholder implementation
+
+        // TODO: Enhance with actual PTS lookup when we have cue-to-PTS mapping
+        output.push(line)
+      } else {
+        output.push(line)
+      }
+    } else {
+      output.push(line)
+    }
+  }
+
+  if (adjustedCount > 0 && logger) {
+    logger.log(`Reconciled ${adjustedCount} cue START-DATE timestamps for variant ${options?.variantId || 'unknown'}`)
+  }
+
+  return {
+    manifest: output.join('\n'),
+    adjustedCount
+  }
+}
+
+// -----------------------------------------------------------------------------
 // Durable Object: ChannelDO
 // -----------------------------------------------------------------------------
 export class ChannelDO {
@@ -917,6 +1438,33 @@ export class ChannelDO {
       const adPodBase = req.headers.get('X-Ad-Pod-Base') || this.env.AD_POD_BASE
       const signHost = req.headers.get('X-Sign-Host') || this.env.SIGN_HOST
 
+      if (u.pathname === "/ingest/ts") {
+        if (req.method !== "POST") {
+          return new Response("method not allowed", { status: 405 })
+        }
+
+        try {
+          const arrayBuffer = await req.arrayBuffer()
+          const payload = new Uint8Array(arrayBuffer)
+          const events = parseScte35FromTransportStream(payload)
+          await appendScte35Events(this.state, events)
+
+          console.log(
+            `[SCTE35] Ingest request processed for channel=${channelId}, cues=${events.length}, bytes=${payload.byteLength}`
+          )
+
+          return new Response(JSON.stringify({ ok: true, events: events.length }), {
+            headers: { "content-type": "application/json" }
+          })
+        } catch (err) {
+          console.error("SCTE-35 ingest failure:", err)
+          return new Response(JSON.stringify({ ok: false, error: "ingest_failed" }), {
+            status: 500,
+            headers: { "content-type": "application/json" }
+          })
+        }
+      }
+
       // Control plane: POST /cue to start/stop an ad break for this channel
       if (u.pathname === "/cue") {
         if (req.method !== "POST") return new Response("method not allowed", { status: 405 })
@@ -980,9 +1528,31 @@ export class ChannelDO {
 
       if (!channel) return new Response("channel required", { status: 400 })
 
+      // Collect IDR metadata from request headers (if present)
+      try {
+        this.updateIdrTimeline(variant, req.headers)
+      } catch (err) {
+        console.warn(`Failed to update IDR timeline for variant ${variant}:`, err)
+      }
+
       // Extract viewer bitrate from variant name for ad selection
       // Format: scte35-audio_eng=128000-video=1000000.m3u8
       const viewerBitrate = extractBitrateFromVariant(variant)
+
+      const ptsMap = this.getPtsPdtMap(channel, variant)
+      const metricsEmitter = this.env.METRICS
+        ? (metric: string, value: number, dimensions?: Record<string, string>) => {
+            try {
+              ;(this.env.METRICS as any).writeDataPoint({
+                metric,
+                value,
+                dimensions: { channel, variant, ...(dimensions || {}) }
+              })
+            } catch (err) {
+              console.warn(`Failed to emit metric ${metric}:`, err)
+            }
+          }
+        : undefined
 
       // PERFORMANCE FIX: Check if this is a segment request FIRST
       // Segments should bypass all config/database lookups
@@ -1001,9 +1571,23 @@ export class ChannelDO {
 
       // Fetch origin manifest for processing
       const originResponse = await fetchOriginVariant(originUrl, channel, variant)
-      
+
       // For manifests, read as text for processing
-      const origin = await originResponse.text()
+      let origin = await originResponse.text()
+
+      // Parse SCTE-35 signals from origin manifest
+      // These are used directly without conversion to events
+      const originScte35Signals = parseSCTE35FromManifest(origin)
+      if (originScte35Signals.length > 0) {
+        console.log(`[SCTE35] Detected ${originScte35Signals.length} signals from origin manifest`)
+      }
+
+      const mappingResult = reconcileCueStartDates(origin, ptsMap, {
+        variantId: variant,
+        logger: console,
+        metrics: metricsEmitter
+      })
+      origin = mappingResult.manifest
 
       // Detect and store bitrates if this is a master manifest
       // Fire-and-forget to avoid delaying the response
@@ -1296,11 +1880,40 @@ export class ChannelDO {
           stableDuration = adState!.durationSec
           console.log(`Using persisted ad state: start=${startISO}, duration=${stableDuration}s`)
         } else {
-          startISO = scte35StartPDT || new Date(Math.floor(now / 1000) * 1000).toISOString()
-          // Use integer milliseconds to avoid floating-point precision issues
+          let startCandidate = scte35StartPDT || null
+          let startSource: 'scte35' | 'pts_map' | 'calculated' = startCandidate ? 'scte35' : 'calculated'
+
+          if (!startCandidate && activeBreak?.pts !== undefined) {
+            const estimate = ptsMap.estimate(activeBreak.pts)
+            if (estimate) {
+              startCandidate = estimate.iso
+              startSource = 'pts_map'
+              metricsEmitter?.('pts_pdt_cue_alignment', 1, { channel, variant, source: 'pts_map' })
+            } else {
+              metricsEmitter?.('pts_pdt_cue_alignment', 0, { channel, variant, source: 'missing_map' })
+            }
+          }
+
+          if (!startCandidate) {
+            startCandidate = new Date(Math.floor(now / 1000) * 1000).toISOString()
+            startSource = 'calculated'
+          }
+
+          if (!scte35StartPDT && startCandidate) {
+            scte35StartPDT = startCandidate
+          }
+
+          startISO = startCandidate
           const durationMs = Math.round(breakDurationSec * 1000)
           stableDuration = durationMs / 1000  // Exact representation
-          console.log(`Using calculated values: start=${startISO}, duration=${stableDuration}s (from ${breakDurationSec}s)`)
+
+          if (startSource === 'pts_map') {
+            metricsEmitter?.('pts_pdt_cue_alignment_source', 1, { channel, variant, source: 'pts_map' })
+          } else if (startSource === 'scte35') {
+            metricsEmitter?.('pts_pdt_cue_alignment_source', 1, { channel, variant, source: 'scte35' })
+          } else {
+            metricsEmitter?.('pts_pdt_cue_alignment_source', 1, { channel, variant, source: 'calculated' })
+          }
         }
         
         // PERFORMANCE OPTIMIZATION: Use pre-calculated decision if available in ad state
@@ -1328,10 +1941,13 @@ export class ChannelDO {
         }, cachedDecision)  // Pass cached decision if available
         
         console.log(`Decision response received: podId=${decisionResponse.pod?.podId}, items=${decisionResponse.pod?.items?.length || 0}`)
-        
+
         const pod = decisionResponse.pod
         const tracking = decisionResponse.tracking || { impressions: [], quartiles: {} }
-        
+
+        // Select ad variant based on viewer bitrate (will be updated after actual selection)
+        let adVariant: number | undefined = undefined
+
         // Build beacon message with tracking URLs
         const beaconMsg: BeaconMessage = {
           event: "imp",
@@ -1340,7 +1956,7 @@ export class ChannelDO {
           channel,
           ts: Date.now(),
           trackerUrls: tracking.impressions || [],
-          metadata: { 
+          metadata: {
             variant,
             bitrate: viewerBitrate,
             adVariant,
@@ -1368,9 +1984,25 @@ export class ChannelDO {
           if (adActive && adState!.podUrl) {
             interstitialURI = adState!.podUrl
           } else {
+            // Detect if this is an audio-only stream to prevent codec mismatches
+            // Audio-only threshold: <= 256kbps (64k, 128k, 256k are typical audio bitrates)
+            const isAudioOnly = viewerBitrate <= 256000 && variant.toLowerCase().includes('audio')
+
+            // Filter variants by stream type
+            let eligibleItems = pod.items
+            if (isAudioOnly) {
+              const audioOnlyItems = pod.items.filter(item => item.bitrate <= 256000)
+              if (audioOnlyItems.length > 0) {
+                eligibleItems = audioOnlyItems
+                console.log(`[SGAI] Audio-only stream detected (${viewerBitrate}bps), filtered to ${eligibleItems.length} audio-only ad variants`)
+              } else {
+                console.warn(`⚠️  [SGAI] Audio-only stream but no audio-only ad variants available - PLAYBACK MAY FAIL`)
+              }
+            }
+
             // Find best matching ad item for viewer's bitrate
-            const adItem = pod.items.find(item => item.bitrate === viewerBitrate) || 
-                           pod.items[0]  // Fallback to first item
+            const adItem = eligibleItems.find(item => item.bitrate === viewerBitrate) ||
+                           eligibleItems[0]  // Fallback to first eligible item
             // Use per-channel signing configuration
             interstitialURI = await signAdPlaylist(signHost, this.env.SEGMENT_SECRET, adItem.playlistUrl)
           }
@@ -1378,13 +2010,15 @@ export class ChannelDO {
           // Strip origin SCTE-35 markers before adding our interstitial
           const cleanOrigin = stripOriginSCTE35Markers(origin)
           // Use stableDuration for consistent interstitial timing
-          const sgai = addDaterangeInterstitial(
-            cleanOrigin,
-            adActive ? (adState!.podId || "ad") : pod.podId,
-            startISO,
-            stableDuration,
-            interstitialURI
-          )
+          const baseAttributes = activeBreak?.rawAttributes ? { ...activeBreak.rawAttributes } : undefined
+          const sgai = injectInterstitialCues(cleanOrigin, {
+            id: adActive ? (adState!.podId || "ad") : pod.podId,
+            startDateISO: startISO,
+            durationSec: stableDuration,
+            assetURI: interstitialURI,
+            baseAttributes,
+            scte35Payload: activeBreak?.rawCommand
+          })
           
           await this.env.BEACON_QUEUE.send(beaconMsg)
           return new Response(sgai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
@@ -1394,24 +2028,48 @@ export class ChannelDO {
           if (scte35StartPDT) {
             // True SSAI: Replace segments at SCTE-35 marker position
             // Fetch the actual ad playlist and extract real segment URLs
-            
+
+            // Detect if this is an audio-only stream
+            // Audio-only threshold: <= 256kbps (64k, 128k, 256k are typical audio bitrates)
+            const isAudioOnly = viewerBitrate <= 256000 && variant.toLowerCase().includes('audio')
+
+            // Filter variants by stream type to prevent codec mismatches
+            let eligibleItems = pod.items
+            if (isAudioOnly) {
+              // For audio-only streams, only use audio-only ad variants (<= 256kbps)
+              const audioOnlyItems = pod.items.filter(item => item.bitrate <= 256000)
+              if (audioOnlyItems.length > 0) {
+                eligibleItems = audioOnlyItems
+                console.log(`Audio-only stream detected (${viewerBitrate}bps), filtered to ${eligibleItems.length} audio-only ad variants`)
+              } else {
+                console.warn(`⚠️  Audio-only stream but no audio-only ad variants available - THIS WILL CAUSE PLAYBACK ERRORS`)
+              }
+            }
+
             // Try exact bitrate match first, fall back to closest available
-            let adItem = pod.items.find(item => item.bitrate === viewerBitrate)
-            
-            if (!adItem && pod.items.length > 0) {
-              // No exact match - find closest bitrate (prefer lower to avoid buffering)
-              const sorted = [...pod.items].sort((a, b) => {
-                const diffA = Math.abs(a.bitrate - viewerBitrate)
-                const diffB = Math.abs(b.bitrate - viewerBitrate)
-                // If diffs are equal, prefer lower bitrate
-                if (diffA === diffB) return a.bitrate - b.bitrate
-                return diffA - diffB
-              })
-              adItem = sorted[0]
-              console.log(`No exact match for ${viewerBitrate}bps, using closest: ${adItem.bitrate}bps`)
+            let adItem = eligibleItems.find(item => item.bitrate === viewerBitrate)
+
+            if (!adItem && eligibleItems.length > 0) {
+              // No exact match - prefer closest LOWER bitrate to avoid buffering/quality jumps
+              // Players handle downscaling better than upscaling
+              const lowerBitrates = eligibleItems.filter(item => item.bitrate <= viewerBitrate)
+              const higherBitrates = eligibleItems.filter(item => item.bitrate > viewerBitrate)
+
+              if (lowerBitrates.length > 0) {
+                // Prefer highest available lower bitrate (closest match below requested)
+                adItem = lowerBitrates.sort((a, b) => b.bitrate - a.bitrate)[0]
+                console.log(`No exact match for ${viewerBitrate}bps, using closest lower: ${adItem.bitrate}bps`)
+              } else if (higherBitrates.length > 0) {
+                // No lower bitrates available, use lowest higher bitrate
+                adItem = higherBitrates.sort((a, b) => a.bitrate - b.bitrate)[0]
+                console.log(`No exact match for ${viewerBitrate}bps, no lower bitrates available, using lowest higher: ${adItem.bitrate}bps`)
+              }
             }
             
             if (adItem) {
+              // Update adVariant for beacon tracking
+              adVariant = adItem.bitrate
+
               const baseUrl = adItem.playlistUrl.replace("/playlist.m3u8", "")
               
               // Fetch the actual ad playlist to get real segment URLs
@@ -1420,16 +2078,15 @@ export class ChannelDO {
                 const playlistResponse = await fetchWithRetry(adItem.playlistUrl, 3)
                 
                 const playlistContent = await playlistResponse.text()
-                const adSegments: Array<{url: string, duration: number}> = []
-                
+                const adSegments: AdSegmentInfo[] = []
+
                 // Parse playlist to extract segment filenames AND durations
                 const lines = playlistContent.split('\n')
                 let currentDuration = 6.0 // Default fallback
-                
+
                 for (const line of lines) {
                   const trimmed = line.trim()
-                  
-                  // Extract duration from #EXTINF
+
                   if (trimmed.startsWith('#EXTINF:')) {
                     const match = trimmed.match(/#EXTINF:([\d.]+)/)
                     if (match) {
@@ -1437,47 +2094,23 @@ export class ChannelDO {
                     }
                     continue
                   }
-                  
-                  // Skip other comments and empty lines
+
                   if (!trimmed || trimmed.startsWith('#')) continue
-                  
-                  // This is a segment URL - add with its duration
+
                   adSegments.push({
                     url: `${baseUrl}/${trimmed}`,
-                    duration: currentDuration
+                    duration: currentDuration,
+                    type: 'ad'
                   })
                 }
-                
-                // Round total duration to avoid floating-point precision issues
-                let totalDuration = Math.round(adSegments.reduce((sum, seg) => sum + seg.duration, 0) * 100) / 100
-                console.log(`Extracted ${adSegments.length} ad segments (total: ${totalDuration.toFixed(2)}s) from playlist: ${adItem.playlistUrl}`)
-                
-                // Pad with slate if ad is shorter than SCTE-35 break duration
-                if (totalDuration < stableDuration && Math.abs(totalDuration - stableDuration) > 1.0) {
-                  const gapDuration = stableDuration - totalDuration
-                  console.log(`⚠️  Ad duration mismatch: ad=${totalDuration.toFixed(2)}s, break=${stableDuration.toFixed(2)}s, gap=${gapDuration.toFixed(2)}s, padding with slate`)
 
-                  // Fetch channel's slate configuration
-                  try {
-                    const slateSegments = await this.fetchSlateSegments(channelId, viewerBitrate, gapDuration)
-                    if (slateSegments.length > 0) {
-                      adSegments.push(...slateSegments)
-                      totalDuration = Math.round(adSegments.reduce((sum, seg) => sum + seg.duration, 0) * 100) / 100
-                      console.log(`Added ${slateSegments.length} slate segments, new total: ${totalDuration.toFixed(2)}s`)
-                    } else {
-                      console.warn('No slate segments available, gap will remain')
-                    }
-                  } catch (err) {
-                    console.error('Failed to fetch slate segments:', err)
-                  }
-                }
-                
+                let baseAdDuration = Math.round(adSegments.reduce((sum, seg) => sum + seg.duration, 0) * 1000) / 1000
+                console.log(`Extracted ${adSegments.length} ad segments (total: ${baseAdDuration.toFixed(3)}s) from playlist: ${adItem.playlistUrl}`)
+
                 if (adSegments.length > 0) {
                   const cleanOrigin = stripOriginSCTE35Markers(origin)
-                  
+
                   // FIX #4: MANIFEST WINDOW VALIDATION
-                  // Check if SCTE-35 PDT is actually in the manifest window before attempting SSAI
-                  // If PDT not found, skip SSAI entirely and jump straight to SGAI fallback
                   let shouldAttemptSSAI = true
                   if (scte35StartPDT) {
                     const pdtsInManifest = getCachedPDTs(cleanOrigin)
@@ -1486,70 +2119,158 @@ export class ChannelDO {
                       shouldAttemptSSAI = false
                     }
                   }
-                  
-                  // CRITICAL: Pass actual ad duration calculated from segments
-                  // This ensures PDT timeline continuity
-                  // Use stable skip count from ad state if available (prevents concurrent request inconsistency)
+
                   const stableSkipCount = adState?.contentSegmentsToSkip || undefined
-                  
-                  let result = { manifest: cleanOrigin, segmentsSkipped: 0, durationSkipped: 0 }
+                  let skipPlan: SkipPlan | null = null
                   if (shouldAttemptSSAI) {
-                    result = replaceSegmentsWithAds(
-                      cleanOrigin,
-                      scte35StartPDT,
-                      adSegments,
-                      totalDuration,        // Actual ad duration from segment sum
-                      stableDuration,       // SCTE-35 break duration for content skipping
-                      stableSkipCount       // Use cached skip count if available
-                    )
+                    skipPlan = calculateSkipPlan(cleanOrigin, scte35StartPDT, {
+                      scte35Duration: stableDuration,
+                      stableSkipCount
+                    })
+
+                    // Skip plan validation - allow SSAI if we have a resume PDT (even if calculated)
+                    if (!skipPlan || skipPlan.segmentsSkipped === 0 || !skipPlan.resumePDT) {
+                      console.warn(`⚠️  Unable to build skip plan for PDT ${scte35StartPDT} (plan=${JSON.stringify(skipPlan)})`)
+                      shouldAttemptSSAI = false
+                    } else if (skipPlan.remainingSegments === 0 && skipPlan.resumePDT) {
+                      console.log(`✅ SSAI will proceed with calculated resume PDT despite no remaining segments in window`)
+                    }
                   }
 
-                  // HYBRID SSAI/SGAI: If SCTE-35 PDT not found in manifest (rolled out of window),
-                  // OR if we skipped SSAI due to window validation,
-                  // fall back to SGAI (HLS Interstitials) for late-joining viewers
-                  if (result.segmentsSkipped === 0) {
-                    console.log(`🔄 SSAI failed (PDT not in manifest), falling back to SGAI for late-joining viewer`)
+                  const cueDecodeStatus = adSource === 'api'
+                    ? 'manual'
+                    : activeBreak
+                      ? (activeBreak.binaryData
+                        ? (activeBreak.binaryData.crcValid === false ? 'binary-crc-invalid' : 'binary')
+                        : 'attributes')
+                      : (adSource === 'time' ? 'schedule' : 'unknown')
 
-                    // Use SGAI interstitial insertion instead
-                    const adItem = pod.items.find(item => item.bitrate === viewerBitrate) || pod.items[0]
-                    const interstitialURI = await signAdPlaylist(signHost, this.env.SEGMENT_SECRET, adItem.playlistUrl)
+                  let boundarySnapOutcome = 'exact'
+                  let adjustedSegments: AdSegmentInfo[] = [...adSegments]
+                  let adPlaybackDuration = baseAdDuration
+                  const telemetryFallback = { boundarySnapOutcome: 'fallback', durationError: Math.abs(adPlaybackDuration - stableDuration) }
 
-                    const sgai = addDaterangeInterstitial(
+                  let result = { manifest: cleanOrigin, segmentsSkipped: 0, durationSkipped: 0, actualAdDuration: adPlaybackDuration }
+
+                  if (shouldAttemptSSAI && skipPlan) {
+                    const tolerance = 0.5
+                    const targetContentDuration = Math.round(skipPlan.durationSkipped * 1000) / 1000
+                    let durationDelta = targetContentDuration - adPlaybackDuration
+
+                    if (Math.abs(durationDelta) > tolerance) {
+                      if (durationDelta > 0) {
+                        boundarySnapOutcome = 'padded'
+                        try {
+                          const slateSegments = await this.fetchSlateSegments(channelId, viewerBitrate, durationDelta)
+                          if (slateSegments.length > 0) {
+                            const slateInfos: AdSegmentInfo[] = slateSegments.map(seg => ({ ...seg, type: 'slate' as const }))
+                            adjustedSegments = [...adjustedSegments, ...slateInfos]
+                            adPlaybackDuration = Math.round(adjustedSegments.reduce((sum, seg) => sum + seg.duration, 0) * 1000) / 1000
+                            console.log(`Added ${slateInfos.length} slate segments to align with snapped IN boundary, new ad duration=${adPlaybackDuration.toFixed(3)}s`)
+                          } else {
+                            console.warn('No slate segments available to fill snapped boundary gap')
+                            boundarySnapOutcome = 'underrun'
+                          }
+                        } catch (err) {
+                          console.error('Failed to fetch slate segments for snapped boundary padding:', err)
+                          boundarySnapOutcome = 'underrun'
+                        }
+                      } else {
+                        boundarySnapOutcome = 'trimmed'
+                        const trimmed = this.trimSlateSegments(adjustedSegments, Math.abs(durationDelta))
+                        if (trimmed > 0) {
+                          adPlaybackDuration = Math.round(adjustedSegments.reduce((sum, seg) => sum + seg.duration, 0) * 1000) / 1000
+                          console.log(`Trimmed ${trimmed.toFixed(3)}s of slate to match snapped IN boundary, new ad duration=${adPlaybackDuration.toFixed(3)}s`)
+                        } else {
+                          boundarySnapOutcome = 'overrun'
+                        }
+                      }
+                    }
+
+                    const replacement = replaceSegmentsWithAds(
                       cleanOrigin,
-                      adActive ? (adState!.podId || "ad") : pod.podId,
-                      startISO,
+                      scte35StartPDT,
+                      adjustedSegments,
+                      adPlaybackDuration,
                       stableDuration,
-                      interstitialURI
+                      stableSkipCount,
+                      {
+                        adId: adActive ? (adState!.podId || 'ad') : pod.podId,
+                        boundarySnap: boundarySnapOutcome,
+                        cueDecodeStatus,
+                        pidContinuity: 'reset',
+                        plannedDuration: stableDuration,
+                        durationError: Math.abs(adPlaybackDuration - stableDuration)
+                      }
                     )
 
-                    await this.env.BEACON_QUEUE.send(beaconMsg)
-                    return new Response(sgai, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
+                    result = replacement
+
+                    beaconMsg.metadata = {
+                      ...beaconMsg.metadata,
+                      telemetry: {
+                        pidContinuity: 'reset',
+                        cueDecodeStatus,
+                        boundarySnap: boundarySnapOutcome,
+                        durationError: Math.abs(replacement.actualAdDuration - stableDuration),
+                        plannedDuration: stableDuration,
+                        actualAdDuration: replacement.actualAdDuration,
+                        actualContentDuration: replacement.durationSkipped
+                      }
+                    }
+                  } else {
+                    beaconMsg.metadata = {
+                      ...beaconMsg.metadata,
+                      telemetry: {
+                        pidContinuity: 'reset',
+                        cueDecodeStatus,
+                        boundarySnap: telemetryFallback.boundarySnapOutcome,
+                        durationError: telemetryFallback.durationError,
+                        plannedDuration: stableDuration,
+                        actualAdDuration: adPlaybackDuration,
+                        actualContentDuration: 0
+                      }
+                    }
+                  }
+
+                  // SSAI-only mode: Skip ad if insertion point not in manifest
+                  // SGAI (HLS Interstitials) disabled because most players (hls.js, VLC, etc.) don't support it
+                  // Timeline mismatch between live content (with PDT) and VOD ads (without PDT) causes player errors
+                  if (result.segmentsSkipped === 0) {
+                    console.log(`⏩ SSAI skipped - insertion point not in manifest window (late-joining viewer or ad too far in past)`)
+                    console.log(`   Ad break timestamp: ${startISO}, likely outside ${Math.round(313 * 1.92 / 60)}min manifest window`)
+                    console.log(`   Returning clean origin manifest (no ad insertion)`)
+
+                    // Return origin without ads
+                    return new Response(cleanOrigin, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
                   }
 
                   // SSAI succeeded - persist skip stats ONLY on first request (when skip count is unset/zero)
                   // CRITICAL: Once set, never overwrite to ensure timeline consistency across all variants
                   if (adState && (!adState.contentSegmentsToSkip || adState.contentSegmentsToSkip === 0)) {
-                    // Only persist if we actually skipped content (PDT was found in manifest)
-                    if (result.segmentsSkipped > 0) {
-                      adState.contentSegmentsToSkip = result.segmentsSkipped
+                    if (result.segmentsSkipped > 0 && skipPlan) {
+                      adState.contentSegmentsToSkip = skipPlan.stableSkipCount
                       adState.skippedDuration = result.durationSkipped
+                      adState.manifestPlan = skipPlan
                       await saveAdState(this.state, adState)
-                      console.log(`✅ Persisted stable skip count (FIRST REQUEST): ${result.segmentsSkipped} segments (${result.durationSkipped.toFixed(2)}s)`)
+                      console.log(`✅ Persisted stable skip count (FIRST REQUEST): ${skipPlan.stableSkipCount} segments (${result.durationSkipped.toFixed(2)}s)`)
                     } else {
                       console.log(`⚠️  Skip count is 0 (PDT not in window) - not persisting, will retry on next request`)
                     }
-                  } else if (adState && adState.contentSegmentsToSkip) {
+                  } else if (adState && skipPlan) {
                     // TELEMETRY: Detect if recalculation produces different skip count (potential bug)
-                    if (result.segmentsSkipped > 0 && result.segmentsSkipped !== adState.contentSegmentsToSkip) {
-                      console.warn(`🚨 TELEMETRY: Skip count mismatch detected! cached=${adState.contentSegmentsToSkip}, recalc=${result.segmentsSkipped}. This may indicate concurrent request inconsistency.`)
-                      // FUTURE: Send to analytics/alerting system
-                    } else {
-                      console.log(`ℹ️  Using existing stable skip count: ${adState.contentSegmentsToSkip} segments (${adState.skippedDuration?.toFixed(2) || 'unknown'}s)`)
+                    if (result.segmentsSkipped > 0 && adState.contentSegmentsToSkip && skipPlan.stableSkipCount !== adState.contentSegmentsToSkip) {
+                      console.warn(`🚨 TELEMETRY: Skip count mismatch detected! cached=${adState.contentSegmentsToSkip}, recalc=${skipPlan.stableSkipCount}. This may indicate concurrent request inconsistency.`)
                     }
+                    adState.manifestPlan = skipPlan
+                    await saveAdState(this.state, adState)
+                    console.log(`ℹ️  Using shared manifest plan with stable skip count ${skipPlan.stableSkipCount}`)
                   }
 
+                  const renderedManifest = result.manifest
+
                   await this.env.BEACON_QUEUE.send(beaconMsg)
-                  return new Response(result.manifest, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
+                  return new Response(renderedManifest, { headers: { "Content-Type": "application/vnd.apple.mpegurl" } })
                 }
               } catch (err) {
                 console.error(`Error fetching/parsing ad playlist:`, err)

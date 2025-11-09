@@ -2,6 +2,13 @@
 
 Production-ready server-side ad insertion for live streaming on Cloudflare Workers.
 
+## 📚 Documentation
+
+- **[DEPLOYMENT.md](./DEPLOYMENT.md)** — Complete deployment guide for Cloudflare Workers
+- **[deploy-checklist.md](./deploy-checklist.md)** — Pre-deployment checklist
+- **[TESTING.md](./TESTING.md)** — Testing guide (local & production)
+- **[hls_ssai_timing_spec.md](./hls_ssai_timing_spec.md)** — SCTE-35 timing specification
+
 ## 🚀 Quick Start
 
 ### Development
@@ -18,12 +25,25 @@ npm run dev:beacon
 # Terminal 4: VAST parser
 npm run dev:vast
 
-# Test
+# Run tests
+npm run test:unit
+npm run test:integration  # Requires dev servers running
+
+# Test endpoint
 curl "http://localhost:8787?channel=ch1&variant=v_1600k.m3u8&force=sgai"
 ```
 
-### Production
+### Production Deployment
 ```bash
+# 1. Login to Cloudflare
+wrangler login
+
+# 2. Review checklist
+cat deploy-checklist.md
+
+# 3. Deploy all workers
+./deploy.sh
+# OR
 npm run deploy:all
 ```
 

@@ -3,8 +3,13 @@
 
 import { strict as assert } from "node:assert"
 import { test, describe } from "node:test"
+import { BASE_URL_VAST as VAST_PARSER_URL, shouldRunIntegrationTests } from "./test-config.ts"
 
-const VAST_PARSER_URL = "http://localhost:8790"
+// Skip all integration tests if configured
+if (!shouldRunIntegrationTests()) {
+  console.log("⊘ Skipping VAST integration tests (SKIP_INTEGRATION=1)")
+  process.exit(0)
+}
 
 // Sample VAST 3.0 XML for testing
 const SAMPLE_VAST_3_XML = `<?xml version="1.0" encoding="UTF-8"?>

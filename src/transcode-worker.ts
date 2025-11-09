@@ -28,17 +28,24 @@ export class FFmpegContainer extends Container {
   defaultPort = 8080;
   sleepAfter = '5m'; // Sleep after 5 minutes of inactivity
   instanceType = 'standard-2'; // 1 vCPU, 6GB RAM, 12GB disk
-  
+
   override onStart() {
     console.log('[FFmpegContainer] Container started');
   }
-  
+
   override onStop() {
     console.log('[FFmpegContainer] Container stopped');
   }
-  
+
   override onError(error: unknown) {
     console.error('[FFmpegContainer] Container error:', error);
+  }
+
+  // Handle alarm for sleepAfter lifecycle
+  async alarm() {
+    console.log('[FFmpegContainer] Alarm fired - container will sleep due to inactivity');
+    // Container base class handles the actual sleep logic
+    // This handler just prevents uncaught exception errors in logs
   }
 }
 
