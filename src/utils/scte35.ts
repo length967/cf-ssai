@@ -1,8 +1,13 @@
-// SCTE-35 Parser for HLS Manifests
-// Parses SCTE-35 markers from #EXT-X-DATERANGE tags in HLS manifests
-// Enhanced with binary SCTE-35 command parsing for frame-accurate insertion
+// SCTE-35 Parser utilities
+// Provides both legacy HLS manifest parsing and MPEG-TS transport parsing helpers
 
-import type { SCTE35Signal, SCTE35SignalType, SCTE35SegmentationType } from "../types"
+import type {
+  SCTE35Signal,
+  SCTE35SignalType,
+  SCTE35SegmentationType,
+  Scte35Event,
+  Scte35EventCommandType
+} from "../types"
 import {
   parseSCTE35Binary,
   createEnhancedSignal,
@@ -14,6 +19,403 @@ import {
   isSCTE35Encrypted,
   validateCRC32
 } from "./scte35-binary"
+import type { SegmentationDescriptor, SpliceInsert, TimeSignal } from "./scte35-binary"
+
+const TS_PACKET_SIZE = 188
+
+type SectionAssembler = {
+  buffer: number[]
+  lastContinuity: number | null
+  counters: number[]
+}
+
+function bytesToHex(data: Uint8Array): string {
+  return Array.from(data)
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("")
+}
+
+function bytesToBase64(data: Uint8Array): string {
+  let binary = ""
+  for (const byte of data) {
+    binary += String.fromCharCode(byte)
+  }
+  return btoa(binary)
+}
+
+function mapCommandType(commandType: number): Scte35EventCommandType {
+  switch (commandType) {
+    case 0x05:
+      return "splice_insert"
+    case 0x06:
+      return "time_signal"
+    case 0x07:
+      return "bandwidth_reservation"
+    case 0x04:
+      return "private_command"
+    default:
+      return "reserved"
+  }
+}
+
+function normalizeContinuity(counters: number[]): number[] {
+  if (counters.length === 0) return []
+  const seen = new Set<number>()
+  const out: number[] = []
+  for (const value of counters) {
+    if (!seen.has(value)) {
+      seen.add(value)
+      out.push(value)
+    }
+  }
+  return out
+}
+
+function parseProgramAssociationSection(section: Uint8Array): Array<{ programNumber: number; pmtPid: number }> {
+  if (section[0] !== 0x00) return []
+
+  const sectionLength = ((section[1] & 0x0f) << 8) | section[2]
+  const programLoopEnd = 3 + sectionLength - 4
+  const programs: Array<{ programNumber: number; pmtPid: number }> = []
+
+  for (let offset = 8; offset + 4 <= programLoopEnd; offset += 4) {
+    const programNumber = (section[offset] << 8) | section[offset + 1]
+    const pid = ((section[offset + 2] & 0x1f) << 8) | section[offset + 3]
+    if (programNumber === 0) continue // Network PID, skip
+    programs.push({ programNumber, pmtPid: pid })
+  }
+
+  return programs
+}
+
+function parseProgramMapSection(section: Uint8Array): number[] {
+  if (section[0] !== 0x02) return []
+
+  const sectionLength = ((section[1] & 0x0f) << 8) | section[2]
+  const programInfoLength = ((section[10] & 0x0f) << 8) | section[11]
+  const descriptorsEnd = 3 + sectionLength - 4
+  const pids: number[] = []
+
+  let offset = 12 + programInfoLength
+  while (offset + 5 <= descriptorsEnd) {
+    const streamType = section[offset]
+    const elementaryPid = ((section[offset + 1] & 0x1f) << 8) | section[offset + 2]
+    const esInfoLength = ((section[offset + 3] & 0x0f) << 8) | section[offset + 4]
+
+    if (streamType === 0x86) {
+      pids.push(elementaryPid)
+    }
+
+    offset += 5 + esInfoLength
+  }
+
+  return pids
+}
+
+function toPtsSeconds(pts?: number): number | undefined {
+  if (pts === undefined) return undefined
+  return Number(pts) / 90000
+}
+
+function normalizeSegmentationTypeName(name?: string): SCTE35SegmentationType | undefined {
+  if (!name) return undefined
+  const normalized = name.toLowerCase()
+
+  if (normalized.includes("provider") && normalized.includes("ad")) return "Provider Ad"
+  if (normalized.includes("distributor") && normalized.includes("ad")) return "Distributor Ad"
+  if (normalized.includes("program") && normalized.includes("start")) return "Program Start"
+  if (normalized.includes("program") && normalized.includes("end")) return "Program End"
+  if (normalized.includes("chapter") && normalized.includes("start")) return "Chapter Start"
+  if (normalized.includes("break") && normalized.includes("start")) return "Break Start"
+  if (normalized.includes("break") && normalized.includes("end")) return "Break End"
+  if (normalized.includes("unscheduled")) return "Unscheduled Event"
+
+  return undefined
+}
+
+function createScte35Event(
+  section: Uint8Array,
+  pid: number,
+  programNumber: number | undefined,
+  continuityCounters: number[],
+  ingestTimestamp: number
+): Scte35Event | null {
+  if (section.length === 0) return null
+
+  const rawHex = bytesToHex(section)
+  const raw = bytesToBase64(section)
+  const parsed = parseSCTE35Binary(raw)
+
+  const commandTypeId = parsed?.spliceCommandType ?? -1
+  const commandType = mapCommandType(commandTypeId)
+
+  const event: Scte35Event = {
+    programNumber,
+    pid,
+    eventId: "", // filled below
+    commandType,
+    commandTypeId,
+    continuityCounters: normalizeContinuity(continuityCounters),
+    raw,
+    rawHex,
+    crc32: parsed?.crc32,
+    crcValid: parsed?.crcValid,
+    encrypted: parsed?.encryptedPacket,
+    encryptionAlgorithm: parsed?.encryptionAlgorithm,
+    protocolVersion: parsed?.protocolVersion,
+    ptsAdjustment: parsed ? Number(parsed.ptsAdjustment) : undefined,
+    cwIndex: parsed?.cwIndex,
+    tier: parsed?.tier,
+    ingestTimestamp
+  }
+
+  if (parsed?.spliceCommandType === 0x05 && parsed.spliceCommand) {
+    const spliceInsert = parsed.spliceCommand as SpliceInsert
+    event.spliceEventId = spliceInsert.spliceEventId
+    event.spliceEventCancelIndicator = spliceInsert.spliceEventCancelIndicator
+    event.outOfNetworkIndicator = spliceInsert.outOfNetworkIndicator
+    event.programSpliceFlag = spliceInsert.programSpliceFlag
+    event.durationFlag = spliceInsert.durationFlag
+    event.spliceImmediateFlag = spliceInsert.spliceImmediateFlag
+
+    const ptsTime = spliceInsert.spliceTime?.ptsTime
+    if (ptsTime !== undefined) {
+      const pts = Number(ptsTime)
+      event.pts = pts
+      event.ptsSeconds = toPtsSeconds(pts)
+    }
+
+    if (spliceInsert.breakDuration) {
+      event.breakDurationSeconds = spliceInsert.breakDuration.durationSeconds
+      event.autoReturn = spliceInsert.breakDuration.autoReturn
+    }
+  } else if (parsed?.spliceCommandType === 0x06 && parsed.spliceCommand) {
+    const timeSignal = parsed.spliceCommand as TimeSignal
+    const ptsTime = timeSignal.spliceTime?.ptsTime
+    if (ptsTime !== undefined) {
+      const pts = Number(ptsTime)
+      event.pts = pts
+      event.ptsSeconds = toPtsSeconds(pts)
+    }
+  }
+
+  if (parsed?.descriptors?.length) {
+    const segmentationDescriptor = parsed.descriptors.find(
+      (descriptor) => descriptor.identifier === "CUEI" && (descriptor.data as SegmentationDescriptor | undefined)?.segmentationEventId !== undefined
+    )
+
+    if (segmentationDescriptor) {
+      const data = segmentationDescriptor.data as SegmentationDescriptor
+      event.segmentationEventId = data.segmentationEventId
+      event.segmentationTypeId = data.segmentationTypeId
+      event.segmentationTypeName = data.segmentationTypeName
+      event.segmentNum = data.segmentNum
+      event.segmentsExpected = data.segmentsExpected
+      event.subSegmentNum = data.subSegmentNum
+      event.subSegmentsExpected = data.subSegmentsExpected
+      event.upidType = data.segmentationUpidType
+      event.upid = data.segmentationUpid
+      event.segmentationDurationSeconds = data.segmentationDurationSeconds
+      event.deliveryRestrictions = {
+        webAllowed: data.webDeliveryAllowedFlag,
+        noRegionalBlackout: data.noRegionalBlackoutFlag,
+        archiveAllowed: data.archiveAllowedFlag,
+        deviceRestrictions: data.deviceRestrictions
+      }
+    }
+  }
+
+  if (event.breakDurationSeconds === undefined && event.segmentationDurationSeconds !== undefined) {
+    event.breakDurationSeconds = event.segmentationDurationSeconds
+  }
+
+  if (!event.eventId) {
+    if (event.segmentationEventId !== undefined) {
+      event.eventId = `seg-${event.segmentationEventId}`
+    } else if (event.spliceEventId !== undefined) {
+      event.eventId = `splice-${event.spliceEventId}`
+    } else {
+      event.eventId = `raw-${rawHex}`
+    }
+  }
+
+  const ccLog = event.continuityCounters.length > 0 ? event.continuityCounters.join(",") : "n/a"
+  const preview = rawHex.length > 48 ? `${rawHex.slice(0, 48)}…` : rawHex
+  console.log(
+    `[SCTE35] Parsed event ${event.eventId} on PID 0x${pid.toString(16)} (program=${programNumber ?? "unknown"}) ` +
+      `command=${event.commandType} cc=[${ccLog}] raw=${preview}`
+  )
+
+  return event
+}
+
+export function parseScte35FromTransportStream(data: ArrayBuffer | Uint8Array): Scte35Event[] {
+  const bytes = data instanceof Uint8Array ? data : new Uint8Array(data)
+  const events: Scte35Event[] = []
+  const programForPmt = new Map<number, number>()
+  const sctePidToProgram = new Map<number, number>()
+  const assemblers = new Map<number, SectionAssembler>()
+  const ingestTimestamp = Date.now()
+
+  for (let offset = 0; offset + TS_PACKET_SIZE <= bytes.length; offset += TS_PACKET_SIZE) {
+    const packet = bytes.subarray(offset, offset + TS_PACKET_SIZE)
+
+    if (packet[0] !== 0x47) {
+      console.warn(`[SCTE35] Invalid TS sync byte at packet ${offset / TS_PACKET_SIZE}`)
+      continue
+    }
+
+    const payloadUnitStartIndicator = (packet[1] & 0x40) !== 0
+    const pid = ((packet[1] & 0x1f) << 8) | packet[2]
+    const adaptationFieldControl = (packet[3] >> 4) & 0x03
+    const continuityCounter = packet[3] & 0x0f
+
+    const hasPayload = adaptationFieldControl === 1 || adaptationFieldControl === 3
+    if (!hasPayload) continue
+
+    let assembler = assemblers.get(pid)
+    if (!assembler) {
+      assembler = { buffer: [], lastContinuity: null, counters: [] }
+      assemblers.set(pid, assembler)
+    }
+
+    let index = 4
+    if (adaptationFieldControl === 2 || adaptationFieldControl === 3) {
+      const adaptationLength = packet[index]
+      index += 1 + adaptationLength
+      if (index >= TS_PACKET_SIZE) continue
+    }
+
+    let payload = packet.subarray(index, TS_PACKET_SIZE)
+    if (payload.length === 0) continue
+
+    if (payloadUnitStartIndicator) {
+      const pointerField = payload[0]
+      const startOffset = 1 + pointerField
+      assembler.buffer = []
+      assembler.counters = []
+      assembler.lastContinuity = continuityCounter
+
+      if (startOffset >= payload.length) {
+        continue
+      }
+      payload = payload.subarray(startOffset)
+    } else if (assembler.lastContinuity !== null) {
+      const expected = (assembler.lastContinuity + 1) & 0x0f
+      if (expected !== continuityCounter && assembler.buffer.length > 0) {
+        console.warn(
+          `[SCTE35] Continuity counter jump on PID 0x${pid.toString(16)}: expected ${expected}, got ${continuityCounter}`
+        )
+        assembler.buffer = []
+        assembler.counters = []
+      }
+      assembler.lastContinuity = continuityCounter
+    } else {
+      assembler.lastContinuity = continuityCounter
+    }
+
+    if (!assembler.counters.includes(continuityCounter)) {
+      assembler.counters.push(continuityCounter)
+    }
+
+    for (const byte of payload) {
+      assembler.buffer.push(byte)
+    }
+
+    while (assembler.buffer.length >= 3) {
+      const sectionLength = ((assembler.buffer[1] & 0x0f) << 8) | assembler.buffer[2]
+      const totalLength = sectionLength + 3
+      if (assembler.buffer.length < totalLength) break
+
+      const sectionBytes = assembler.buffer.slice(0, totalLength)
+      assembler.buffer = assembler.buffer.slice(totalLength)
+
+      const counters = assembler.counters.slice()
+      assembler.counters = assembler.counters.slice(-1)
+
+      const section = Uint8Array.from(sectionBytes)
+
+      if (pid === 0x0000) {
+        const programs = parseProgramAssociationSection(section)
+        for (const { programNumber, pmtPid } of programs) {
+          if (!programForPmt.has(pmtPid)) {
+            console.log(`[SCTE35] PAT discovered PMT PID 0x${pmtPid.toString(16)} for program ${programNumber}`)
+          }
+          programForPmt.set(pmtPid, programNumber)
+        }
+        continue
+      }
+
+      const programNumber = programForPmt.get(pid)
+      if (programNumber !== undefined && section[0] === 0x02) {
+        const sctePids = parseProgramMapSection(section)
+        for (const sctePid of sctePids) {
+          if (!sctePidToProgram.has(sctePid)) {
+            console.log(`[SCTE35] PMT discovered SCTE-35 PID 0x${sctePid.toString(16)} for program ${programNumber}`)
+          }
+          sctePidToProgram.set(sctePid, programNumber)
+        }
+        continue
+      }
+
+      const eventProgram = sctePidToProgram.get(pid)
+      if (eventProgram !== undefined) {
+        const event = createScte35Event(section, pid, eventProgram, counters, ingestTimestamp)
+        if (event) {
+          events.push(event)
+        }
+      }
+    }
+  }
+
+  return events
+}
+
+export function eventToSignal(event: Scte35Event): SCTE35Signal | null {
+  const parsed = parseSCTE35Binary(event.raw)
+  if (!parsed) {
+    console.warn(`[SCTE35] Unable to normalize event ${event.eventId}: invalid splice_info_section payload`)
+    return null
+  }
+
+  let type: SCTE35SignalType = event.commandType === "splice_insert" ? "splice_insert" : "time_signal"
+  if (event.segmentationTypeName) {
+    const lowered = event.segmentationTypeName.toLowerCase()
+    if (lowered.includes("end") || lowered.includes("return")) {
+      type = "return_signal"
+    }
+  }
+
+  const segmentationType = normalizeSegmentationTypeName(event.segmentationTypeName)
+  const breakDuration = event.breakDurationSeconds ?? event.segmentationDurationSeconds
+
+  const binaryData: SCTE35Signal["binaryData"] = {
+    spliceEventId: event.spliceEventId,
+    protocolVersion: parsed.protocolVersion,
+    ptsAdjustment: event.ptsAdjustment !== undefined ? BigInt(Math.round(event.ptsAdjustment)) : undefined,
+    crcValid: event.crcValid,
+    tier: event.tier,
+    cwIndex: event.cwIndex,
+    encryptedPacket: parsed.encryptedPacket,
+    encryptionAlgorithm: parsed.encryptionAlgorithm,
+    segmentationDescriptors: parsed.descriptors,
+    deliveryRestrictions: event.deliveryRestrictions,
+  }
+
+  return {
+    id: event.eventId,
+    type,
+    pts: event.pts,
+    duration: breakDuration,
+    segmentationType,
+    upid: event.upid,
+    breakDuration,
+    autoReturn: event.autoReturn,
+    segmentNum: event.segmentNum,
+    segmentsExpected: event.segmentsExpected,
+    binaryData,
+  }
+}
 
 /**
  * Parse SCTE-35 signals from HLS manifest
@@ -44,6 +446,7 @@ export function parseSCTE35FromManifest(manifestText: string): SCTE35Signal[] {
 function parseDateRangeSCTE35(line: string): SCTE35Signal | null {
   // Parse attributes from DATERANGE tag
   const attrs = parseDateRangeAttributes(line)
+  const rawAttributes = { ...attrs }
   
   // Check if this is an SCTE-35 signal
   // SCTE-35 signals typically have SCTE35-CMD or SCTE35-OUT/SCTE35-IN attributes
@@ -67,7 +470,7 @@ function parseDateRangeSCTE35(line: string): SCTE35Signal | null {
     const enhancedSignal = createEnhancedSignal(id, binaryCmd, attrs)
     if (enhancedSignal) {
       console.log(`SCTE-35 binary parsing successful: Event ID ${enhancedSignal.binaryData?.spliceEventId}, CRC valid: ${enhancedSignal.binaryData?.crcValid}`)
-      return enhancedSignal
+      return { ...enhancedSignal, rawAttributes, rawCommand: binaryCmd }
     } else {
       console.warn(`SCTE-35 binary parsing failed for ${id}, falling back to attribute parsing`)
     }
@@ -110,7 +513,9 @@ function parseDateRangeSCTE35(line: string): SCTE35Signal | null {
     breakDuration,
     autoReturn,
     segmentNum,
-    segmentsExpected
+    segmentsExpected,
+    rawAttributes,
+    rawCommand: binaryCmd
   }
 }
 

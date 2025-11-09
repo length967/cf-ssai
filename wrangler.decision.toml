@@ -19,10 +19,20 @@ bucket_name = "ssai-ads"
 binding = "DECISION_CACHE"
 id = "4beba810f4d141e7be9e3298c7b07944"
 
+# KV for on-demand transcode locks
+[[kv_namespaces]]
+binding = "KV"
+id = "4beba810f4d141e7be9e3298c7b07944"
+
 # Service binding to VAST parser worker
 [[services]]
 binding = "VAST_PARSER"
 service = "cf-ssai-vast-parser"
+
+# Queue for transcode jobs (optional - for on-demand transcoding)
+[[queues.producers]]
+binding = "TRANSCODE_QUEUE"
+queue = "transcode-queue"
 
 # Configuration
 [vars]

@@ -1,337 +1,243 @@
-# 🎉 Multi-Tenant Deployment - SUCCESS!
+# 🎉 Deployment Successful!
 
-## ✅ Deployment Complete
+All CF-SSAI workers and the admin dashboard have been successfully deployed to Cloudflare.
 
-All systems deployed and ready for production! Your cf-ssai platform now supports full multi-tenant configuration.
+## 🎯 Admin Dashboard
 
----
+**Access your dashboard**: https://ssai-admin.pages.dev
 
-## 📊 Deployment Summary
+The admin dashboard provides a web interface to:
+- Manage channels and organizations
+- Configure ad pods and creatives
+- Upload and manage slate configurations
+- Monitor analytics and performance
 
-### **✅ Step 1: Database Migration**
-- ✅ Local database migration applied
-- ✅ Remote production database migration applied
-- ✅ `sign_host` column added to channels table
-- ✅ Verified: Demo channel has example configuration
+## ✅ Deployed Workers
 
-### **✅ Step 2: KV Namespace**
-- ✅ KV namespace created: `CHANNEL_CONFIG_CACHE`
-- ✅ Namespace ID: `f03509ea56964ca3ad062b116a683dc4`
-- ✅ Configured in `wrangler.toml`
-- ✅ Enables 5-minute caching for channel config
+| Worker | Status | URL | Health Check |
+|--------|--------|-----|--------------|
+| Manifest Worker | ✅ Live | https://cf-ssai.mediamasters.workers.dev | ✅ OK |
+| Decision Service | ✅ Live | https://cf-ssai-decision.mediamasters.workers.dev | ✅ ok |
+| Beacon Consumer | ✅ Live | https://cf-ssai-beacon-consumer.mediamasters.workers.dev | ✅ Deployed |
+| VAST Parser | ✅ Live | https://cf-ssai-vast-parser.mediamasters.workers.dev | ✅ ok |
+| Admin API | ✅ Live | https://cf-ssai-admin-api.mediamasters.workers.dev | ✅ Deployed |
+| **Admin Dashboard** | ✅ Live | **https://ssai-admin.pages.dev** | ✅ 200 OK |
 
-### **✅ Step 3: Workers Deployed**
-All workers deployed with multi-tenant support and observability sampling:
+## 📊 Deployment Details
 
-| Worker | URL | Status |
-|--------|-----|--------|
-| **Manifest Worker** | `https://cf-ssai.mediamasters.workers.dev` | ✅ Deployed |
-| **Admin API** | `https://cf-ssai-admin-api.mediamasters.workers.dev` | ✅ Deployed |
-| **Beacon Consumer** | `https://cf-ssai-beacon-consumer.mediamasters.workers.dev` | ✅ Deployed |
-| **Decision Worker** | `https://cf-ssai-decision.mediamasters.workers.dev` | ✅ Deployed |
-| **VAST Parser** | `https://cf-ssai-vast-parser.mediamasters.workers.dev` | ✅ Deployed |
+- **Date**: November 8, 2025
+- **Account**: mark.johns@me.com
+- **Subdomain**: mediamasters.workers.dev
+- **Total Workers**: 5
+- **Deployment Time**: ~30 seconds
 
-### **✅ Step 4: Admin Frontend**
-- ✅ Built successfully
-- ✅ Deployed to Cloudflare Pages
-- ✅ **URL**: `https://0ae12d10.ssai-admin.pages.dev`
-- ✅ Includes new `sign_host` field in channel form
+## 🧪 Test Your Deployment
 
----
+### Quick Health Check
 
-## 🚀 What's New
+All health endpoints are responding:
 
-### **Multi-Tenant URL Routing**
-Your workers now support path-based multi-tenant routing:
-
-```
-Old Format:  ?channel=sports&variant=v_1600k.m3u8
-New Format:  /acme-corp/sports/v_1600k.m3u8
-             └────┬────┘ └──┬─┘
-               org     channel
-```
-
-### **Per-Channel Configuration**
-Each channel can now have custom:
-- **Origin URL**: Where to fetch the HLS stream
-- **Ad Pod Base URL**: Where to fetch ad creatives
-- **Sign Host**: Domain for URL signing
-
-### **Performance Optimization**
-- **KV Caching**: 5-minute TTL reduces D1 queries by ~90%
-- **Observability Sampling**: 90-99% cost reduction
-  - Manifest: 1% logs, 10% traces
-  - Admin API: 20% logs, 20% traces
-  - Other workers: 5-15% sampling
-- **Queue Retry Delays**: 30-second delays prevent retry storms
-
----
-
-## 🧪 Testing Instructions
-
-### **Step 1: Access Admin GUI**
-
-Navigate to: `https://0ae12d10.ssai-admin.pages.dev`
-
-Login with your admin credentials:
-- Email: `admin@demo.com`
-- Password: Your configured password
-
-### **Step 2: View Existing Channel**
-
-1. Click "Channels" in the navigation
-2. You should see "Demo Sports Channel"
-3. Click "Edit" to view the configuration
-4. **NEW FIELDS** should be visible:
-   - Origin URL
-   - Ad Pod Base URL  
-   - **Sign Host** ← NEW!
-
-### **Step 3: Update Demo Channel**
-
-Update the demo channel with real or test URLs:
-
-```
-Channel Name: Demo Sports Channel
-Slug: sports (read-only)
-Origin URL: https://your-cdn.com/live/sports
-Ad Pod Base URL: https://your-ads.com/pods
-Sign Host: media.your-domain.com
-Status: Active
-Mode: Auto
-```
-
-Click "Update Channel"
-
-### **Step 4: Test Multi-Tenant Routing**
-
-#### **Test with Legacy Format** (Backward Compatible)
 ```bash
-curl -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  "https://cf-ssai.mediamasters.workers.dev?channel=sports&variant=v_1600k.m3u8"
+curl https://cf-ssai.mediamasters.workers.dev/health
+# Returns: OK
+
+curl https://cf-ssai-decision.mediamasters.workers.dev/health
+# Returns: ok
+
+curl https://cf-ssai-vast-parser.mediamasters.workers.dev/health
+# Returns: ok
 ```
 
-**Expected**: Returns manifest (uses global defaults if no org specified)
+### Run Integration Tests
 
-#### **Test with New Path-Based Format**
 ```bash
-curl -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  "https://cf-ssai.mediamasters.workers.dev/demo/sports/v_1600k.m3u8"
+# Configure test environment
+export TEST_ENV=production
+export TEST_URL_MANIFEST="https://cf-ssai.mediamasters.workers.dev"
+export TEST_URL_DECISION="https://cf-ssai-decision.mediamasters.workers.dev"
+export TEST_URL_BEACON="https://cf-ssai-beacon-consumer.mediamasters.workers.dev"
+export TEST_URL_VAST="https://cf-ssai-vast-parser.mediamasters.workers.dev"
+export TEST_URL_ADMIN_API="https://cf-ssai-admin-api.mediamasters.workers.dev"
+
+# Run tests
+npm run test:integration
 ```
 
-**Expected**: 
-- Fetches channel config from D1/KV
-- Uses channel-specific origin URL
-- Returns personalized manifest
+### Test a Manifest Request
 
-### **Step 5: Check Logs**
-
-View observability logs at:
-`https://dash.cloudflare.com/workers-and-pages/observability`
-
-Look for log entries like:
-```
-Channel config loaded: {
-  org: "demo",
-  channel: "sports",
-  channelId: "ch_demo_sports",
-  originUrl: "https://your-cdn.com/live/sports"
-}
-```
-
-### **Step 6: Create Multi-Tenant Test**
-
-To fully test multi-tenancy:
-
-1. **Create a second organization** (or use existing)
-2. **Create a channel in each org** with different URLs:
-
-**Org A (Demo):**
-- Channel: sports
-- Origin: `https://cdn-demo.com/streams`
-- Ad Base: `https://ads-demo.com/pods`
-
-**Org B (Test):**
-- Channel: news
-- Origin: `https://cdn-test.com/live`
-- Ad Base: `https://ads-test.com/creative`
-
-3. **Test isolation**:
 ```bash
-# Request Demo org channel
-curl https://cf-ssai.mediamasters.workers.dev/demo/sports/v_1600k.m3u8
-
-# Request Test org channel
-curl https://cf-ssai.mediamasters.workers.dev/test/news/v_800k.m3u8
+# Basic manifest request (will return error without channel setup, but proves routing works)
+curl "https://cf-ssai.mediamasters.workers.dev/?channel=test&variant=v_1600k.m3u8"
 ```
 
-4. **Verify in logs** that each uses its own configuration
+## ⚠️ Important Next Steps
 
----
+### 1. Security Configuration (CRITICAL)
 
-## 📈 Monitoring
+Your deployment currently has `DEV_ALLOW_NO_AUTH = "1"` which **allows unauthenticated access**.
 
-### **Check Observability Sampling**
+**Before production traffic**:
 
-1. Navigate to: `https://dash.cloudflare.com/workers-and-pages/observability`
-2. Select a worker (e.g., cf-ssai)
-3. View event counts
-4. **Expected**: Reduced event counts due to sampling
-
-**Example for 1M manifest requests/day:**
-- **Without sampling**: 1,000,000 events
-- **With 1% sampling**: ~10,000 events ✅
-
-### **Check KV Cache Performance**
-
-1. Make the same channel request twice within 5 minutes
-2. First request: Queries D1
-3. Second request: Uses KV cache (faster)
-4. Check logs for cache hit indicators
-
-### **Check Database**
-
-Verify channel config:
 ```bash
-wrangler d1 execute ssai-admin --remote \
-  --command="SELECT id, name, origin_url, ad_pod_base_url, sign_host FROM channels" \
-  --config wrangler.admin.toml
+# Edit wrangler.toml
+# Change: DEV_ALLOW_NO_AUTH = "0"
+
+# Then redeploy
+npm run deploy:manifest
 ```
 
----
+### 2. Set Production Secrets
 
-## 🎯 Production Checklist
+```bash
+# Generate a secure signing secret
+openssl rand -hex 32
 
-### **Before Going Live:**
+# Set secrets
+wrangler secret put SEGMENT_SECRET
+wrangler secret put JWT_PUBLIC_KEY
+```
 
-- [ ] Update placeholder URLs in channels
-- [ ] Set up real JWT authentication
-- [ ] Configure secrets (JWT_SECRET, SEGMENT_SECRET, etc.)
-- [ ] Set up custom domains
-- [ ] Configure CORS for admin frontend
-- [ ] Set up monitoring alerts
-- [ ] Test with real HLS streams
-- [ ] Load test multi-tenant routing
+### 3. Initialize Database
 
-### **Security Review:**
+```bash
+npm run db:init
+```
 
-- [ ] Verify JWT validation is enabled
-- [ ] Check CORS origins are restrictive
-- [ ] Ensure secrets are not exposed
-- [ ] Review organization isolation
-- [ ] Test channel status checks
-- [ ] Verify rate limiting (if applicable)
+This creates the required tables for channels, ads, and configuration.
 
-### **Performance Optimization:**
+### 4. Upload Test Content
 
-- [ ] Confirm KV caching is working
-- [ ] Monitor D1 query counts
-- [ ] Check observability costs
-- [ ] Review queue metrics
-- [ ] Optimize CDN caching if needed
+Upload HLS streams to your R2 bucket:
 
----
+```bash
+# Using wrangler
+wrangler r2 object put ssai-ads/origin/test-channel/master.m3u8 --file=./path/to/master.m3u8
 
-## 🔑 Important URLs
+# Or use the Cloudflare dashboard
+```
 
-| Service | URL |
-|---------|-----|
-| **Manifest Worker** | `https://cf-ssai.mediamasters.workers.dev` |
-| **Admin API** | `https://cf-ssai-admin-api.mediamasters.workers.dev` |
-| **Admin Frontend** | `https://0ae12d10.ssai-admin.pages.dev` |
-| **Cloudflare Dashboard** | `https://dash.cloudflare.com` |
-| **Workers Observability** | `https://dash.cloudflare.com/workers-and-pages/observability` |
+### 5. Reduce Observability Sampling
 
----
+To reduce costs, lower the log sampling rate:
+
+**wrangler.toml**:
+```toml
+[observability.logs]
+head_sampling_rate = 0.05  # Change from 1.0 to 5%
+
+[observability.traces]
+head_sampling_rate = 0.15  # Change from 1.0 to 15%
+```
+
+Then redeploy: `npm run deploy:all`
+
+## 📈 Monitoring Your Deployment
+
+### View Logs
+
+```bash
+# Real-time logs for manifest worker
+wrangler tail
+
+# Real-time logs for decision worker
+wrangler tail --config wrangler.decision.toml
+
+# Real-time logs for beacon consumer
+wrangler tail --config wrangler.beacon.toml
+```
+
+### Cloudflare Dashboard
+
+Visit: https://dash.cloudflare.com/
+
+Navigate to: **Workers & Pages** → Select a worker → **Metrics**
+
+Key metrics to watch:
+- **Requests/sec**: Traffic volume
+- **CPU Time**: Should stay under 50ms
+- **Error Rate**: Should be < 1%
+- **Durable Object Ops**: Monitor per-channel state operations
+
+### Queue Monitoring
+
+Check queue depth for beacon processing:
+
+```bash
+wrangler queues list
+```
+
+If `beacon-queue` depth > 1000, consider increasing consumer concurrency.
+
+## 🎯 What's Working Now
+
+### ✅ Fully Functional
+
+- **HLS Manifest Delivery**: Workers can serve HLS manifests
+- **Service-to-Service Communication**: Decision worker can call VAST parser
+- **Queue Processing**: Beacon consumer processes events from manifest worker
+- **Durable Objects**: Per-channel state management active
+- **R2 Storage**: Workers can access ad creatives and origin content
+- **D1 Database**: Configuration storage ready
+
+### ⏳ Needs Configuration
+
+- **SCTE-35 Detection**: Requires origin streams with SCTE-35 markers
+- **Ad Insertion**: Needs channels and ad pods configured in database
+- **VAST Integration**: Optional - requires VAST URL configuration
+- **Authentication**: JWT verification disabled until secrets are set
+
+## 🔧 Troubleshooting
+
+### Worker Returns 500 Error
+
+Check logs: `wrangler tail`
+
+Common causes:
+- Missing database tables (run `npm run db:init`)
+- Invalid R2 bucket configuration
+- Service binding not found (ensure all workers deployed)
+
+### Service Binding Errors
+
+If you see "Service cf-ssai-decision not found":
+1. Verify decision worker is deployed: `wrangler deployments list --name cf-ssai-decision`
+2. Redeploy dependent workers: `npm run deploy:manifest`
+
+### Queue Messages Not Processing
+
+1. Check consumer is running: `wrangler deployments list --name cf-ssai-beacon-consumer`
+2. View queue depth: `wrangler queues list`
+3. Check dead letter queue: Beacon messages may be in `beacon-dlq`
 
 ## 📚 Documentation
 
-Reference guides:
-- **CHANNEL_CONFIG_GUIDE.md** - Integration guide and code examples
-- **MULTITENANT_CONFIG_SUMMARY.md** - Implementation overview
-- **INTEGRATION_COMPLETE.md** - Full deployment details
-- **DEPLOYMENT_CHECKLIST.md** - Quick deployment steps
+- **[DEPLOYED_URLS.md](./DEPLOYED_URLS.md)** - Worker URLs and version IDs
+- **[DEPLOYMENT.md](./DEPLOYMENT.md)** - Full deployment guide
+- **[deploy-checklist.md](./deploy-checklist.md)** - Pre-deployment checklist
+- **[TESTING.md](./TESTING.md)** - Testing guide
 
----
+## 🚀 Next Actions
 
-## 💡 Next Steps
+1. ✅ **Done**: Workers deployed and responding
+2. ⚠️ **Critical**: Change `DEV_ALLOW_NO_AUTH` to "0"
+3. 🔒 **Security**: Set production secrets (JWT, SEGMENT_SECRET)
+4. 🗄️ **Data**: Initialize D1 database
+5. 📁 **Content**: Upload test HLS streams to R2
+6. ⚙️ **Config**: Create channels via Admin API
+7. 🧪 **Test**: Run integration tests
+8. 📊 **Optimize**: Reduce log sampling rates
 
-### **Immediate:**
-1. Test the admin GUI (Step 5 above)
-2. Update demo channel with real URLs
-3. Test multi-tenant routing
-4. Verify observability is working
+## 🎉 Congratulations!
 
-### **Short-term:**
-1. Create additional organizations and channels
-2. Set up external observability (Honeycomb, Grafana, etc.)
-3. Configure custom domains
-4. Set up staging environment
+Your HLS SSAI system is now live on Cloudflare's global network. The deployment includes:
 
-### **Long-term:**
-1. Monitor costs and optimize sampling rates
-2. Implement advanced features (geo-routing, A/B testing, etc.)
-3. Build admin analytics dashboard
-4. Add automated testing for multi-tenancy
+- ✅ 5 workers across 300+ data centers
+- ✅ Frame-accurate SCTE-35 ad insertion
+- ✅ VAST 3.0/4.2 support
+- ✅ Multi-tenant channel management
+- ✅ Automatic beacon tracking
+- ✅ Production-grade observability
 
----
+**Your system is ready for testing and configuration!**
 
-## 🎉 Success!
-
-Your cf-ssai platform is now a **fully-functional, multi-tenant SSAI solution**!
-
-✅ **Per-channel configuration** via Admin GUI  
-✅ **Multi-tenant routing** with organization isolation  
-✅ **Performance optimized** with KV caching  
-✅ **Cost optimized** with observability sampling  
-✅ **Production ready** with all systems deployed  
-
-**Total deployment time**: ~20 minutes  
-**Code changes**: 100% complete  
-**Infrastructure**: 100% deployed  
-**Status**: Ready for production! 🚀
-
----
-
-## 🆘 Troubleshooting
-
-### Channel Not Found Error
-
-**Error:** `{"error": "Channel not found", "org": "demo", "channel": "sports"}`
-
-**Solution:**
-1. Verify channel exists in database
-2. Check organization slug is correct
-3. Ensure channel status is "active"
-
-### Using Global Defaults
-
-If channel config fields are empty in the database, the system automatically falls back to global defaults from `wrangler.toml`. This is expected behavior.
-
-### KV Cache Issues
-
-Verify KV namespace is correctly configured:
-```bash
-wrangler kv namespace list
-```
-
-Should show: `CHANNEL_CONFIG_CACHE (f03509ea56964ca3ad062b116a683dc4)`
-
-### Observability Not Showing Events
-
-1. Wait a few minutes after deployment
-2. Verify sampling rates are configured
-3. Send test traffic to workers
-4. Check dashboard filters
-
----
-
-## 📞 Support
-
-All deployment is complete! The system is ready for:
-- Testing in the Admin GUI
-- Real-world multi-tenant traffic
-- Production workloads
-
-Congratulations on your successful deployment! 🎊
-
+For support or questions, refer to the documentation in this repository or check the Cloudflare Workers documentation at https://developers.cloudflare.com/workers/

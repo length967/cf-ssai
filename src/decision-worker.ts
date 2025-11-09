@@ -430,7 +430,9 @@ async function runAdWaterfall(
       let channelBitrates: number[] = []
       if (channelConfig.bitrateLadder) {
         try {
-          channelBitrates = JSON.parse(channelConfig.bitrateLadder)
+          const bitratesKbps = JSON.parse(channelConfig.bitrateLadder) as number[]
+          // Convert kbps to bps for comparison with ad variants
+          channelBitrates = bitratesKbps.map(kbps => kbps * 1000)
         } catch (e) {
           console.warn('Failed to parse bitrate ladder:', e)
         }

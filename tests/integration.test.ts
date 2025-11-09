@@ -3,10 +3,18 @@
 
 import { strict as assert } from "node:assert"
 import { test, describe } from "node:test"
+import {
+  BASE_URL_MANIFEST,
+  BASE_URL_DECISION,
+  BASE_URL_VAST,
+  shouldRunIntegrationTests
+} from "./test-config.ts"
 
-const BASE_URL_MANIFEST = "http://localhost:8787"
-const BASE_URL_DECISION = "http://localhost:8788"
-const BASE_URL_VAST = "http://localhost:8790"
+// Skip all integration tests if configured
+if (!shouldRunIntegrationTests()) {
+  console.log("⊘ Skipping integration tests (SKIP_INTEGRATION=1)")
+  process.exit(0)
+}
 
 // Sample SCTE-35 manifest from origin
 const SCTE35_ORIGIN_MANIFEST = `#EXTM3U
