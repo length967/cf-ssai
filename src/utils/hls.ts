@@ -6,22 +6,20 @@ export type VariantInfo = { bandwidth?: number; resolution?: string; uri: string
 /**
  * Extract bitrates (in kbps) from HLS master manifest
  * Returns sorted array of bitrates for transcoding ladder matching
- * Filters out audio-only variants (< 200 kbps or no video codec/resolution)
+ * IMPORTANT: Includes BOTH video+audio AND audio-only variants for proper ad matching
  */
 export function extractBitrates(masterManifest: string): number[] {
   const lines = masterManifest.split('\n')
   const variants = parseVariant(lines)
-  
+
   // Extract bandwidths and convert from bps to kbps
-  // Filter out audio-only variants (isVideo=false or very low bitrate)
+  // Include ALL variants (both video+audio and audio-only)
   const bitrates = variants
-    .filter(v => v.isVideo !== false) // Keep only video variants
     .map(v => v.bandwidth)
-    .filter((bw): bw is number => bw !== undefined)
+    .filter((bw): bw is number => bw !== undefined && bw > 0)
     .map(bw => Math.round(bw / 1000)) // Convert bps to kbps
-    .filter(kbps => kbps >= 200) // Extra safety: filter very low bitrates (audio-only)
     .sort((a, b) => a - b) // Sort ascending
-  
+
   // Remove duplicates
   return Array.from(new Set(bitrates))
 }

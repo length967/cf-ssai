@@ -1844,12 +1844,13 @@ export class ChannelDO {
             interstitialURI = adState!.podUrl
           } else {
             // Detect if this is an audio-only stream to prevent codec mismatches
-            const isAudioOnly = viewerBitrate < 300000 && variant.toLowerCase().includes('audio')
+            // Audio-only threshold: <= 256kbps (64k, 128k, 256k are typical audio bitrates)
+            const isAudioOnly = viewerBitrate <= 256000 && variant.toLowerCase().includes('audio')
 
             // Filter variants by stream type
             let eligibleItems = pod.items
             if (isAudioOnly) {
-              const audioOnlyItems = pod.items.filter(item => item.bitrate < 300000)
+              const audioOnlyItems = pod.items.filter(item => item.bitrate <= 256000)
               if (audioOnlyItems.length > 0) {
                 eligibleItems = audioOnlyItems
                 console.log(`[SGAI] Audio-only stream detected (${viewerBitrate}bps), filtered to ${eligibleItems.length} audio-only ad variants`)
@@ -1888,14 +1889,14 @@ export class ChannelDO {
             // Fetch the actual ad playlist and extract real segment URLs
 
             // Detect if this is an audio-only stream
-            // Audio-only streams: bitrate < 300kbps AND variant name contains "audio"
-            const isAudioOnly = viewerBitrate < 300000 && variant.toLowerCase().includes('audio')
+            // Audio-only threshold: <= 256kbps (64k, 128k, 256k are typical audio bitrates)
+            const isAudioOnly = viewerBitrate <= 256000 && variant.toLowerCase().includes('audio')
 
             // Filter variants by stream type to prevent codec mismatches
             let eligibleItems = pod.items
             if (isAudioOnly) {
-              // For audio-only streams, only use audio-only ad variants (< 300kbps)
-              const audioOnlyItems = pod.items.filter(item => item.bitrate < 300000)
+              // For audio-only streams, only use audio-only ad variants (<= 256kbps)
+              const audioOnlyItems = pod.items.filter(item => item.bitrate <= 256000)
               if (audioOnlyItems.length > 0) {
                 eligibleItems = audioOnlyItems
                 console.log(`Audio-only stream detected (${viewerBitrate}bps), filtered to ${eligibleItems.length} audio-only ad variants`)

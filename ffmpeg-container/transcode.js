@@ -9,6 +9,21 @@ const { promisify } = require('util');
 
 const execAsync = promisify(exec);
 
+// Detect if source has a video stream using ffprobe
+async function hasVideoStream(filePath) {
+  try {
+    const { stdout } = await execAsync(
+      `ffprobe -v error -select_streams v:0 -show_entries stream=codec_type -of csv=p=0 "${filePath}"`
+    );
+    const hasVideo = stdout.trim() === 'video';
+    console.log(`[FFprobe] Source has video stream: ${hasVideo}`);
+    return hasVideo;
+  } catch (error) {
+    console.warn('[FFprobe] Could not detect video stream, assuming video exists:', error.message);
+    return true; // Default to assuming video exists for safety
+  }
+}
+
 // Detect source video resolution using ffprobe
 async function detectSourceResolution(filePath) {
   try {
@@ -148,23 +163,34 @@ async function getVideoDuration(filePath) {
 }
 
 // Transcode to a specific bitrate variant
-async function transcodeVariant(sourceFile, outputDir, bitrateKbps, sourceResolution) {
+async function transcodeVariant(sourceFile, outputDir, bitrateKbps, sourceResolution, sourceHasVideo) {
   const playlistPath = path.join(outputDir, 'playlist.m3u8');
   const segmentPattern = path.join(outputDir, 'segment_%03d.ts');
-
-  // Detect if this should be audio-only based on bitrate
-  // Audio-only threshold: < 300kbps
-  const isAudioOnly = bitrateKbps < 300;
 
   // Ensure output directory exists
   fs.mkdirSync(outputDir, { recursive: true });
 
   let cmd;
+  let isAudioOnly;
+
+  // Determine if this variant should be audio-only:
+  // 1. If source has NO video stream → always audio-only
+  // 2. If source HAS video stream AND bitrate ≤ 256kbps → create audio-only variant
+  // 3. Otherwise → video + audio
+  if (!sourceHasVideo) {
+    isAudioOnly = true;
+    console.log(`[FFmpeg] Transcoding ${bitrateKbps}k variant (AUDIO-ONLY - source has no video stream)`);
+  } else if (bitrateKbps <= 256) {
+    isAudioOnly = true;
+    console.log(`[FFmpeg] Transcoding ${bitrateKbps}k variant (AUDIO-ONLY - low bitrate from video source)`);
+  } else {
+    isAudioOnly = false;
+    const resolution = calculateOutputResolution(sourceResolution, bitrateKbps);
+    console.log(`[FFmpeg] Transcoding ${bitrateKbps}k variant (VIDEO+AUDIO ${resolution.width}x${resolution.height})`);
+  }
 
   if (isAudioOnly) {
     // Audio-only transcoding (no video)
-    console.log(`[FFmpeg] Transcoding ${bitrateKbps}k variant (AUDIO-ONLY)`);
-
     cmd = `ffmpeg -i "${sourceFile}" \
       -vn \
       -c:a aac -b:a ${bitrateKbps}k -ac 2 -ar 48000 \
@@ -174,8 +200,6 @@ async function transcodeVariant(sourceFile, outputDir, bitrateKbps, sourceResolu
   } else {
     // Video + audio transcoding
     const resolution = calculateOutputResolution(sourceResolution, bitrateKbps);
-    console.log(`[FFmpeg] Transcoding ${bitrateKbps}k variant (${resolution.width}x${resolution.height})`);
-
     cmd = `ffmpeg -i "${sourceFile}" \
       -vf "scale=w=${resolution.width}:h=${resolution.height}:force_original_aspect_ratio=decrease,pad=${resolution.width}:${resolution.height}:(ow-iw)/2:(oh-ih)/2" \
       -c:v libx264 -profile:v main -level 4.0 \
@@ -328,23 +352,31 @@ async function transcodeVideo({ adId, sourceKey, bitrates, r2Config, isSlate, is
     // 2. Get video duration
     const duration = await getVideoDuration(sourceFile);
     console.log(`[Transcode] Video duration: ${duration}s`);
-    
-    // 3. Detect source resolution ONCE (before transcoding)
-    const sourceResolution = await detectSourceResolution(sourceFile);
-    console.log(`[Transcode] Source resolution: ${sourceResolution.width}x${sourceResolution.height}`);
-    
-    // 4. Transcode each bitrate variant with detected resolution
+
+    // 3. Detect if source has video stream ONCE (before transcoding)
+    const sourceHasVideo = await hasVideoStream(sourceFile);
+    console.log(`[Transcode] Source has video: ${sourceHasVideo}`);
+
+    // 4. Detect source resolution if video exists
+    let sourceResolution = { width: 1280, height: 720 }; // Default for audio-only
+    if (sourceHasVideo) {
+      sourceResolution = await detectSourceResolution(sourceFile);
+      console.log(`[Transcode] Source resolution: ${sourceResolution.width}x${sourceResolution.height}`);
+    }
+
+    // 5. Transcode each bitrate variant
     const variants = [];
     for (const bitrateKbps of bitrates) {
       const variantDir = path.join(outputBaseDir, `${bitrateKbps}k`);
-      await transcodeVariant(sourceFile, variantDir, bitrateKbps, sourceResolution);
+      await transcodeVariant(sourceFile, variantDir, bitrateKbps, sourceResolution, sourceHasVideo);
 
       // Upload variant to R2
       const remotePrefix = `transcoded-ads/${adId}/${bitrateKbps}k`;
       await uploadDirectory(r2Client, bucket, variantDir, remotePrefix);
 
-      // Detect if audio-only based on bitrate
-      const isAudioOnly = bitrateKbps < 300;
+      // Determine if this variant is audio-only
+      // Audio-only if: source has no video OR (source has video AND bitrate ≤ 256kbps)
+      const isAudioOnly = !sourceHasVideo || bitrateKbps <= 256;
 
       // Calculate actual resolution used for this variant (video+audio only)
       const variantResolution = isAudioOnly
@@ -418,15 +450,22 @@ async function transcodeSegment({ adId, segmentId, sourceKey, startTime, duratio
     
     const segmentSize = fs.statSync(segmentFile).size;
     console.log(`[TranscodeSegment] Extracted segment: ${segmentSize} bytes`);
-    
-    // 3. Detect source resolution (from segment)
-    const sourceResolution = await detectSourceResolution(segmentFile);
-    
-    // 4. Transcode segment to HLS for each bitrate
+
+    // 3. Detect if segment has video stream
+    const sourceHasVideo = await hasVideoStream(segmentFile);
+    console.log(`[TranscodeSegment] Segment has video: ${sourceHasVideo}`);
+
+    // 4. Detect source resolution if video exists
+    let sourceResolution = { width: 1280, height: 720 }; // Default for audio-only
+    if (sourceHasVideo) {
+      sourceResolution = await detectSourceResolution(segmentFile);
+    }
+
+    // 5. Transcode segment to HLS for each bitrate
     const variants = [];
     for (const bitrateKbps of bitrates) {
       const variantDir = path.join(outputBaseDir, `${bitrateKbps}k`);
-      await transcodeVariant(segmentFile, variantDir, bitrateKbps, sourceResolution);
+      await transcodeVariant(segmentFile, variantDir, bitrateKbps, sourceResolution, sourceHasVideo);
       
       // Upload variant to R2
       const remotePrefix = `transcoded-ads/${adId}/segment-${segmentId}/${bitrateKbps}k`;
